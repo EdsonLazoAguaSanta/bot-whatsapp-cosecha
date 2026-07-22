@@ -184,7 +184,7 @@ def enviar_whatsapp(numero_destino, mensaje_texto):
     Envía mensaje por WhatsApp Business API (Meta)
     """
     try:
-        url = f"https://graph.instagram.com/v17.0/{WHATSAPP_PHONE_ID}/messages"
+        url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages"
         
         headers = {
             "Authorization": f"Bearer {WHATSAPP_TOKEN}",
