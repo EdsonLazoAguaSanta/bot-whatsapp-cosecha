@@ -266,6 +266,38 @@ async def receive_message(request: Request):
 # RUTAS DE PRUEBA (LOCAL)
 # ============================================================================
 
+from fastapi.responses import HTMLResponse
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy():
+    return """
+    <html><head><meta charset="utf-8"><title>Política de Privacidad</title></head>
+    <body style="font-family:sans-serif;max-width:700px;margin:40px auto;line-height:1.6">
+    <h1>Política de Privacidad — Bot Cosecha Agua Santa</h1>
+    <p>Última actualización: julio 2026</p>
+
+    <h2>Alcance</h2>
+    <p>Esta aplicación es una herramienta interna de Empresas Agua Santa.
+    Su uso está restringido a personal autorizado y productores asociados.</p>
+
+    <h2>Datos que se procesan</h2>
+    <p>Número de teléfono de WhatsApp y el contenido de los mensajes enviados
+    al servicio, con el único fin de responder consultas sobre programación
+    y avance de cosecha.</p>
+
+    <h2>Uso de la información</h2>
+    <p>Los datos se utilizan exclusivamente para operar el servicio de consultas.
+    No se venden, ceden ni comparten con terceros, ni se usan con fines publicitarios.</p>
+
+    <h2>Conservación</h2>
+    <p>Los mensajes se procesan de forma transitoria. Los registros operativos
+    se conservan solo el tiempo necesario para el funcionamiento del sistema.</p>
+
+    <h2>Contacto</h2>
+    <p>Consultas sobre esta política: elazo@aguasanta.cl</p>
+    </body></html>
+    """
+
 @app.get("/health")
 async def health():
     """Verifica estado del bot"""
