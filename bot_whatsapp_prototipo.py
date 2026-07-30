@@ -65,11 +65,10 @@ def obtener_bins_estimados(variedad):
             return "Error de conexión a base de datos"
         
         cursor = conn.cursor()
-        # Usa la tabla que Erick proporcionó
         query = """
-        SELECT SUM(Cantidad) as total_bins
-        FROM [Tabla PKG-Cos-Estima]
-        WHERE Variedad LIKE ?
+        SELECT SUM(Bultos) as total_bins
+        FROM [PKG-Cos-Estima]
+        WHERE [Variedad Agronomica] LIKE ?
         """
         cursor.execute(query, (f"%{variedad}%",))
         resultado = cursor.fetchone()
@@ -92,8 +91,8 @@ def obtener_cosecha_actual(variedad):
         
         cursor = conn.cursor()
         query = """
-        SELECT SUM(Cantidad) as total
-        FROM [vista Recepcion_Consolidada]
+        SELECT SUM(Bultos) as total
+        FROM [Recepcion_Consolidada]
         WHERE Variedad LIKE ? AND CAST(Fecha AS DATE) = CAST(GETDATE() AS DATE)
         """
         cursor.execute(query, (f"%{variedad}%",))
@@ -110,32 +109,21 @@ def obtener_cosecha_actual(variedad):
 
 def obtener_calibre_promedio(variedad, ano=2025):
     """Consulta: ¿Cuál fue el calibre promedio de [variedad] el año pasado?"""
-    try:
-        conn = conectar_sql()
-        if not conn:
-            return "Error de conexión a base de datos"
-        
-        cursor = conn.cursor()
-        query = """
-        SELECT AVG(Calibre) as calibre_prom
-        FROM [tabla_calibres]
-        WHERE Variedad LIKE ? AND YEAR(Fecha) = ?
-        """
-        cursor.execute(query, (f"%{variedad}%", ano))
-        resultado = cursor.fetchone()
-        conn.close()
-        
-        if resultado and resultado[0]:
-            return f"📏 {variedad.upper()}: Calibre promedio {ano}: {resultado[0]:.1f}"
-        else:
-            return f"No hay datos de calibre para {variedad} en {ano}"
-    except Exception as e:
-        logger.error(f"Error en obtener_calibre_promedio: {str(e)}")
-        return f"Error al consultar: {str(e)}"
+    return f"📏 Consulta de calibre para {variedad.upper()} aún no disponible: falta confirmar con Erick en qué tabla vive el dato de calibre."
 
 # ============================================================================
 # PROCESAMIENTO DE MENSAJES
 # ============================================================================
+
+# Mapea la variedad tal como la escribe el usuario -> nombre real en Control_EAS
+# "tifany" es el nombre real en base de datos (con una sola "f")
+VARIEDADES_RECONOCIDAS = {
+    "tiffany": "tifany",
+    "crimson": "crimson",
+    "flame": "flame",
+    "jumbo red": "jumbo red",
+    "thompson": "thompson",
+}
 
 def procesar_mensaje(texto_mensaje):
     """
@@ -146,21 +134,21 @@ def procesar_mensaje(texto_mensaje):
     # Palabras clave y respuestas
     if "bins estimados" in texto or "cuántos bins" in texto:
         # Buscar variedad mencionada
-        for variedad in ["tiffany", "crimson", "flame", "jumbo red", "thompson"]:
+        for variedad, variedad_db in VARIEDADES_RECONOCIDAS.items():
             if variedad in texto:
-                return obtener_bins_estimados(variedad)
+                return obtener_bins_estimados(variedad_db)
         return "Por favor menciona una variedad (Tiffany, Crimson, Flame, etc)"
-    
+
     elif "cosechado" in texto or "cosecha de hoy" in texto:
-        for variedad in ["tiffany", "crimson", "flame", "jumbo red", "thompson"]:
+        for variedad, variedad_db in VARIEDADES_RECONOCIDAS.items():
             if variedad in texto:
-                return obtener_cosecha_actual(variedad)
+                return obtener_cosecha_actual(variedad_db)
         return "¿Cuál variedad? (Tiffany, Crimson, Flame, etc)"
-    
+
     elif "calibre" in texto or "promedio" in texto:
-        for variedad in ["tiffany", "crimson", "flame", "jumbo red", "thompson"]:
+        for variedad, variedad_db in VARIEDADES_RECONOCIDAS.items():
             if variedad in texto:
-                return obtener_calibre_promedio(variedad)
+                return obtener_calibre_promedio(variedad_db)
         return "¿De cuál variedad quieres conocer el calibre?"
     
     elif "ayuda" in texto or "hola" in texto or "?" in texto:
