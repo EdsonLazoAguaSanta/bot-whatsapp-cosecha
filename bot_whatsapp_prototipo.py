@@ -70,14 +70,15 @@ def obtener_bins_estimados(variedad):
         
         cursor = conn.cursor()
         query = """
-        SELECT SUM(Bultos) as total_bins
+        SELECT SUM([Envases a Proceso]) as total_bins
         FROM [PKG-Cos-Estima]
         WHERE [Variedad Agronomica] LIKE ?
+        AND Temporada = (SELECT MAX(Temporada) FROM [PKG-Cos-Estima])
         """
         cursor.execute(query, (f"%{variedad}%",))
         resultado = cursor.fetchone()
         conn.close()
-        
+
         if resultado and resultado[0]:
             return f"📦 {variedad.upper()}: {int(resultado[0])} bins estimados esta temporada"
         else:
@@ -114,6 +115,152 @@ def obtener_cosecha_actual(variedad):
 def obtener_calibre_promedio(variedad, ano=2025):
     """Consulta: ¿Cuál fue el calibre promedio de [variedad] el año pasado?"""
     return f"📏 Consulta de calibre para {variedad.upper()} aún no disponible: falta confirmar con Erick en qué tabla vive el dato de calibre."
+
+def obtener_trisemanal_cosecha(variedad):
+    """Consulta: ¿Cuál es el programa trisemanal de cosecha de [variedad]?"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+        query = """
+        SELECT SUM(Bultos) as total_bultos, SUM([Cajas Eq]) as total_cajas
+        FROM [PKG-Cos-Trisemanal]
+        WHERE Variedad LIKE ?
+        AND Temporada = (SELECT MAX(Temporada) FROM [PKG-Cos-Trisemanal])
+        """
+        cursor.execute(query, (f"%{variedad}%",))
+        resultado = cursor.fetchone()
+        conn.close()
+
+        if resultado and resultado[0]:
+            cajas = int(resultado[1]) if resultado[1] else 0
+            return f"🗓️ {variedad.upper()}: {int(resultado[0])} bultos programados en el trisemanal de cosecha ({cajas} cajas equivalentes)"
+        else:
+            return f"No hay datos del trisemanal de cosecha para {variedad}"
+    except Exception as e:
+        logger.error(f"Error en obtener_trisemanal_cosecha: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
+def obtener_planificacion_proceso(variedad):
+    """Consulta: ¿Cuál es la planificación de proceso de [variedad]?"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+        query = """
+        SELECT SUM(Bultos) as total_bultos, SUM(Kilos) as total_kilos
+        FROM [PKG-Planifica]
+        WHERE Variedad LIKE ?
+        AND Temporada = (SELECT MAX(Temporada) FROM [PKG-Planifica])
+        """
+        cursor.execute(query, (f"%{variedad}%",))
+        resultado = cursor.fetchone()
+        conn.close()
+
+        if resultado and resultado[0]:
+            kilos = int(resultado[1]) if resultado[1] else 0
+            return f"🏭 {variedad.upper()}: {int(resultado[0])} bultos planificados a proceso ({kilos} kg)"
+        else:
+            return f"No hay datos de planificación de proceso para {variedad}"
+    except Exception as e:
+        logger.error(f"Error en obtener_planificacion_proceso: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
+def obtener_comparacion_estimado_vs_cosechado(variedad):
+    """Consulta: ¿Cómo vamos hoy de [variedad] respecto a lo estimado para hoy? (comparación diaria)"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+        cursor.execute(
+            """SELECT SUM([Envases a Proceso]) FROM [PKG-Cos-Estima]
+               WHERE [Variedad Agronomica] LIKE ?
+               AND CAST(Fecha_cosecha AS DATE) = CAST(GETDATE() AS DATE)""",
+            (f"%{variedad}%",)
+        )
+        fila = cursor.fetchone()
+        estimado = fila[0] if fila and fila[0] else 0
+
+        cursor.execute(
+            """SELECT SUM(Bultos) FROM [Recepcion_Consolidada]
+               WHERE Variedad LIKE ?
+               AND CAST(Fecha AS DATE) = CAST(GETDATE() AS DATE)""",
+            (f"%{variedad}%",)
+        )
+        fila = cursor.fetchone()
+        cosechado = fila[0] if fila and fila[0] else 0
+
+        conn.close()
+
+        if not estimado:
+            return f"No hay estimación para hoy de {variedad}, no puedo comparar"
+
+        porcentaje = (cosechado / estimado) * 100
+        return (
+            f"📊 {variedad.upper()} hoy: {int(cosechado)} cosechados de {int(estimado)} estimados "
+            f"para hoy ({porcentaje:.1f}%)"
+        )
+    except Exception as e:
+        logger.error(f"Error en obtener_comparacion_estimado_vs_cosechado: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
+def obtener_resumen_por_productor(productor):
+    """Consulta: ¿Cuánto ha cosechado el productor [productor]?"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+        query = """
+        SELECT SUM(Bultos) as total, COUNT(DISTINCT Variedad) as variedades
+        FROM [Recepcion_Consolidada]
+        WHERE Productor LIKE ?
+        AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada])
+        """
+        cursor.execute(query, (f"%{productor}%",))
+        resultado = cursor.fetchone()
+        conn.close()
+
+        if resultado and resultado[0]:
+            return f"👨‍🌾 {productor.upper()}: {int(resultado[0])} bultos cosechados en total, en {resultado[1]} variedades"
+        else:
+            return f"No encontré datos del productor '{productor}'"
+    except Exception as e:
+        logger.error(f"Error en obtener_resumen_por_productor: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
+def obtener_resumen_por_packing(packing):
+    """Consulta: ¿Cuánto ha recibido el packing [packing]?"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+        query = """
+        SELECT SUM(Bultos) as total, COUNT(DISTINCT Variedad) as variedades
+        FROM [Recepcion_Consolidada]
+        WHERE Packing LIKE ?
+        AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada])
+        """
+        cursor.execute(query, (f"%{packing}%",))
+        resultado = cursor.fetchone()
+        conn.close()
+
+        if resultado and resultado[0]:
+            return f"🏭 Packing {packing.upper()}: {int(resultado[0])} bultos recibidos, en {resultado[1]} variedades"
+        else:
+            return f"No encontré datos del packing '{packing}'"
+    except Exception as e:
+        logger.error(f"Error en obtener_resumen_por_packing: {str(e)}")
+        return f"Error al consultar: {str(e)}"
 
 # ============================================================================
 # PROCESAMIENTO DE MENSAJES
@@ -173,21 +320,98 @@ TOOLS = [
             "required": ["variedad"]
         }
     },
+    {
+        "name": "consultar_trisemanal_cosecha",
+        "description": "Consulta el programa trisemanal de cosecha (bultos y cajas equivalentes programados) para una variedad.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "variedad": {
+                    "type": "string",
+                    "description": "Nombre de la variedad mencionada por el usuario."
+                }
+            },
+            "required": ["variedad"]
+        }
+    },
+    {
+        "name": "consultar_planificacion_proceso",
+        "description": "Consulta la planificación de proceso (bultos y kilos planificados a proceso) para una variedad.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "variedad": {
+                    "type": "string",
+                    "description": "Nombre de la variedad mencionada por el usuario."
+                }
+            },
+            "required": ["variedad"]
+        }
+    },
+    {
+        "name": "comparar_estimado_vs_cosechado",
+        "description": "Compara lo cosechado HOY contra lo estimado para HOY de una variedad, con porcentaje de avance del día. Usar cuando pregunten 'cómo vamos hoy' o 'qué porcentaje llevamos hoy' de una variedad. Es una comparación diaria, no de temporada completa.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "variedad": {
+                    "type": "string",
+                    "description": "Nombre de la variedad mencionada por el usuario."
+                }
+            },
+            "required": ["variedad"]
+        }
+    },
+    {
+        "name": "consultar_resumen_productor",
+        "description": "Consulta el resumen de bultos cosechados por un productor específico (no por variedad).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "productor": {
+                    "type": "string",
+                    "description": "Nombre o parte del nombre del productor mencionado por el usuario."
+                }
+            },
+            "required": ["productor"]
+        }
+    },
+    {
+        "name": "consultar_resumen_packing",
+        "description": "Consulta el resumen de bultos recibidos por una planta/packing específica (no por variedad ni productor).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "packing": {
+                    "type": "string",
+                    "description": "Nombre o parte del nombre del packing mencionado por el usuario."
+                }
+            },
+            "required": ["packing"]
+        }
+    },
 ]
 
 SYSTEM_PROMPT = """Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
 
-Tienes herramientas para consultar bins estimados, cosecha de hoy, y calibre promedio por variedad.
-Usa una herramienta cuando el usuario pregunte por alguno de esos datos y haya mencionado (o puedas inferir)
-una variedad de fruta.
+Tienes herramientas para consultar, por variedad: bins estimados, cosecha de hoy, calibre promedio,
+programa trisemanal de cosecha, planificación de proceso, y comparación de avance (estimado vs cosechado).
+También puedes consultar resúmenes por productor o por packing (no requieren variedad).
+
+Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
+(o puedas inferir) el dato que falta (variedad, productor o packing).
 
 Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna herramienta, respóndele tú
-directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer (bins estimados,
-cosecha de hoy, calibre promedio, por variedad).
+directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer.
 
-Si falta la variedad para poder consultar, pídesela al usuario en vez de inventar una."""
+Si falta la variedad, productor o packing para poder consultar, pídeselo al usuario en vez de inventarlo."""
 
 def ejecutar_tool(tool_name, tool_input):
+    if tool_name == "consultar_resumen_productor":
+        return obtener_resumen_por_productor(tool_input.get("productor", ""))
+    if tool_name == "consultar_resumen_packing":
+        return obtener_resumen_por_packing(tool_input.get("packing", ""))
+
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
     if tool_name == "consultar_bins_estimados":
         return obtener_bins_estimados(variedad)
@@ -195,6 +419,12 @@ def ejecutar_tool(tool_name, tool_input):
         return obtener_cosecha_actual(variedad)
     elif tool_name == "consultar_calibre_promedio":
         return obtener_calibre_promedio(variedad)
+    elif tool_name == "consultar_trisemanal_cosecha":
+        return obtener_trisemanal_cosecha(variedad)
+    elif tool_name == "consultar_planificacion_proceso":
+        return obtener_planificacion_proceso(variedad)
+    elif tool_name == "comparar_estimado_vs_cosechado":
+        return obtener_comparacion_estimado_vs_cosechado(variedad)
     return "No supe qué información buscar para esa pregunta."
 
 def procesar_mensaje(texto_mensaje):
