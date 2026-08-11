@@ -10,6 +10,7 @@ import requests
 import os
 from dotenv import load_dotenv
 import logging
+import anthropic
 
 load_dotenv()
 
@@ -32,6 +33,9 @@ DB_NAME = os.getenv("DB_NAME", "Control_EAS")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "token_seguro_12345")
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ============================================================================
 # CONEXIÓN SQL SERVER
@@ -115,53 +119,110 @@ def obtener_calibre_promedio(variedad, ano=2025):
 # PROCESAMIENTO DE MENSAJES
 # ============================================================================
 
-# Mapea la variedad tal como la escribe el usuario -> nombre real en Control_EAS
+# Alias de variedad tal como la escribe el usuario -> nombre real en Control_EAS
 # "tifany" es el nombre real en base de datos (con una sola "f")
-VARIEDADES_RECONOCIDAS = {
+ALIAS_VARIEDADES = {
     "tiffany": "tifany",
-    "crimson": "crimson",
-    "flame": "flame",
-    "jumbo red": "jumbo red",
-    "thompson": "thompson",
 }
+
+def normalizar_variedad(variedad_usuario):
+    """Traduce variedades con alias conocidos (ej. 'tiffany' -> 'tifany') al nombre real en la BD"""
+    v = variedad_usuario.lower().strip()
+    return ALIAS_VARIEDADES.get(v, v)
+
+TOOLS = [
+    {
+        "name": "consultar_bins_estimados",
+        "description": "Consulta cuántos bins se estiman cosechar esta temporada para una variedad de fruta.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "variedad": {
+                    "type": "string",
+                    "description": "Nombre de la variedad mencionada por el usuario, tal como la escribió (ej. 'tiffany', 'crimson')."
+                }
+            },
+            "required": ["variedad"]
+        }
+    },
+    {
+        "name": "consultar_cosecha_hoy",
+        "description": "Consulta cuántos bins se han cosechado HOY para una variedad de fruta.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "variedad": {
+                    "type": "string",
+                    "description": "Nombre de la variedad mencionada por el usuario."
+                }
+            },
+            "required": ["variedad"]
+        }
+    },
+    {
+        "name": "consultar_calibre_promedio",
+        "description": "Consulta el calibre promedio histórico de una variedad de fruta.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "variedad": {
+                    "type": "string",
+                    "description": "Nombre de la variedad mencionada por el usuario."
+                }
+            },
+            "required": ["variedad"]
+        }
+    },
+]
+
+SYSTEM_PROMPT = """Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
+
+Tienes herramientas para consultar bins estimados, cosecha de hoy, y calibre promedio por variedad.
+Usa una herramienta cuando el usuario pregunte por alguno de esos datos y haya mencionado (o puedas inferir)
+una variedad de fruta.
+
+Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna herramienta, respóndele tú
+directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer (bins estimados,
+cosecha de hoy, calibre promedio, por variedad).
+
+Si falta la variedad para poder consultar, pídesela al usuario en vez de inventar una."""
+
+def ejecutar_tool(tool_name, tool_input):
+    variedad = normalizar_variedad(tool_input.get("variedad", ""))
+    if tool_name == "consultar_bins_estimados":
+        return obtener_bins_estimados(variedad)
+    elif tool_name == "consultar_cosecha_hoy":
+        return obtener_cosecha_actual(variedad)
+    elif tool_name == "consultar_calibre_promedio":
+        return obtener_calibre_promedio(variedad)
+    return "No supe qué información buscar para esa pregunta."
 
 def procesar_mensaje(texto_mensaje):
     """
-    Procesa el mensaje y devuelve respuesta inteligente
+    Usa Claude para interpretar el mensaje: decide si llamar una herramienta de consulta
+    o responder directamente (saludo, ayuda, pregunta fuera de alcance).
     """
-    texto = texto_mensaje.lower().strip()
-    
-    # Palabras clave y respuestas
-    if "bins estimados" in texto or "cuántos bins" in texto:
-        # Buscar variedad mencionada
-        for variedad, variedad_db in VARIEDADES_RECONOCIDAS.items():
-            if variedad in texto:
-                return obtener_bins_estimados(variedad_db)
-        return "Por favor menciona una variedad (Tiffany, Crimson, Flame, etc)"
+    try:
+        response = claude_client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=300,
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=[{"role": "user", "content": texto_mensaje}],
+        )
 
-    elif "cosechado" in texto or "cosecha de hoy" in texto:
-        for variedad, variedad_db in VARIEDADES_RECONOCIDAS.items():
-            if variedad in texto:
-                return obtener_cosecha_actual(variedad_db)
-        return "¿Cuál variedad? (Tiffany, Crimson, Flame, etc)"
+        tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
+        if tool_use_block:
+            return ejecutar_tool(tool_use_block.name, tool_use_block.input)
 
-    elif "calibre" in texto or "promedio" in texto:
-        for variedad, variedad_db in VARIEDADES_RECONOCIDAS.items():
-            if variedad in texto:
-                return obtener_calibre_promedio(variedad_db)
-        return "¿De cuál variedad quieres conocer el calibre?"
-    
-    elif "ayuda" in texto or "hola" in texto or "?" in texto:
-        return """🤖 BOT COSECHA - Qué puedo hacer:
-        
-📦 "¿Cuántos bins de Tiffany?" → Bins estimados
-✅ "Cosecha de Crimson" → Bins cosechados hoy
-📏 "Calibre promedio Flame" → Datos históricos
+        text_block = next((b for b in response.content if b.type == "text"), None)
+        if text_block:
+            return text_block.text
 
-Variedad disponibles: Tiffany, Crimson, Flame, Thompson, Jumbo Red"""
-    
-    else:
         return "No entendí tu pregunta. Escribe 'ayuda' para ver qué puedo hacer."
+    except Exception as e:
+        logger.error(f"Error en procesar_mensaje (Claude): {str(e)}")
+        return "Tuve un problema procesando tu mensaje. Intenta de nuevo en un momento."
 
 # ============================================================================
 # ENVÍO POR WHATSAPP
