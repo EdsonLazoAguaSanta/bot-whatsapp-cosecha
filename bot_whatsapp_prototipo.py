@@ -266,16 +266,34 @@ def obtener_resumen_por_packing(packing):
 # PROCESAMIENTO DE MENSAJES
 # ============================================================================
 
-# Alias de variedad tal como la escribe el usuario -> nombre real en Control_EAS
-# "tifany" es el nombre real en base de datos (con una sola "f")
-ALIAS_VARIEDADES = {
-    "tiffany": "tifany",
-}
+def cargar_variedades_conocidas():
+    """
+    Carga la lista real de variedades desde la base de datos, para que Claude pueda reconocer
+    lo que escribe el usuario (con typos, sin tildes, abreviado) y usar el nombre exacto de la BD.
+    """
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT [Variedad Agronomica] FROM [PKG-Cos-Estima] WHERE [Variedad Agronomica] IS NOT NULL
+            UNION
+            SELECT DISTINCT Variedad FROM [Recepcion_Consolidada] WHERE Variedad IS NOT NULL
+        """)
+        variedades = sorted(set(row[0].strip() for row in cursor.fetchall() if row[0] and row[0].strip()))
+        conn.close()
+        logger.info(f"Cargadas {len(variedades)} variedades conocidas")
+        return variedades
+    except Exception as e:
+        logger.error(f"Error cargando variedades conocidas: {str(e)}")
+        return []
+
+VARIEDADES_CONOCIDAS = cargar_variedades_conocidas()
 
 def normalizar_variedad(variedad_usuario):
-    """Traduce variedades con alias conocidos (ej. 'tiffany' -> 'tifany') al nombre real en la BD"""
-    v = variedad_usuario.lower().strip()
-    return ALIAS_VARIEDADES.get(v, v)
+    """Limpia espacios; la traducción al nombre exacto ya la hace Claude usando VARIEDADES_CONOCIDAS"""
+    return variedad_usuario.strip()
 
 TOOLS = [
     {
@@ -392,7 +410,13 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
+def construir_system_prompt():
+    if VARIEDADES_CONOCIDAS:
+        lista_variedades = ", ".join(VARIEDADES_CONOCIDAS)
+    else:
+        lista_variedades = "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
+
+    return f"""Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
 
 Tienes herramientas para consultar, por variedad: bins estimados, cosecha de hoy, calibre promedio,
 programa trisemanal de cosecha, planificación de proceso, y comparación de avance (estimado vs cosechado).
@@ -401,10 +425,21 @@ También puedes consultar resúmenes por productor o por packing (no requieren v
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, productor o packing).
 
+VARIEDADES CONOCIDAS EN EL SISTEMA (nombre exacto como está en la base de datos):
+{lista_variedades}
+
+Cuando el usuario mencione una variedad, identifica a cuál de esta lista se refiere aunque la escriba
+distinto (sin tildes, con errores de tipeo, abreviada, en otro idioma, etc. — ej. "tiffany" es "TIFANY",
+"murcott" es "W. MURCOTT") y pasa a la herramienta el nombre EXACTO tal como aparece en esta lista.
+Si no reconoces ninguna variedad de la lista que calce razonablemente, pídele al usuario que aclare
+en vez de adivinar.
+
 Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna herramienta, respóndele tú
 directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer.
 
 Si falta la variedad, productor o packing para poder consultar, pídeselo al usuario en vez de inventarlo."""
+
+SYSTEM_PROMPT = construir_system_prompt()
 
 def ejecutar_tool(tool_name, tool_input):
     if tool_name == "consultar_resumen_productor":
