@@ -8,9 +8,11 @@ from fastapi.responses import JSONResponse
 import pyodbc
 import requests
 import os
+import io
 from dotenv import load_dotenv
 import logging
 import anthropic
+import openai
 
 load_dotenv()
 
@@ -36,6 +38,9 @@ WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "token_seguro_12345")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ============================================================================
 # CONEXIÓN SQL SERVER
@@ -490,6 +495,39 @@ def procesar_mensaje(texto_mensaje):
         return "Tuve un problema procesando tu mensaje. Intenta de nuevo en un momento."
 
 # ============================================================================
+# NOTAS DE VOZ
+# ============================================================================
+
+def descargar_audio_whatsapp(media_id):
+    """Descarga el archivo de audio de un mensaje de WhatsApp a partir de su media_id"""
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+
+    meta_resp = requests.get(f"https://graph.facebook.com/v22.0/{media_id}", headers=headers)
+    meta_resp.raise_for_status()
+    meta = meta_resp.json()
+
+    audio_resp = requests.get(meta["url"], headers=headers)
+    audio_resp.raise_for_status()
+
+    return audio_resp.content, meta.get("mime_type", "audio/ogg")
+
+def transcribir_audio(audio_bytes, mime_type="audio/ogg"):
+    """Transcribe una nota de voz a texto usando OpenAI Whisper"""
+    if not openai_client:
+        raise RuntimeError("OPENAI_API_KEY no configurada")
+
+    extension = "mp3" if "mp3" in mime_type or "mpeg" in mime_type else "ogg"
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = f"nota_voz.{extension}"
+
+    transcripcion = openai_client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio_file,
+        language="es",
+    )
+    return transcripcion.text
+
+# ============================================================================
 # ENVÍO POR WHATSAPP
 # ============================================================================
 
@@ -561,13 +599,35 @@ async def receive_message(request: Request):
                     for message in messages:
                         numero_sender = message.get("from")
                         msg_id = message.get("id")
-                        msg_text = message.get("text", {}).get("body", "")
-                        
+                        msg_type = message.get("type")
+
+                        if msg_type == "text":
+                            msg_text = message.get("text", {}).get("body", "")
+                        elif msg_type == "audio":
+                            try:
+                                media_id = message.get("audio", {}).get("id")
+                                audio_bytes, mime_type = descargar_audio_whatsapp(media_id)
+                                msg_text = transcribir_audio(audio_bytes, mime_type)
+                                logger.info(f"Nota de voz transcrita de {numero_sender}: {msg_text}")
+                            except Exception as e:
+                                logger.error(f"Error transcribiendo audio: {str(e)}")
+                                enviar_whatsapp(
+                                    numero_sender,
+                                    "No pude entender tu nota de voz. ¿Puedes escribir tu pregunta como texto?"
+                                )
+                                continue
+                        else:
+                            enviar_whatsapp(
+                                numero_sender,
+                                "Por ahora solo puedo responder mensajes de texto o notas de voz."
+                            )
+                            continue
+
                         logger.info(f"Mensaje de {numero_sender}: {msg_text}")
-                        
+
                         # Procesar mensaje
                         respuesta = procesar_mensaje(msg_text)
-                        
+
                         # Enviar respuesta
                         enviar_whatsapp(numero_sender, respuesta)
         
