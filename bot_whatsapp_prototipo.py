@@ -303,23 +303,41 @@ MAX_GRUPOS_TABLA = 8
 def _fecha_str(fecha):
     return fecha.strftime("%d-%m-%Y") if hasattr(fecha, "strftime") else str(fecha)
 
+def _truncar(texto, ancho):
+    texto = texto or ""
+    if len(texto) <= ancho:
+        return texto
+    return texto[:ancho - 1] + "…"
+
+def _quitar_prefijo_planta(nombre):
+    """Quita el prefijo genérico 'PLANTA '/'PACKING ' para dejar más espacio en la tabla"""
+    for prefijo in ("PLANTA ", "PACKING "):
+        if nombre.startswith(prefijo):
+            return nombre[len(prefijo):]
+    return nombre
+
 def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True):
     """
-    filas: lista de tuplas (Packing, Productor, Variedad, Fecha, Base Origen, total_kg).
-    Arma una respuesta en tablas de texto monoespaciado (bloques ```), agrupada por
-    Productor + Variedad, con columnas Trisemanal (estimado) y Recepción Planta (real)
-    por fecha. Si hay demasiados grupos o demasiados días, colapsa a solo totales.
+    filas: lista de tuplas (Packing, Productor, Especie, Variedad, Fecha, Base Origen, total_kg).
+    Si el rango es corto y hay pocos grupos, arma una tabla de fecha x (estimado, real) por
+    cada packing/productor/variedad. Si no, colapsa a una tabla única con columnas
+    Planta | Productor | Especie | Variedad | Estimado | Real.
     """
     if not filas:
         return None
 
-    grupos = {}  # (packing, productor, variedad) -> {fecha: {"estimado":x, "real":y}}
-    for packing, productor, variedad, fecha, base_origen, total in filas:
+    grupos = {}  # (packing, productor, especie, variedad) -> {fecha: {"estimado":x, "real":y}}
+    for packing, productor, especie, variedad, fecha, base_origen, total in filas:
         if not total:
             continue
         # Normaliza mayúsculas: la misma planta/productor puede venir escrito distinto
         # según si la fila es 'Trisemanal' o 'Recepción Planta' en la base de origen.
-        clave = ((packing or "").strip().upper(), (productor or "").strip().upper(), (variedad or "").strip().upper())
+        clave = (
+            (packing or "").strip().upper(),
+            (productor or "").strip().upper(),
+            (especie or "").strip().upper(),
+            (variedad or "").strip().upper(),
+        )
         clave_valor = "estimado" if base_origen == BASE_ORIGEN_ESTIMADO else "real"
         grupos.setdefault(clave, {}).setdefault(fecha, {})[clave_valor] = total
 
@@ -332,39 +350,58 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
     tabla_completa = mostrar_fechas and len(grupos) <= MAX_GRUPOS_TABLA
     total_estimado_gral = 0
     total_real_gral = 0
-    grupos_mostrados = 0
 
-    for (packing, productor, variedad), fechas in sorted(grupos.items()):
-        total_est = sum(v.get("estimado", 0) or 0 for v in fechas.values())
-        total_real = sum(v.get("real", 0) or 0 for v in fechas.values())
-        total_estimado_gral += total_est
-        total_real_gral += total_real
+    if tabla_completa:
+        for (packing, productor, especie, variedad), fechas in sorted(grupos.items()):
+            total_est = sum(v.get("estimado", 0) or 0 for v in fechas.values())
+            total_real = sum(v.get("real", 0) or 0 for v in fechas.values())
+            total_estimado_gral += total_est
+            total_real_gral += total_real
 
-        if not tabla_completa or grupos_mostrados >= MAX_GRUPOS_TABLA:
-            grupos_mostrados += 1
-            lineas.append(
-                f"\n🏭 {packing} · {productor} · {variedad}: "
-                f"estimado {formatear_kg(total_est)} kg, real {formatear_kg(total_real)} kg"
+            filas_tabla = [f"{'Fecha':<11}{'Trisem.':>9}{'Real':>9}"]
+            for fecha in sorted(fechas.keys()):
+                vals = fechas[fecha]
+                est = vals.get("estimado", 0) or 0
+                real = vals.get("real", 0) or 0
+                est_str = formatear_kg(est) if est else "-"
+                real_str = formatear_kg(real) if real else "-"
+                filas_tabla.append(f"{_fecha_str(fecha):<11}{est_str:>9}{real_str:>9}")
+            filas_tabla.append("-" * 29)
+            filas_tabla.append(f"{'TOTAL':<11}{formatear_kg(total_est):>9}{formatear_kg(total_real):>9}")
+
+            tabla_texto = "\n".join(filas_tabla)
+            lineas.append(f"\n🏭 {packing} · {productor} · {variedad}\n```{tabla_texto}```")
+    else:
+        # Tabla única: Planta | Productor | Especie | Variedad | Estimado | Real
+        anchos = {"planta": 11, "productor": 15, "especie": 8, "variedad": 12, "num": 9}
+        encabezado = (
+            f"{'Planta':<{anchos['planta']}}{'Productor':<{anchos['productor']}}"
+            f"{'Especie':<{anchos['especie']}}{'Variedad':<{anchos['variedad']}}"
+            f"{'Estimado':>{anchos['num']}}{'Real':>{anchos['num']}}"
+        )
+        filas_tabla = [encabezado, "-" * len(encabezado)]
+
+        for (packing, productor, especie, variedad), fechas in sorted(grupos.items()):
+            total_est = sum(v.get("estimado", 0) or 0 for v in fechas.values())
+            total_real = sum(v.get("real", 0) or 0 for v in fechas.values())
+            total_estimado_gral += total_est
+            total_real_gral += total_real
+
+            planta_corta = _truncar(_quitar_prefijo_planta(packing), anchos["planta"])
+            productor_corto = _truncar(productor, anchos["productor"])
+            especie_corta = _truncar(traducir_especie(especie), anchos["especie"])
+            variedad_corta = _truncar(variedad, anchos["variedad"])
+            est_str = formatear_kg(total_est) if total_est else "-"
+            real_str = formatear_kg(total_real) if total_real else "-"
+
+            filas_tabla.append(
+                f"{planta_corta:<{anchos['planta']}}{productor_corto:<{anchos['productor']}}"
+                f"{especie_corta:<{anchos['especie']}}{variedad_corta:<{anchos['variedad']}}"
+                f"{est_str:>{anchos['num']}}{real_str:>{anchos['num']}}"
             )
-            continue
-
-        grupos_mostrados += 1
-        filas_tabla = [f"{'Fecha':<11}{'Trisem.':>9}{'Real':>9}"]
-        for fecha in sorted(fechas.keys()):
-            vals = fechas[fecha]
-            est = vals.get("estimado", 0) or 0
-            real = vals.get("real", 0) or 0
-            est_str = formatear_kg(est) if est else "-"
-            real_str = formatear_kg(real) if real else "-"
-            filas_tabla.append(f"{_fecha_str(fecha):<11}{est_str:>9}{real_str:>9}")
-        filas_tabla.append("-" * 29)
-        filas_tabla.append(f"{'TOTAL':<11}{formatear_kg(total_est):>9}{formatear_kg(total_real):>9}")
 
         tabla_texto = "\n".join(filas_tabla)
-        lineas.append(f"\n🏭 {packing} · {productor} · {variedad}\n```{tabla_texto}```")
-
-    if len(grupos) > MAX_GRUPOS_TABLA and tabla_completa:
-        lineas.append(f"\n(mostrando resumen de {len(grupos)} grupos)")
+        lineas.append(f"\n```{tabla_texto}```")
 
     lineas.append(
         f"\n📦 Total general: estimado {formatear_kg(total_estimado_gral)} kg, "
@@ -410,11 +447,11 @@ def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad
 
         where = " AND ".join(condiciones)
         query = f"""
-            SELECT Packing, Productor, Variedad, CAST(Fecha AS DATE) as Fecha, [Base Origen],
+            SELECT Packing, Productor, Especie, Variedad, CAST(Fecha AS DATE) as Fecha, [Base Origen],
                    SUM(KgsRecepcionados) as total
             FROM [Recepcion_Consolidada]
             WHERE {where}
-            GROUP BY Packing, Productor, Variedad, CAST(Fecha AS DATE), [Base Origen]
+            GROUP BY Packing, Productor, Especie, Variedad, CAST(Fecha AS DATE), [Base Origen]
             HAVING SUM(KgsRecepcionados) > 0
             ORDER BY Packing, Productor, Variedad, Fecha
         """
