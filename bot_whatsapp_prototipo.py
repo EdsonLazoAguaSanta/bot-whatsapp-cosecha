@@ -309,13 +309,6 @@ def _truncar(texto, ancho):
         return texto
     return texto[:ancho - 1] + "…"
 
-def _quitar_prefijo_planta(nombre):
-    """Quita el prefijo genérico 'PLANTA '/'PACKING ' para dejar más espacio en la tabla"""
-    for prefijo in ("PLANTA ", "PACKING "):
-        if nombre.startswith(prefijo):
-            return nombre[len(prefijo):]
-    return nombre
-
 def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True):
     """
     filas: lista de tuplas (Packing, Productor, Especie, Variedad, Fecha, Base Origen, total_kg).
@@ -372,36 +365,62 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
             tabla_texto = "\n".join(filas_tabla)
             lineas.append(f"\n🏭 {packing} · {productor} · {variedad}\n```{tabla_texto}```")
     else:
-        # Tabla única: Planta | Productor | Especie | Variedad | Estimado | Real
-        anchos = {"planta": 11, "productor": 15, "especie": 8, "variedad": 12, "num": 9}
-        encabezado = (
-            f"{'Planta':<{anchos['planta']}}{'Productor':<{anchos['productor']}}"
-            f"{'Especie':<{anchos['especie']}}{'Variedad':<{anchos['variedad']}}"
-            f"{'Estimado':>{anchos['num']}}{'Real':>{anchos['num']}}"
-        )
-        filas_tabla = [encabezado, "-" * len(encabezado)]
-
-        for (packing, productor, especie, variedad), fechas in sorted(grupos.items()):
+        # Planta y Productor van como encabezado (nombre completo, sin cortar).
+        # La tabla queda angosta (Variedad | Estimado | Real) para que siempre entre bien.
+        por_planta_productor = {}
+        for (packing, productor, especie, variedad), fechas in grupos.items():
             total_est = sum(v.get("estimado", 0) or 0 for v in fechas.values())
             total_real = sum(v.get("real", 0) or 0 for v in fechas.values())
             total_estimado_gral += total_est
             total_real_gral += total_real
+            clave_pp = (packing, productor)
+            por_planta_productor.setdefault(clave_pp, []).append((especie, variedad, total_est, total_real))
 
-            planta_corta = _truncar(_quitar_prefijo_planta(packing), anchos["planta"])
-            productor_corto = _truncar(productor, anchos["productor"])
-            especie_corta = _truncar(traducir_especie(especie), anchos["especie"])
-            variedad_corta = _truncar(variedad, anchos["variedad"])
-            est_str = formatear_kg(total_est) if total_est else "-"
-            real_str = formatear_kg(total_real) if total_real else "-"
+        anchos = {"especie": 8, "variedad": 12, "num": 10}
+        ancho_total = anchos["especie"] + anchos["variedad"] + anchos["num"] * 2
+        MAX_SECCIONES = 20
+        secciones_mostradas = 0
+        total_secciones = len(por_planta_productor)
 
-            filas_tabla.append(
-                f"{planta_corta:<{anchos['planta']}}{productor_corto:<{anchos['productor']}}"
-                f"{especie_corta:<{anchos['especie']}}{variedad_corta:<{anchos['variedad']}}"
-                f"{est_str:>{anchos['num']}}{real_str:>{anchos['num']}}"
-            )
+        planta_actual = None
+        for (packing, productor), items in sorted(por_planta_productor.items()):
+            if secciones_mostradas >= MAX_SECCIONES:
+                break
+            secciones_mostradas += 1
 
-        tabla_texto = "\n".join(filas_tabla)
-        lineas.append(f"\n```{tabla_texto}```")
+            if packing != planta_actual:
+                planta_actual = packing
+                lineas.append(f"\n🏭 *{packing}*")
+
+            lineas.append(f"\n{productor}")
+
+            filas_tabla = [
+                f"{'Especie':<{anchos['especie']}}{'Variedad':<{anchos['variedad']}}"
+                f"{'Estimado':>{anchos['num']}}{'Real':>{anchos['num']}}"
+            ]
+            sub_est = 0
+            sub_real = 0
+            for especie, variedad, total_est, total_real in sorted(items, key=lambda x: (x[0], x[1])):
+                sub_est += total_est
+                sub_real += total_real
+                est_str = formatear_kg(total_est) if total_est else "-"
+                real_str = formatear_kg(total_real) if total_real else "-"
+                filas_tabla.append(
+                    f"{_truncar(traducir_especie(especie), anchos['especie']):<{anchos['especie']}}"
+                    f"{_truncar(variedad, anchos['variedad']):<{anchos['variedad']}}"
+                    f"{est_str:>{anchos['num']}}{real_str:>{anchos['num']}}"
+                )
+            if len(items) > 1:
+                filas_tabla.append("-" * ancho_total)
+                filas_tabla.append(
+                    f"{'TOTAL':<{anchos['especie'] + anchos['variedad']}}"
+                    f"{formatear_kg(sub_est):>{anchos['num']}}{formatear_kg(sub_real):>{anchos['num']}}"
+                )
+
+            lineas.append(f"```{chr(10).join(filas_tabla)}```")
+
+        if total_secciones > MAX_SECCIONES:
+            lineas.append(f"\n(mostrando {MAX_SECCIONES} de {total_secciones} productores — acota la consulta para ver el resto)")
 
     lineas.append(
         f"\n📦 Total general: estimado {formatear_kg(total_estimado_gral)} kg, "
