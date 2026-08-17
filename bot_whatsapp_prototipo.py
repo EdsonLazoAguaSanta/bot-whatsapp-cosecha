@@ -9,6 +9,7 @@ import pyodbc
 import requests
 import os
 import io
+import sqlite3
 from datetime import datetime
 from dotenv import load_dotenv
 import logging
@@ -42,6 +43,43 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+HISTORIAL_CLAVE = os.getenv("HISTORIAL_CLAVE", "cambiar_esta_clave")
+
+# ============================================================================
+# HISTORIAL LOCAL DE CONVERSACIONES (SQLite, no toca el SQL Server de Agua Santa)
+# ============================================================================
+
+DB_LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversaciones.db")
+
+def inicializar_db_local():
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversaciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero_sender TEXT,
+            tipo_mensaje TEXT,
+            mensaje TEXT,
+            respuesta TEXT,
+            fecha_hora TEXT DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+inicializar_db_local()
+
+def guardar_conversacion(numero_sender, tipo_mensaje, mensaje, respuesta):
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.execute(
+            "INSERT INTO conversaciones (numero_sender, tipo_mensaje, mensaje, respuesta) VALUES (?, ?, ?, ?)",
+            (numero_sender, tipo_mensaje, mensaje, respuesta)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error guardando conversación: {str(e)}")
 
 # ============================================================================
 # CONEXIÓN SQL SERVER
@@ -601,6 +639,9 @@ async def receive_message(request: Request):
                         # Procesar mensaje
                         respuesta = procesar_mensaje(msg_text)
 
+                        # Guardar en el historial local
+                        guardar_conversacion(numero_sender, msg_type, msg_text, respuesta)
+
                         # Enviar respuesta
                         enviar_whatsapp(numero_sender, respuesta)
         
@@ -649,6 +690,29 @@ async def privacy():
 async def health():
     """Verifica estado del bot"""
     return {"status": "Bot activo y listo"}
+
+@app.get("/historial")
+async def historial(clave: str, limit: int = 50):
+    """
+    Ver las últimas conversaciones registradas (protegido con clave).
+    Uso: https://bot-whatsapp-asa.com/historial?clave=TU_CLAVE&limit=50
+    """
+    if clave != HISTORIAL_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT numero_sender, tipo_mensaje, mensaje, respuesta, fecha_hora "
+            "FROM conversaciones ORDER BY id DESC LIMIT ?",
+            (limit,)
+        )
+        filas = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return {"total": len(filas), "conversaciones": filas}
+    except Exception as e:
+        logger.error(f"Error obteniendo historial: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/test/mensaje")
 async def test_mensaje(mensaje: str):
