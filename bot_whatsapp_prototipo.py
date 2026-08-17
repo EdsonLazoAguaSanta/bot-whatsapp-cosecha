@@ -297,6 +297,129 @@ def obtener_resumen_por_packing(packing):
         logger.error(f"Error en obtener_resumen_por_packing: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
+def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc=""):
+    """
+    filas: lista de tuplas (Especie, Variedad, Productor, total_kg).
+    Arma un texto agrupado por especie -> variedad, con detalle por productor
+    si no son demasiadas filas (para no saturar el mensaje de WhatsApp).
+    """
+    if not filas:
+        return None
+
+    total_general = sum(f[3] for f in filas if f[3])
+
+    por_especie = {}
+    for especie, variedad, productor, total in filas:
+        if not total:
+            continue
+        por_especie.setdefault(especie, {}).setdefault(variedad, []).append((productor, total))
+
+    rango = fecha_inicio if fecha_inicio == fecha_fin else f"{fecha_inicio} a {fecha_fin}"
+    lineas = [f"📅 Cosecha real {rango}{filtro_desc}:"]
+
+    mostrar_productores = len(filas) <= 15
+
+    for especie, variedades in por_especie.items():
+        especie_es = traducir_especie(especie)
+        total_especie = sum(t for vs in variedades.values() for _, t in vs)
+        lineas.append(f"\n🍃 {especie_es}: {formatear_kg(total_especie)} kg")
+        for variedad, productores in variedades.items():
+            total_variedad = sum(t for _, t in productores)
+            if mostrar_productores:
+                detalle_prod = ", ".join(
+                    f"{p}: {formatear_kg(t)} kg" for p, t in sorted(productores, key=lambda x: -x[1])
+                )
+                lineas.append(f"  • {variedad}: {formatear_kg(total_variedad)} kg ({detalle_prod})")
+            else:
+                lineas.append(f"  • {variedad}: {formatear_kg(total_variedad)} kg ({len(productores)} productores)")
+
+    lineas.append(f"\n📦 Total: {formatear_kg(total_general)} kg")
+    return "\n".join(lineas)
+
+def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad=None, productor=None):
+    """
+    Detalle de cosecha REAL entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
+    agrupado por especie, variedad y productor, con totales. Filtros opcionales.
+    """
+    try:
+        if not fecha_fin:
+            fecha_fin = fecha_inicio
+
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+        condiciones = ["[Base Origen] = ?", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
+        params = [BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        filtro_desc = ""
+        if especie:
+            condiciones.append("Especie LIKE ?")
+            params.append(f"%{especie}%")
+            filtro_desc += f" de {traducir_especie(especie)}"
+        if variedad:
+            condiciones.append("Variedad LIKE ?")
+            params.append(f"%{variedad}%")
+            filtro_desc += f" ({variedad.upper()})"
+        if productor:
+            condiciones.append("Productor LIKE ?")
+            params.append(f"%{productor}%")
+            filtro_desc += f" del productor {productor.upper()}"
+
+        where = " AND ".join(condiciones)
+        query = f"""
+            SELECT Especie, Variedad, Productor, SUM(KgsRecepcionados) as total
+            FROM [Recepcion_Consolidada]
+            WHERE {where}
+            GROUP BY Especie, Variedad, Productor
+            HAVING SUM(KgsRecepcionados) > 0
+            ORDER BY Especie, Variedad, total DESC
+        """
+        cursor.execute(query, params)
+        filas = cursor.fetchall()
+        conn.close()
+
+        resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc)
+        if not resultado:
+            return f"No hay cosecha real registrada{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
+        return resultado
+    except Exception as e:
+        logger.error(f"Error en obtener_cosecha_detalle: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
+def obtener_ultima_cosecha(especie=None, variedad=None):
+    """Encuentra la última fecha con cosecha real de una especie o variedad, y muestra su detalle"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+        condiciones = ["[Base Origen] = ?", "KgsRecepcionados > 0"]
+        params = [BASE_ORIGEN_REAL]
+        if especie:
+            condiciones.append("Especie LIKE ?")
+            params.append(f"%{especie}%")
+        if variedad:
+            condiciones.append("Variedad LIKE ?")
+            params.append(f"%{variedad}%")
+        where = " AND ".join(condiciones)
+
+        cursor.execute(f"SELECT MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE {where}", params)
+        fila = cursor.fetchone()
+        conn.close()
+
+        ultima_fecha = fila[0] if fila else None
+        if not ultima_fecha:
+            referencia = especie or variedad or ""
+            return f"No encontré cosecha real registrada de {referencia}" if referencia else "No encontré cosecha real registrada"
+
+        fecha_str = ultima_fecha.strftime("%Y-%m-%d") if hasattr(ultima_fecha, "strftime") else str(ultima_fecha)
+        return obtener_cosecha_detalle(fecha_str, fecha_str, especie=especie, variedad=variedad)
+    except Exception as e:
+        logger.error(f"Error en obtener_ultima_cosecha: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
 # ============================================================================
 # PROCESAMIENTO DE MENSAJES
 # ============================================================================
@@ -423,6 +546,53 @@ TOOLS = [
             "required": ["packing"]
         }
     },
+    {
+        "name": "consultar_ultima_cosecha",
+        "description": "Encuentra cuándo fue la última fecha con cosecha REAL registrada de una especie o variedad, y muestra el detalle de esa fecha (variedades, productores, totales). Usar para preguntas como '¿cuándo fue la última cosecha de mandarinas?'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "especie": {
+                    "type": "string",
+                    "description": "Especie mencionada por el usuario, traducida al nombre EXACTO en inglés de la lista de especies conocidas (ej. 'mandarina' -> 'MANDARIN'). Opcional si se da variedad."
+                },
+                "variedad": {
+                    "type": "string",
+                    "description": "Variedad específica mencionada por el usuario. Opcional si se da especie."
+                }
+            }
+        }
+    },
+    {
+        "name": "consultar_cosecha_detalle",
+        "description": "Consulta el detalle de cosecha REAL entre dos fechas (o una sola fecha), agrupado por especie, variedad y productor, con totales. Usar para preguntas como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', opcionalmente filtrado por especie, variedad o productor.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fecha_inicio": {
+                    "type": "string",
+                    "description": "Fecha de inicio en formato YYYY-MM-DD, calculada a partir de la fecha de hoy y lo que diga el usuario."
+                },
+                "fecha_fin": {
+                    "type": "string",
+                    "description": "Fecha de fin en formato YYYY-MM-DD. Si el usuario pregunta por un solo día, omite este campo."
+                },
+                "especie": {
+                    "type": "string",
+                    "description": "Especie mencionada por el usuario, traducida al nombre EXACTO en inglés de la lista de especies conocidas. Opcional."
+                },
+                "variedad": {
+                    "type": "string",
+                    "description": "Variedad mencionada por el usuario. Opcional."
+                },
+                "productor": {
+                    "type": "string",
+                    "description": "Productor o fundo mencionado por el usuario. Opcional."
+                }
+            },
+            "required": ["fecha_inicio"]
+        }
+    },
 ]
 
 def construir_system_prompt():
@@ -431,20 +601,24 @@ def construir_system_prompt():
     else:
         lista_variedades = "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
 
+    lista_especies = ", ".join(f"{en} ({es})" for en, es in ESPECIE_TRADUCCION.items())
+
     hoy = datetime.now().strftime("%Y-%m-%d (%A)")
 
     return f"""Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
 
 Hoy es {hoy}. Usa esta fecha como referencia para calcular fechas relativas que mencione el usuario
-("ayer", "hoy", "mañana", "el lunes pasado", "el 12 de agosto", etc.) y pásalas a las herramientas en
-formato YYYY-MM-DD.
+("ayer", "hoy", "mañana", "el lunes pasado", "el 12 de agosto", "entre el 1 y el 15 de agosto", etc.)
+y pásalas a las herramientas en formato YYYY-MM-DD.
 
 Tienes herramientas para consultar, por variedad: estimado de temporada (trisemanal), cosecha real en
 una fecha, calibre promedio, y comparación de avance (estimado vs cosechado real) en una fecha.
-También puedes consultar resúmenes por productor o por packing (no requieren variedad).
+También puedes consultar resúmenes por productor o por packing (no requieren variedad), cuándo fue la
+última cosecha real de una especie o variedad, y el detalle de cosecha real entre un rango de fechas
+(agrupado por especie/variedad/productor, opcionalmente filtrado por especie, variedad o productor).
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
-(o puedas inferir) el dato que falta (variedad, productor, packing, fecha).
+(o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
 
 VARIEDADES CONOCIDAS EN EL SISTEMA (nombre exacto como está en la base de datos):
 {lista_variedades}
@@ -455,16 +629,39 @@ distinto (sin tildes, con errores de tipeo, abreviada, en otro idioma, etc. — 
 Si no reconoces ninguna variedad de la lista que calce razonablemente, pídele al usuario que aclare
 en vez de adivinar.
 
+ESPECIES CONOCIDAS EN EL SISTEMA (nombre real en inglés y su traducción):
+{lista_especies}
+
+Cuando el usuario mencione una especie (en español, plural, singular, etc.), pasa a la herramienta el
+nombre EXACTO en inglés de esta lista (ej. "mandarinas" -> "MANDARIN", "uva" -> "GRAPE").
+
 Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna herramienta, respóndele tú
 directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer.
 
-Si falta la variedad, productor o packing para poder consultar, pídeselo al usuario en vez de inventarlo."""
+Si falta la variedad, especie, productor o packing para poder consultar, pídeselo al usuario en vez de
+inventarlo."""
 
 def ejecutar_tool(tool_name, tool_input):
     if tool_name == "consultar_resumen_productor":
         return obtener_resumen_por_productor(tool_input.get("productor", ""))
     if tool_name == "consultar_resumen_packing":
         return obtener_resumen_por_packing(tool_input.get("packing", ""))
+
+    if tool_name == "consultar_ultima_cosecha":
+        especie = tool_input.get("especie") or None
+        variedad_op = normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None
+        return obtener_ultima_cosecha(especie=especie, variedad=variedad_op)
+
+    if tool_name == "consultar_cosecha_detalle":
+        especie = tool_input.get("especie") or None
+        variedad_op = normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None
+        return obtener_cosecha_detalle(
+            fecha_inicio=tool_input.get("fecha_inicio"),
+            fecha_fin=tool_input.get("fecha_fin") or None,
+            especie=especie,
+            variedad=variedad_op,
+            productor=tool_input.get("productor") or None,
+        )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
     fecha = tool_input.get("fecha") or None
