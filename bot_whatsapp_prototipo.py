@@ -297,49 +297,87 @@ def obtener_resumen_por_packing(packing):
         logger.error(f"Error en obtener_resumen_por_packing: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc=""):
+UMBRAL_DIAS_TABLA_DETALLADA = 14
+MAX_GRUPOS_TABLA = 8
+
+def _fecha_str(fecha):
+    return fecha.strftime("%d-%m-%Y") if hasattr(fecha, "strftime") else str(fecha)
+
+def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True):
     """
-    filas: lista de tuplas (Especie, Variedad, Productor, total_kg).
-    Arma un texto agrupado por especie -> variedad, con detalle por productor
-    si no son demasiadas filas (para no saturar el mensaje de WhatsApp).
+    filas: lista de tuplas (Packing, Productor, Variedad, Fecha, Base Origen, total_kg).
+    Arma una respuesta en tablas de texto monoespaciado (bloques ```), agrupada por
+    Productor + Variedad, con columnas Trisemanal (estimado) y Recepción Planta (real)
+    por fecha. Si hay demasiados grupos o demasiados días, colapsa a solo totales.
     """
     if not filas:
         return None
 
-    total_general = sum(f[3] for f in filas if f[3])
-
-    por_especie = {}
-    for especie, variedad, productor, total in filas:
+    grupos = {}  # (packing, productor, variedad) -> {fecha: {"estimado":x, "real":y}}
+    for packing, productor, variedad, fecha, base_origen, total in filas:
         if not total:
             continue
-        por_especie.setdefault(especie, {}).setdefault(variedad, []).append((productor, total))
+        # Normaliza mayúsculas: la misma planta/productor puede venir escrito distinto
+        # según si la fila es 'Trisemanal' o 'Recepción Planta' en la base de origen.
+        clave = ((packing or "").strip().upper(), (productor or "").strip().upper(), (variedad or "").strip().upper())
+        clave_valor = "estimado" if base_origen == BASE_ORIGEN_ESTIMADO else "real"
+        grupos.setdefault(clave, {}).setdefault(fecha, {})[clave_valor] = total
+
+    if not grupos:
+        return None
 
     rango = fecha_inicio if fecha_inicio == fecha_fin else f"{fecha_inicio} a {fecha_fin}"
-    lineas = [f"📅 Cosecha real {rango}{filtro_desc}:"]
+    lineas = [f"📅 Detalle {rango}{filtro_desc}:"]
 
-    mostrar_productores = len(filas) <= 15
+    tabla_completa = mostrar_fechas and len(grupos) <= MAX_GRUPOS_TABLA
+    total_estimado_gral = 0
+    total_real_gral = 0
+    grupos_mostrados = 0
 
-    for especie, variedades in por_especie.items():
-        especie_es = traducir_especie(especie)
-        total_especie = sum(t for vs in variedades.values() for _, t in vs)
-        lineas.append(f"\n🍃 {especie_es}: {formatear_kg(total_especie)} kg")
-        for variedad, productores in variedades.items():
-            total_variedad = sum(t for _, t in productores)
-            if mostrar_productores:
-                detalle_prod = ", ".join(
-                    f"{p}: {formatear_kg(t)} kg" for p, t in sorted(productores, key=lambda x: -x[1])
-                )
-                lineas.append(f"  • {variedad}: {formatear_kg(total_variedad)} kg ({detalle_prod})")
-            else:
-                lineas.append(f"  • {variedad}: {formatear_kg(total_variedad)} kg ({len(productores)} productores)")
+    for (packing, productor, variedad), fechas in sorted(grupos.items()):
+        total_est = sum(v.get("estimado", 0) or 0 for v in fechas.values())
+        total_real = sum(v.get("real", 0) or 0 for v in fechas.values())
+        total_estimado_gral += total_est
+        total_real_gral += total_real
 
-    lineas.append(f"\n📦 Total: {formatear_kg(total_general)} kg")
+        if not tabla_completa or grupos_mostrados >= MAX_GRUPOS_TABLA:
+            grupos_mostrados += 1
+            lineas.append(
+                f"\n🏭 {packing} · {productor} · {variedad}: "
+                f"estimado {formatear_kg(total_est)} kg, real {formatear_kg(total_real)} kg"
+            )
+            continue
+
+        grupos_mostrados += 1
+        filas_tabla = [f"{'Fecha':<11}{'Trisem.':>9}{'Real':>9}"]
+        for fecha in sorted(fechas.keys()):
+            vals = fechas[fecha]
+            est = vals.get("estimado", 0) or 0
+            real = vals.get("real", 0) or 0
+            est_str = formatear_kg(est) if est else "-"
+            real_str = formatear_kg(real) if real else "-"
+            filas_tabla.append(f"{_fecha_str(fecha):<11}{est_str:>9}{real_str:>9}")
+        filas_tabla.append("-" * 29)
+        filas_tabla.append(f"{'TOTAL':<11}{formatear_kg(total_est):>9}{formatear_kg(total_real):>9}")
+
+        tabla_texto = "\n".join(filas_tabla)
+        lineas.append(f"\n🏭 {packing} · {productor} · {variedad}\n```{tabla_texto}```")
+
+    if len(grupos) > MAX_GRUPOS_TABLA and tabla_completa:
+        lineas.append(f"\n(mostrando resumen de {len(grupos)} grupos)")
+
+    lineas.append(
+        f"\n📦 Total general: estimado {formatear_kg(total_estimado_gral)} kg, "
+        f"real {formatear_kg(total_real_gral)} kg"
+    )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad=None, productor=None):
+def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None):
     """
-    Detalle de cosecha REAL entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
-    agrupado por especie, variedad y productor, con totales. Filtros opcionales.
+    Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
+    con columnas de estimado (Trisemanal) y real (Recepción Planta) por fecha, agrupado por
+    packing/productor/variedad. Filtros opcionales. Si el rango es muy amplio o hay muchos
+    grupos, se colapsa a solo totales para no saturar el mensaje.
     """
     try:
         if not fecha_fin:
@@ -350,8 +388,8 @@ def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad
             return "Error de conexión a base de datos"
 
         cursor = conn.cursor()
-        condiciones = ["[Base Origen] = ?", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
-        params = [BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        condiciones = ["[Base Origen] IN (?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
+        params = [BASE_ORIGEN_ESTIMADO, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
         filtro_desc = ""
         if especie:
             condiciones.append("Especie LIKE ?")
@@ -365,23 +403,34 @@ def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad
             condiciones.append("Productor LIKE ?")
             params.append(f"%{productor}%")
             filtro_desc += f" del productor {productor.upper()}"
+        if packing:
+            condiciones.append("Packing LIKE ?")
+            params.append(f"%{packing}%")
+            filtro_desc += f" en {packing.upper()}"
 
         where = " AND ".join(condiciones)
         query = f"""
-            SELECT Especie, Variedad, Productor, SUM(KgsRecepcionados) as total
+            SELECT Packing, Productor, Variedad, CAST(Fecha AS DATE) as Fecha, [Base Origen],
+                   SUM(KgsRecepcionados) as total
             FROM [Recepcion_Consolidada]
             WHERE {where}
-            GROUP BY Especie, Variedad, Productor
+            GROUP BY Packing, Productor, Variedad, CAST(Fecha AS DATE), [Base Origen]
             HAVING SUM(KgsRecepcionados) > 0
-            ORDER BY Especie, Variedad, total DESC
+            ORDER BY Packing, Productor, Variedad, Fecha
         """
         cursor.execute(query, params)
         filas = cursor.fetchall()
         conn.close()
 
-        resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc)
+        try:
+            dias_rango = (datetime.strptime(fecha_fin, "%Y-%m-%d") - datetime.strptime(fecha_inicio, "%Y-%m-%d")).days
+        except ValueError:
+            dias_rango = 0
+        mostrar_fechas = dias_rango <= UMBRAL_DIAS_TABLA_DETALLADA
+
+        resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc, mostrar_fechas)
         if not resultado:
-            return f"No hay cosecha real registrada{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
+            return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
         return resultado
     except Exception as e:
         logger.error(f"Error en obtener_cosecha_detalle: {str(e)}")
@@ -448,6 +497,33 @@ def cargar_variedades_conocidas():
         return []
 
 VARIEDADES_CONOCIDAS = cargar_variedades_conocidas()
+
+# Alias de plantas/packing conocidos, dados por el usuario (Agua Santa)
+ALIAS_PACKING = {
+    "PACKING SANTA ANA DEL HUIQUE": ["Planta Santa Ana", "Packing Santa Ana", "Santa Ana"],
+    "PLANTA ALMAHUE": ["Almahue"],
+    "PLANTA EL CARMELO": ["El Carmelo"],
+    "PLANTA EL PARQUE": ["El Parque"],
+    "PLANTA LISONJERA": ["Lisonjera"],
+}
+
+def cargar_packings_conocidos():
+    """Carga los nombres reales de Packing/Planta desde la base de datos"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT Packing FROM [Recepcion_Consolidada] WHERE Packing IS NOT NULL")
+        packings = sorted(set(row[0].strip() for row in cursor.fetchall() if row[0] and row[0].strip()))
+        conn.close()
+        logger.info(f"Cargados {len(packings)} packings conocidos")
+        return packings
+    except Exception as e:
+        logger.error(f"Error cargando packings conocidos: {str(e)}")
+        return []
+
+PACKINGS_CONOCIDOS = cargar_packings_conocidos()
 
 def normalizar_variedad(variedad_usuario):
     """Limpia espacios; la traducción al nombre exacto ya la hace Claude usando VARIEDADES_CONOCIDAS"""
@@ -565,7 +641,7 @@ TOOLS = [
     },
     {
         "name": "consultar_cosecha_detalle",
-        "description": "Consulta el detalle de cosecha REAL entre dos fechas (o una sola fecha), agrupado por especie, variedad y productor, con totales. Usar para preguntas como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', opcionalmente filtrado por especie, variedad o productor.",
+        "description": "Consulta el detalle de cosecha (estimado trisemanal y real) entre dos fechas (o una sola fecha), agrupado por packing/productor/variedad, con desglose por fecha si el rango no es muy amplio. Usar para preguntas como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', 'kilos recepcionados en tal planta', opcionalmente filtrado por especie, variedad, productor o packing/planta.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -588,6 +664,10 @@ TOOLS = [
                 "productor": {
                     "type": "string",
                     "description": "Productor o fundo mencionado por el usuario. Opcional."
+                },
+                "packing": {
+                    "type": "string",
+                    "description": "Planta o packing mencionado por el usuario (ej. 'recepcionado en Almahue'), traducido al nombre EXACTO de la lista de packings conocidos. 'Recepcionado' o 'recibido' en una planta/packing se refiere a esto. Opcional."
                 }
             },
             "required": ["fecha_inicio"]
@@ -602,6 +682,15 @@ def construir_system_prompt():
         lista_variedades = "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
 
     lista_especies = ", ".join(f"{en} ({es})" for en, es in ESPECIE_TRADUCCION.items())
+
+    if PACKINGS_CONOCIDOS:
+        lista_packings = ", ".join(PACKINGS_CONOCIDOS)
+    else:
+        lista_packings = "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
+
+    alias_packing_texto = "; ".join(
+        f'{real} = {" / ".join(alias)}' for real, alias in ALIAS_PACKING.items()
+    )
 
     hoy = datetime.now().strftime("%Y-%m-%d (%A)")
 
@@ -635,6 +724,16 @@ ESPECIES CONOCIDAS EN EL SISTEMA (nombre real en inglés y su traducción):
 Cuando el usuario mencione una especie (en español, plural, singular, etc.), pasa a la herramienta el
 nombre EXACTO en inglés de esta lista (ej. "mandarinas" -> "MANDARIN", "uva" -> "GRAPE").
 
+PACKINGS/PLANTAS CONOCIDOS EN EL SISTEMA (nombre exacto como está en la base de datos):
+{lista_packings}
+
+Alias conocidos para packings/plantas: {alias_packing_texto}
+
+Cuando el usuario mencione una planta o packing (con su nombre completo o un alias, ej. "recepcionado
+en Almahue", "recibido en Santa Ana"), pasa a la herramienta el nombre EXACTO de la lista de packings.
+Las palabras "recepcionado" o "recibido" en una planta/packing significan lo mismo que "cosechado real"
+pero filtrado por esa planta.
+
 Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna herramienta, respóndele tú
 directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer.
 
@@ -661,6 +760,7 @@ def ejecutar_tool(tool_name, tool_input):
             especie=especie,
             variedad=variedad_op,
             productor=tool_input.get("productor") or None,
+            packing=tool_input.get("packing") or None,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
