@@ -336,12 +336,13 @@ def _truncar(texto, ancho):
         return texto
     return texto[:ancho - 1] + "…"
 
-def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True):
+def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True, unidad="kg"):
     """
-    filas: lista de tuplas (Packing, Productor, Especie, Variedad, Fecha, Base Origen, total_kg).
+    filas: lista de tuplas (Packing, Productor, Especie, Variedad, Fecha, Base Origen, total).
     Si el rango es corto y hay pocos grupos, arma una tabla de fecha x (estimado, real) por
     cada packing/productor/variedad. Si no, colapsa a una tabla única con columnas
     Planta | Productor | Especie | Variedad | Estimado | Real.
+    unidad: etiqueta del total (ej. "kg", "BINS", "TOTES") según qué columna se sumó.
     """
     if not filas:
         return None
@@ -450,12 +451,12 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
             lineas.append(f"\n(mostrando {MAX_SECCIONES} de {total_secciones} productores — acota la consulta para ver el resto)")
 
     lineas.append(
-        f"\n📦 Total general: estimado {formatear_kg(total_estimado_gral)} kg, "
-        f"real {formatear_kg(total_real_gral)} kg"
+        f"\n📦 Total general: estimado {formatear_kg(total_estimado_gral)} {unidad}, "
+        f"real {formatear_kg(total_real_gral)} {unidad}"
     )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False):
+def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False, envase=None):
     """
     Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
     con columnas de estimado (Trisemanal) y real (Recepción Planta) por fecha, agrupado por
@@ -463,6 +464,9 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
     grupos, se colapsa a solo totales para no saturar el mensaje.
     Si no se da fecha_inicio, se usa el inicio de la temporada vigente hasta hoy (para
     preguntas tipo "toda la temporada", "hasta hoy", sin fechas explícitas).
+    Si se da envase (ej. "BINS", "TOTES", "CAJA EQ"), se filtra por ese tipo de envase y se
+    suma la cantidad real de unidades (Bultos) en vez de kilos, sin inventar factores de
+    conversión (los factores kg/unidad no son confiables en los datos históricos).
     """
     try:
         conn = conectar_sql()
@@ -513,14 +517,23 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
             params.append(f"%{packing}%")
             filtro_desc += f" en {packing.upper()}"
 
+        columna_suma = "KgsRecepcionados"
+        unidad = "kg"
+        if envase:
+            condiciones.append("Envase LIKE ?")
+            params.append(f"%{envase}%")
+            filtro_desc += f" en {envase.upper()}"
+            columna_suma = "Bultos"
+            unidad = envase.upper()
+
         where = " AND ".join(condiciones)
         query = f"""
             SELECT Packing, Productor, Especie, Variedad, CAST(Fecha AS DATE) as Fecha, [Base Origen],
-                   SUM(KgsRecepcionados) as total
+                   SUM({columna_suma}) as total
             FROM [Recepcion_Consolidada]
             WHERE {where}
             GROUP BY Packing, Productor, Especie, Variedad, CAST(Fecha AS DATE), [Base Origen]
-            HAVING SUM(KgsRecepcionados) > 0
+            HAVING SUM({columna_suma}) > 0
             ORDER BY Packing, Productor, Variedad, Fecha
         """
         cursor.execute(query, params)
@@ -533,7 +546,7 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
             dias_rango = 0
         mostrar_fechas = forzar_fechas or dias_rango <= UMBRAL_DIAS_TABLA_DETALLADA
 
-        resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc, mostrar_fechas)
+        resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc, mostrar_fechas, unidad)
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
         return resultado
@@ -632,6 +645,24 @@ def cargar_packings_conocidos():
         return []
 
 PACKINGS_CONOCIDOS = cargar_packings_conocidos()
+
+def cargar_envases_conocidos():
+    """Carga los tipos de envase reales desde la base de datos (bins, totes, cajas, etc.)"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT Envase FROM [Recepcion_Consolidada] WHERE Envase IS NOT NULL")
+        envases = sorted(set(row[0].strip() for row in cursor.fetchall() if row[0] and row[0].strip()))
+        conn.close()
+        logger.info(f"Cargados {len(envases)} tipos de envase conocidos")
+        return envases
+    except Exception as e:
+        logger.error(f"Error cargando envases conocidos: {str(e)}")
+        return []
+
+ENVASES_CONOCIDOS = cargar_envases_conocidos()
 
 def normalizar_variedad(variedad_usuario):
     """Limpia espacios; la traducción al nombre exacto ya la hace Claude usando VARIEDADES_CONOCIDAS"""
@@ -784,6 +815,10 @@ TOOLS = [
                 "detalle_por_fecha": {
                     "type": "boolean",
                     "description": "Poner en true SIEMPRE que el usuario use la palabra 'detalle' (o pida explícitamente el desglose por fecha), aunque el rango de fechas sea amplio. Fuerza a mostrar la tabla con una fila por cada fecha en vez de solo totales. Omitir o dejar en false si no se pidió detalle explícitamente."
+                },
+                "envase": {
+                    "type": "string",
+                    "description": "SOLO si el usuario pregunta específicamente por bins, totes, cajas u otro tipo de envase/contenedor (no si pregunta por kilos). Traducir al nombre EXACTO de la lista de envases conocidos (ej. 'bins' -> 'BINS'). Cuando se da, la respuesta muestra la cantidad real de unidades de ese envase en vez de kilos (no se convierte desde kilos, es la cantidad real registrada). Omitir si el usuario pregunta por kilos/kg."
                 }
             }
         }
@@ -806,6 +841,11 @@ def construir_system_prompt():
     alias_packing_texto = "; ".join(
         f'{real} = {" / ".join(alias)}' for real, alias in ALIAS_PACKING.items()
     )
+
+    if ENVASES_CONOCIDOS:
+        lista_envases = ", ".join(ENVASES_CONOCIDOS)
+    else:
+        lista_envases = "(lista no disponible por ahora)"
 
     hoy = datetime.now().strftime("%Y-%m-%d (%A)")
 
@@ -857,6 +897,15 @@ en Almahue", "recibido en Santa Ana"), pasa a la herramienta el nombre EXACTO de
 Las palabras "recepcionado" o "recibido" en una planta/packing significan lo mismo que "cosechado real"
 pero filtrado por esa planta.
 
+TIPOS DE ENVASE CONOCIDOS EN EL SISTEMA (nombre exacto como está en la base de datos):
+{lista_envases}
+
+Si el usuario pregunta específicamente por bins, totes, cajas u otro contenedor físico (no por kilos),
+usa el parámetro "envase" de consultar_cosecha_detalle con el nombre EXACTO de esta lista. Esto muestra
+la cantidad REAL de unidades registradas de ese envase, no una conversión calculada desde kilos (los
+kilos por unidad varían según la fruta y no son un factor fijo confiable). Si el usuario pregunta por
+kilos/kg, no uses este parámetro.
+
 Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna herramienta, respóndele tú
 directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer.
 
@@ -885,6 +934,7 @@ def ejecutar_tool(tool_name, tool_input):
             productor=tool_input.get("productor") or None,
             packing=tool_input.get("packing") or None,
             forzar_fechas=bool(tool_input.get("detalle_por_fecha")),
+            envase=tool_input.get("envase") or None,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
