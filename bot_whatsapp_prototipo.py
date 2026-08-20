@@ -428,7 +428,7 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
     )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None):
+def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False):
     """
     Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
     con columnas de estimado (Trisemanal) y real (Recepción Planta) por fecha, agrupado por
@@ -482,7 +482,7 @@ def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad
             dias_rango = (datetime.strptime(fecha_fin, "%Y-%m-%d") - datetime.strptime(fecha_inicio, "%Y-%m-%d")).days
         except ValueError:
             dias_rango = 0
-        mostrar_fechas = dias_rango <= UMBRAL_DIAS_TABLA_DETALLADA
+        mostrar_fechas = forzar_fechas or dias_rango <= UMBRAL_DIAS_TABLA_DETALLADA
 
         resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc, mostrar_fechas)
         if not resultado:
@@ -724,6 +724,10 @@ TOOLS = [
                 "packing": {
                     "type": "string",
                     "description": "Planta o packing mencionado por el usuario (ej. 'recepcionado en Almahue'), traducido al nombre EXACTO de la lista de packings conocidos. 'Recepcionado' o 'recibido' en una planta/packing se refiere a esto. Opcional."
+                },
+                "detalle_por_fecha": {
+                    "type": "boolean",
+                    "description": "Poner en true SIEMPRE que el usuario use la palabra 'detalle' (o pida explícitamente el desglose por fecha), aunque el rango de fechas sea amplio. Fuerza a mostrar la tabla con una fila por cada fecha en vez de solo totales. Omitir o dejar en false si no se pidió detalle explícitamente."
                 }
             },
             "required": ["fecha_inicio"]
@@ -764,6 +768,10 @@ También puedes consultar resúmenes por productor o por packing (no requieren v
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
+
+Si el usuario usa la palabra "detalle" (ej. "dame el detalle de...", "detalle de cosecha de..."), SIEMPRE
+llama a consultar_cosecha_detalle con detalle_por_fecha=true, aunque pregunte solo por la cosecha en
+general y no mencione fechas explícitamente — igual debe mostrarse el desglose por fecha.
 
 VARIEDADES CONOCIDAS EN EL SISTEMA (nombre exacto como está en la base de datos):
 {lista_variedades}
@@ -817,6 +825,7 @@ def ejecutar_tool(tool_name, tool_input):
             variedad=variedad_op,
             productor=tool_input.get("productor") or None,
             packing=tool_input.get("packing") or None,
+            forzar_fechas=bool(tool_input.get("detalle_por_fecha")),
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
@@ -847,7 +856,12 @@ def procesar_mensaje(texto_mensaje):
 
         tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
         if tool_use_block:
-            return ejecutar_tool(tool_use_block.name, tool_use_block.input)
+            tool_input = tool_use_block.input
+            # Si el usuario pidió "detalle" explícitamente, forzamos el desglose por fecha
+            # sin depender de que Claude lo haya marcado (instrucción "sí o sí").
+            if tool_use_block.name == "consultar_cosecha_detalle" and "detalle" in texto_mensaje.lower():
+                tool_input = {**tool_input, "detalle_por_fecha": True}
+            return ejecutar_tool(tool_use_block.name, tool_input)
 
         text_block = next((b for b in response.content if b.type == "text"), None)
         if text_block:
