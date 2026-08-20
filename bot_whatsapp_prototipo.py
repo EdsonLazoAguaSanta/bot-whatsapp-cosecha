@@ -428,22 +428,44 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
     )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False):
+def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False):
     """
     Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
     con columnas de estimado (Trisemanal) y real (Recepción Planta) por fecha, agrupado por
     packing/productor/variedad. Filtros opcionales. Si el rango es muy amplio o hay muchos
     grupos, se colapsa a solo totales para no saturar el mensaje.
+    Si no se da fecha_inicio, se usa el inicio de la temporada vigente hasta hoy (para
+    preguntas tipo "toda la temporada", "hasta hoy", sin fechas explícitas).
     """
     try:
-        if not fecha_fin:
-            fecha_fin = fecha_inicio
-
         conn = conectar_sql()
         if not conn:
             return "Error de conexión a base de datos"
 
         cursor = conn.cursor()
+
+        if not fecha_inicio:
+            cursor.execute("""
+                SELECT MIN(CAST(Fecha AS DATE))
+                FROM [Recepcion_Consolidada]
+                WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+            """)
+            fila = cursor.fetchone()
+            if not fila or not fila[0]:
+                conn.close()
+                return "No pude determinar el inicio de temporada. ¿Puedes darme una fecha o rango específico?"
+            fecha_inicio = fila[0].strftime("%Y-%m-%d")
+            fecha_fin = datetime.now().strftime("%Y-%m-%d")
+        elif not fecha_fin:
+            fecha_fin = fecha_inicio
+
+        try:
+            datetime.strptime(fecha_inicio, "%Y-%m-%d")
+            datetime.strptime(fecha_fin, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            conn.close()
+            return "No entendí el rango de fechas. ¿Puedes indicarlo como 'entre el DD-MM-YYYY y el DD-MM-YYYY'?"
+
         condiciones = ["[Base Origen] IN (?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
         params = [BASE_ORIGEN_ESTIMADO, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
         filtro_desc = ""
@@ -492,8 +514,8 @@ def obtener_cosecha_detalle(fecha_inicio, fecha_fin=None, especie=None, variedad
         logger.error(f"Error en obtener_cosecha_detalle: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def obtener_ultima_cosecha(especie=None, variedad=None):
-    """Encuentra la última fecha con cosecha real de una especie o variedad, y muestra su detalle"""
+def obtener_ultima_cosecha(especie=None, variedad=None, packing=None):
+    """Encuentra la última fecha con cosecha real de una especie, variedad y/o packing, y muestra su detalle"""
     try:
         conn = conectar_sql()
         if not conn:
@@ -508,6 +530,9 @@ def obtener_ultima_cosecha(especie=None, variedad=None):
         if variedad:
             condiciones.append("Variedad LIKE ?")
             params.append(f"%{variedad}%")
+        if packing:
+            condiciones.append("Packing LIKE ?")
+            params.append(f"%{packing}%")
         where = " AND ".join(condiciones)
 
         cursor.execute(f"SELECT MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE {where}", params)
@@ -516,11 +541,11 @@ def obtener_ultima_cosecha(especie=None, variedad=None):
 
         ultima_fecha = fila[0] if fila else None
         if not ultima_fecha:
-            referencia = especie or variedad or ""
+            referencia = especie or variedad or packing or ""
             return f"No encontré cosecha real registrada de {referencia}" if referencia else "No encontré cosecha real registrada"
 
         fecha_str = ultima_fecha.strftime("%Y-%m-%d") if hasattr(ultima_fecha, "strftime") else str(ultima_fecha)
-        return obtener_cosecha_detalle(fecha_str, fecha_str, especie=especie, variedad=variedad)
+        return obtener_cosecha_detalle(fecha_str, fecha_str, especie=especie, variedad=variedad, packing=packing)
     except Exception as e:
         logger.error(f"Error en obtener_ultima_cosecha: {str(e)}")
         return f"Error al consultar: {str(e)}"
@@ -680,30 +705,34 @@ TOOLS = [
     },
     {
         "name": "consultar_ultima_cosecha",
-        "description": "Encuentra cuándo fue la última fecha con cosecha REAL registrada de una especie o variedad, y muestra el detalle de esa fecha (variedades, productores, totales). Usar para preguntas como '¿cuándo fue la última cosecha de mandarinas?'.",
+        "description": "Encuentra cuándo fue la última fecha con cosecha REAL registrada de una especie, variedad y/o packing/planta, y muestra el detalle de esa fecha (variedades, productores, totales). Usar para preguntas como '¿cuándo fue la última cosecha de mandarinas?' o '¿cuándo fue la última recepción de cerezas en Lisonjera?'.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "especie": {
                     "type": "string",
-                    "description": "Especie mencionada por el usuario, traducida al nombre EXACTO en inglés de la lista de especies conocidas (ej. 'mandarina' -> 'MANDARIN'). Opcional si se da variedad."
+                    "description": "Especie mencionada por el usuario, traducida al nombre EXACTO en inglés de la lista de especies conocidas (ej. 'mandarina' -> 'MANDARIN'). Opcional."
                 },
                 "variedad": {
                     "type": "string",
-                    "description": "Variedad específica mencionada por el usuario. Opcional si se da especie."
+                    "description": "Variedad específica mencionada por el usuario. Opcional."
+                },
+                "packing": {
+                    "type": "string",
+                    "description": "Planta o packing mencionado por el usuario, traducido al nombre EXACTO de la lista de packings conocidos. Opcional."
                 }
             }
         }
     },
     {
         "name": "consultar_cosecha_detalle",
-        "description": "Consulta el detalle de cosecha (estimado trisemanal y real) entre dos fechas (o una sola fecha), agrupado por packing/productor/variedad, con desglose por fecha si el rango no es muy amplio. Usar para preguntas como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', 'kilos recepcionados en tal planta', opcionalmente filtrado por especie, variedad, productor o packing/planta.",
+        "description": "Consulta el detalle de cosecha (estimado trisemanal y real), agrupado por packing/productor/variedad, con desglose por fecha si el rango no es muy amplio. Usar para preguntas como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', 'kilos recepcionados en tal planta', '¿cuánto se ha cosechado esta temporada/hasta hoy?', opcionalmente filtrado por especie, variedad, productor o packing/planta. Si el usuario NO da ninguna fecha (ej. 'toda la temporada', 'hasta hoy', 'cuánto llevamos'), omite fecha_inicio y fecha_fin por completo: se usa automáticamente desde el inicio de la temporada vigente hasta hoy.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "fecha_inicio": {
                     "type": "string",
-                    "description": "Fecha de inicio en formato YYYY-MM-DD, calculada a partir de la fecha de hoy y lo que diga el usuario."
+                    "description": "Fecha de inicio en formato YYYY-MM-DD, calculada a partir de la fecha de hoy y lo que diga el usuario. Omitir por completo si el usuario no menciona ninguna fecha o rango (se usará toda la temporada vigente)."
                 },
                 "fecha_fin": {
                     "type": "string",
@@ -729,8 +758,7 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Poner en true SIEMPRE que el usuario use la palabra 'detalle' (o pida explícitamente el desglose por fecha), aunque el rango de fechas sea amplio. Fuerza a mostrar la tabla con una fila por cada fecha en vez de solo totales. Omitir o dejar en false si no se pidió detalle explícitamente."
                 }
-            },
-            "required": ["fecha_inicio"]
+            }
         }
     },
 ]
@@ -758,7 +786,11 @@ def construir_system_prompt():
 
 Hoy es {hoy}. Usa esta fecha como referencia para calcular fechas relativas que mencione el usuario
 ("ayer", "hoy", "mañana", "el lunes pasado", "el 12 de agosto", "entre el 1 y el 15 de agosto", etc.)
-y pásalas a las herramientas en formato YYYY-MM-DD.
+y pásalas a las herramientas en formato YYYY-MM-DD. SIEMPRE calcula fechas concretas, nunca pases texto
+literal como "hoy" o "ayer" a una herramienta. Ejemplos: "esta semana" = desde el lunes de esta semana
+hasta hoy; "la semana pasada" = lunes a domingo de la semana anterior; "hasta hoy" = fecha_inicio que
+corresponda y fecha_fin = hoy. Si el usuario no menciona ninguna fecha (ej. "toda la temporada", "cuánto
+llevamos cosechado"), omite fecha_inicio y fecha_fin por completo en vez de inventar una fecha.
 
 Tienes herramientas para consultar, por variedad: estimado de temporada (trisemanal), cosecha real en
 una fecha, calibre promedio, y comparación de avance (estimado vs cosechado real) en una fecha.
@@ -813,7 +845,7 @@ def ejecutar_tool(tool_name, tool_input):
     if tool_name == "consultar_ultima_cosecha":
         especie = tool_input.get("especie") or None
         variedad_op = normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None
-        return obtener_ultima_cosecha(especie=especie, variedad=variedad_op)
+        return obtener_ultima_cosecha(especie=especie, variedad=variedad_op, packing=tool_input.get("packing") or None)
 
     if tool_name == "consultar_cosecha_detalle":
         especie = tool_input.get("especie") or None
