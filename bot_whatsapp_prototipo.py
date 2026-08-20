@@ -81,6 +81,33 @@ def guardar_conversacion(numero_sender, tipo_mensaje, mensaje, respuesta):
     except Exception as e:
         logger.error(f"Error guardando conversación: {str(e)}")
 
+LIMITE_HISTORIAL_MENSAJES = 6
+LIMITE_HISTORIAL_MINUTOS = 60
+
+def obtener_historial_conversacion(numero_sender):
+    """
+    Trae los últimos mensajes recientes de ESE número (misma sesión de chat) para darle
+    contexto a Claude y que pueda entender preguntas de seguimiento (ej. "y de Lapins?",
+    "conviértelo a bins"). Solo mensajes de la última hora, para no arrastrar contexto viejo.
+    """
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            """SELECT mensaje, respuesta FROM conversaciones
+               WHERE numero_sender = ?
+               AND fecha_hora >= datetime('now', 'localtime', ?)
+               ORDER BY id DESC LIMIT ?""",
+            (numero_sender, f"-{LIMITE_HISTORIAL_MINUTOS} minutes", LIMITE_HISTORIAL_MENSAJES)
+        )
+        filas = list(cursor.fetchall())
+        conn.close()
+        filas.reverse()
+        return filas
+    except Exception as e:
+        logger.error(f"Error obteniendo historial de conversación: {str(e)}")
+        return []
+
 # ============================================================================
 # CONEXIÓN SQL SERVER
 # ============================================================================
@@ -872,18 +899,27 @@ def ejecutar_tool(tool_name, tool_input):
         return obtener_comparacion_estimado_vs_cosechado(variedad, fecha)
     return "No supe qué información buscar para esa pregunta."
 
-def procesar_mensaje(texto_mensaje):
+def procesar_mensaje(texto_mensaje, numero_sender=None):
     """
     Usa Claude para interpretar el mensaje: decide si llamar una herramienta de consulta
     o responder directamente (saludo, ayuda, pregunta fuera de alcance).
+    Si se da numero_sender, incluye los mensajes recientes de esa conversación como
+    contexto, para que Claude entienda preguntas de seguimiento.
     """
     try:
+        messages = []
+        if numero_sender:
+            for turno in obtener_historial_conversacion(numero_sender):
+                messages.append({"role": "user", "content": turno["mensaje"]})
+                messages.append({"role": "assistant", "content": turno["respuesta"]})
+        messages.append({"role": "user", "content": texto_mensaje})
+
         response = claude_client.messages.create(
             model="claude-sonnet-5",
             max_tokens=300,
             system=construir_system_prompt(),
             tools=TOOLS,
-            messages=[{"role": "user", "content": texto_mensaje}],
+            messages=messages,
         )
 
         tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
@@ -1036,7 +1072,7 @@ async def receive_message(request: Request):
                         logger.info(f"Mensaje de {numero_sender}: {msg_text}")
 
                         # Procesar mensaje
-                        respuesta = procesar_mensaje(msg_text)
+                        respuesta = procesar_mensaje(msg_text, numero_sender)
 
                         # Guardar en el historial local
                         guardar_conversacion(numero_sender, msg_type, msg_text, respuesta)
@@ -1114,12 +1150,15 @@ async def historial(clave: str, limit: int = 50):
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/test/mensaje")
-async def test_mensaje(mensaje: str):
+async def test_mensaje(mensaje: str, numero: str = None, guardar: bool = False):
     """
     TEST LOCAL: Envía un mensaje y obtiene respuesta
-    Usa: curl -X POST "http://localhost:8000/test/mensaje?mensaje=cuantos%20bins%20de%20tiffany"
+    Usa: curl "http://localhost:8005/test/mensaje?mensaje=cuantos%20bins%20de%20tiffany"
+    Para probar contexto entre mensajes: pasa el mismo &numero=... y &guardar=true en cada llamada.
     """
-    respuesta = procesar_mensaje(mensaje)
+    respuesta = procesar_mensaje(mensaje, numero)
+    if guardar and numero:
+        guardar_conversacion(numero, "text", mensaje, respuesta)
     return {"pregunta": mensaje, "respuesta": respuesta}
 
 @app.get("/test/conexion")
