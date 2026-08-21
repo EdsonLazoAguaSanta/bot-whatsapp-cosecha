@@ -326,11 +326,12 @@ def obtener_resumen_por_packing(packing):
         logger.error(f"Error en obtener_resumen_por_packing: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_desc=""):
+def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg"):
     """
-    filas: lista de tuplas (Variedad, Base Origen, total_kg).
+    filas: lista de tuplas (Variedad, Base Origen, total).
     Tabla Variedad | Invierno | Primavera | Real, más diferencias y % (Real vs cada
     estimación, y cómo cambió la estimación de Invierno a Primavera).
+    unidad: etiqueta del total (ej. "kg", "BINS") según qué columna se sumó.
     """
     datos = {}
     for variedad, base_origen, total in filas:
@@ -388,9 +389,9 @@ def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_de
             return None
         pct = ((a - b) / b) * 100
         signo = "+" if pct >= 0 else ""
-        return f"{etiqueta}: {signo}{pct:.1f}% ({signo}{formatear_kg(a - b)} kg)"
+        return f"{etiqueta}: {signo}{pct:.1f}% ({signo}{formatear_kg(a - b)} {unidad})"
 
-    resumen = [f"\n📦 Totales: Invierno {formatear_kg(tot_inv)} kg · Primavera {formatear_kg(tot_prim)} kg · Real {formatear_kg(tot_real)} kg"]
+    resumen = [f"\n📦 Totales: Invierno {formatear_kg(tot_inv)} {unidad} · Primavera {formatear_kg(tot_prim)} {unidad} · Real {formatear_kg(tot_real)} {unidad}"]
     for texto in [
         variacion(tot_real, tot_inv, "Real vs Invierno"),
         variacion(tot_real, tot_prim, "Real vs Primavera"),
@@ -402,11 +403,13 @@ def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_de
     lineas.append("\n".join(resumen))
     return "\n".join(lineas)
 
-def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None, packing=None, fecha_inicio=None, fecha_fin=None):
+def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None, packing=None, fecha_inicio=None, fecha_fin=None, envase=None):
     """
     Comparativo Estim Invierno vs Estim Primavera vs Real (Recepción Planta), agrupado por
     variedad, con diferencias y %. Por defecto usa toda la temporada vigente completa (no solo
     hasta hoy), ya que las estimaciones cubren la temporada entera.
+    Si se da envase (ej. "BINS"), compara en esa unidad usando el Bultos real que tiene guardado
+    cada una de las tres fuentes (Invierno, Primavera y Real), no un factor calculado.
     """
     try:
         conn = conectar_sql()
@@ -455,19 +458,28 @@ def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None
             params.append(f"%{packing}%")
             filtro_desc += f" en {packing.upper()}"
 
+        columna_suma = "KgsRecepcionados"
+        unidad = "kg"
+        if envase:
+            condiciones.append("Envase LIKE ?")
+            params.append(f"%{envase}%")
+            filtro_desc += f" en {envase.upper()}"
+            columna_suma = "Bultos"
+            unidad = envase.upper()
+
         where = " AND ".join(condiciones)
         query = f"""
-            SELECT Variedad, [Base Origen], SUM(KgsRecepcionados) as total
+            SELECT Variedad, [Base Origen], SUM({columna_suma}) as total
             FROM [Recepcion_Consolidada]
             WHERE {where}
             GROUP BY Variedad, [Base Origen]
-            HAVING SUM(KgsRecepcionados) > 0
+            HAVING SUM({columna_suma}) > 0
         """
         cursor.execute(query, params)
         filas = cursor.fetchall()
         conn.close()
 
-        resultado = formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_desc)
+        resultado = formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_desc, unidad)
         if not resultado:
             return f"No hay datos de estimaciones ni cosecha real{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
         return resultado
@@ -1003,6 +1015,10 @@ TOOLS = [
                 "fecha_fin": {
                     "type": "string",
                     "description": "Fecha de fin en formato YYYY-MM-DD. Omitir junto con fecha_inicio si no se mencionan fechas."
+                },
+                "envase": {
+                    "type": "string",
+                    "description": "SOLO si el usuario pide el comparativo en bins, totes, cajas u otro envase (no si pide kilos). Traducir al nombre EXACTO de la lista de envases conocidos. Cuando se da, compara la cantidad real de unidades de ese envase que tiene guardada cada una de las tres fuentes (Invierno, Primavera, Real), no un cálculo. Omitir si pregunta por kilos/kg."
                 }
             }
         }
@@ -1137,6 +1153,7 @@ def ejecutar_tool(tool_name, tool_input):
             packing=tool_input.get("packing") or None,
             fecha_inicio=tool_input.get("fecha_inicio") or None,
             fecha_fin=tool_input.get("fecha_fin") or None,
+            envase=tool_input.get("envase") or None,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
