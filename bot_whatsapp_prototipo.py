@@ -137,6 +137,8 @@ def conectar_sql():
 # Verificado contra ejemplo real: W. Murcott 2026-08-12 -> Trisemanal=160.300kg, Recepción Planta=162.136kg (+1.15%)
 BASE_ORIGEN_ESTIMADO = "Trisemanal"
 BASE_ORIGEN_REAL = "Recepción Planta"
+BASE_ORIGEN_ESTIM_INVIERNO = "Estim Invierno"
+BASE_ORIGEN_ESTIM_PRIMAVERA = "Estim Primavera"
 
 ESPECIE_TRADUCCION = {
     "GRAPE": "Uva",
@@ -322,6 +324,155 @@ def obtener_resumen_por_packing(packing):
             return f"No encontré cosecha real registrada del packing '{packing}'"
     except Exception as e:
         logger.error(f"Error en obtener_resumen_por_packing: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
+def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_desc=""):
+    """
+    filas: lista de tuplas (Variedad, Base Origen, total_kg).
+    Tabla Variedad | Invierno | Primavera | Real, más diferencias y % (Real vs cada
+    estimación, y cómo cambió la estimación de Invierno a Primavera).
+    """
+    datos = {}
+    for variedad, base_origen, total in filas:
+        if not total:
+            continue
+        v = (variedad or "").strip().upper()
+        if base_origen == BASE_ORIGEN_ESTIM_INVIERNO:
+            clave = "invierno"
+        elif base_origen == BASE_ORIGEN_ESTIM_PRIMAVERA:
+            clave = "primavera"
+        else:
+            clave = "real"
+        datos.setdefault(v, {})
+        datos[v][clave] = datos[v].get(clave, 0) + total
+
+    if not datos:
+        return None
+
+    rango = fecha_inicio if fecha_inicio == fecha_fin else f"{fecha_inicio} a {fecha_fin}"
+    lineas = [f"📊 Comparativo estimaciones {rango}{filtro_desc}:"]
+
+    anchos = {"variedad": 14, "num": 11}
+    header = (
+        f"{'Variedad':<{anchos['variedad']}}{'Invierno':>{anchos['num']}}"
+        f"{'Primavera':>{anchos['num']}}{'Real':>{anchos['num']}}"
+    )
+    filas_tabla = [header]
+
+    tot_inv = tot_prim = tot_real = 0
+    for variedad in sorted(datos.keys()):
+        d = datos[variedad]
+        inv = d.get("invierno", 0)
+        prim = d.get("primavera", 0)
+        real = d.get("real", 0)
+        tot_inv += inv
+        tot_prim += prim
+        tot_real += real
+        filas_tabla.append(
+            f"{_truncar(variedad, anchos['variedad']):<{anchos['variedad']}}"
+            f"{formatear_kg(inv) if inv else '-':>{anchos['num']}}"
+            f"{formatear_kg(prim) if prim else '-':>{anchos['num']}}"
+            f"{formatear_kg(real) if real else '-':>{anchos['num']}}"
+        )
+    filas_tabla.append("-" * (anchos["variedad"] + anchos["num"] * 3))
+    filas_tabla.append(
+        f"{'TOTAL':<{anchos['variedad']}}"
+        f"{formatear_kg(tot_inv):>{anchos['num']}}"
+        f"{formatear_kg(tot_prim):>{anchos['num']}}"
+        f"{formatear_kg(tot_real):>{anchos['num']}}"
+    )
+    lineas.append(f"```{chr(10).join(filas_tabla)}```")
+
+    def variacion(a, b, etiqueta):
+        if not b:
+            return None
+        pct = ((a - b) / b) * 100
+        signo = "+" if pct >= 0 else ""
+        return f"{etiqueta}: {signo}{pct:.1f}% ({signo}{formatear_kg(a - b)} kg)"
+
+    resumen = [f"\n📦 Totales: Invierno {formatear_kg(tot_inv)} kg · Primavera {formatear_kg(tot_prim)} kg · Real {formatear_kg(tot_real)} kg"]
+    for texto in [
+        variacion(tot_real, tot_inv, "Real vs Invierno"),
+        variacion(tot_real, tot_prim, "Real vs Primavera"),
+        variacion(tot_prim, tot_inv, "Primavera vs Invierno"),
+    ]:
+        if texto:
+            resumen.append(texto)
+
+    lineas.append("\n".join(resumen))
+    return "\n".join(lineas)
+
+def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None, packing=None, fecha_inicio=None, fecha_fin=None):
+    """
+    Comparativo Estim Invierno vs Estim Primavera vs Real (Recepción Planta), agrupado por
+    variedad, con diferencias y %. Por defecto usa toda la temporada vigente completa (no solo
+    hasta hoy), ya que las estimaciones cubren la temporada entera.
+    """
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+
+        if not fecha_inicio or not fecha_fin:
+            cursor.execute("""
+                SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE))
+                FROM [Recepcion_Consolidada]
+                WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+            """)
+            fila = cursor.fetchone()
+            if not fila or not fila[0]:
+                conn.close()
+                return "No pude determinar la temporada vigente. ¿Puedes darme una fecha o rango específico?"
+            fecha_inicio = fecha_inicio or fila[0].strftime("%Y-%m-%d")
+            fecha_fin = fecha_fin or fila[1].strftime("%Y-%m-%d")
+
+        try:
+            datetime.strptime(fecha_inicio, "%Y-%m-%d")
+            datetime.strptime(fecha_fin, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            conn.close()
+            return "No entendí el rango de fechas. ¿Puedes indicarlo como 'entre el DD-MM-YYYY y el DD-MM-YYYY'?"
+
+        condiciones = ["[Base Origen] IN (?, ?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
+        params = [BASE_ORIGEN_ESTIM_INVIERNO, BASE_ORIGEN_ESTIM_PRIMAVERA, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        filtro_desc = ""
+        if especie:
+            condiciones.append("Especie LIKE ?")
+            params.append(f"%{especie}%")
+            filtro_desc += f" de {traducir_especie(especie)}"
+        if variedad:
+            condiciones.append("Variedad LIKE ?")
+            params.append(f"%{variedad}%")
+            filtro_desc += f" ({variedad.upper()})"
+        if productor:
+            condiciones.append("Productor LIKE ?")
+            params.append(f"%{productor}%")
+            filtro_desc += f" del productor {productor.upper()}"
+        if packing:
+            condiciones.append("Packing LIKE ?")
+            params.append(f"%{packing}%")
+            filtro_desc += f" en {packing.upper()}"
+
+        where = " AND ".join(condiciones)
+        query = f"""
+            SELECT Variedad, [Base Origen], SUM(KgsRecepcionados) as total
+            FROM [Recepcion_Consolidada]
+            WHERE {where}
+            GROUP BY Variedad, [Base Origen]
+            HAVING SUM(KgsRecepcionados) > 0
+        """
+        cursor.execute(query, params)
+        filas = cursor.fetchall()
+        conn.close()
+
+        resultado = formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_desc)
+        if not resultado:
+            return f"No hay datos de estimaciones ni cosecha real{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
+        return resultado
+    except Exception as e:
+        logger.error(f"Error en obtener_comparativo_estimaciones: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
 UMBRAL_DIAS_TABLA_DETALLADA = 14
@@ -823,6 +974,39 @@ TOOLS = [
             }
         }
     },
+    {
+        "name": "consultar_comparativo_estimaciones",
+        "description": "Compara Estimación Invierno vs Estimación Primavera vs Cosecha Real (con diferencias y %), agrupado por variedad. Usar para preguntas tipo 'comparativo de estimación invierno, primavera y real', 'diferencia entre lo estimado en invierno y primavera', etc. Por defecto usa toda la temporada vigente completa si no se dan fechas.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "especie": {
+                    "type": "string",
+                    "description": "Especie mencionada por el usuario, traducida al nombre EXACTO en inglés de la lista de especies conocidas. Opcional."
+                },
+                "variedad": {
+                    "type": "string",
+                    "description": "Variedad mencionada por el usuario. Opcional."
+                },
+                "productor": {
+                    "type": "string",
+                    "description": "Productor o fundo mencionado por el usuario. Opcional."
+                },
+                "packing": {
+                    "type": "string",
+                    "description": "Planta o packing mencionado por el usuario, traducido al nombre EXACTO de la lista de packings conocidos. Opcional."
+                },
+                "fecha_inicio": {
+                    "type": "string",
+                    "description": "Fecha de inicio en formato YYYY-MM-DD. Omitir si el usuario pide 'toda la temporada' o no menciona fechas (se usa la temporada completa)."
+                },
+                "fecha_fin": {
+                    "type": "string",
+                    "description": "Fecha de fin en formato YYYY-MM-DD. Omitir junto con fecha_inicio si no se mencionan fechas."
+                }
+            }
+        }
+    },
 ]
 
 def construir_system_prompt():
@@ -864,6 +1048,12 @@ una fecha, calibre promedio, y comparación de avance (estimado vs cosechado rea
 También puedes consultar resúmenes por productor o por packing (no requieren variedad), cuándo fue la
 última cosecha real de una especie o variedad, y el detalle de cosecha real entre un rango de fechas
 (agrupado por especie/variedad/productor, opcionalmente filtrado por especie, variedad o productor).
+
+Además tienes consultar_comparativo_estimaciones: compara Estimación Invierno vs Estimación Primavera
+vs Cosecha Real, con diferencias y %, para preguntas tipo "comparativo de estimación invierno, primavera
+y real" o "diferencia entre lo estimado en invierno y primavera". Estas son dos ciclos de estimación
+distintos al "estimado" (Trisemanal) que usan las otras herramientas — úsala específicamente cuando el
+usuario mencione "invierno" y/o "primavera" en el contexto de estimaciones.
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
@@ -935,6 +1125,18 @@ def ejecutar_tool(tool_name, tool_input):
             packing=tool_input.get("packing") or None,
             forzar_fechas=bool(tool_input.get("detalle_por_fecha")),
             envase=tool_input.get("envase") or None,
+        )
+
+    if tool_name == "consultar_comparativo_estimaciones":
+        especie = tool_input.get("especie") or None
+        variedad_op = normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None
+        return obtener_comparativo_estimaciones(
+            especie=especie,
+            variedad=variedad_op,
+            productor=tool_input.get("productor") or None,
+            packing=tool_input.get("packing") or None,
+            fecha_inicio=tool_input.get("fecha_inicio") or None,
+            fecha_fin=tool_input.get("fecha_fin") or None,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
