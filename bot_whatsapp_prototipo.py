@@ -1025,7 +1025,7 @@ TOOLS = [
     },
 ]
 
-def construir_system_prompt():
+def construir_system_prompt(es_audio=False):
     if VARIEDADES_CONOCIDAS:
         lista_variedades = ", ".join(VARIEDADES_CONOCIDAS)
     else:
@@ -1049,7 +1049,18 @@ def construir_system_prompt():
 
     hoy = datetime.now().strftime("%Y-%m-%d (%A)")
 
+    nota_audio = ""
+    if es_audio:
+        nota_audio = """
+ATENCIÓN: este mensaje viene de una transcripción automática de una nota de voz, puede tener errores
+FONÉTICOS (palabras que suenan parecido pero se transcribieron distinto, ej. "beans" en vez de "bins",
+"crimen" en vez de "crimson", nombres de productores o plantas mal transcritos). Ten esto muy en cuenta
+al interpretar el mensaje: prioriza qué palabra conocida SUENA parecido a lo transcrito, no solo cuál se
+escribe parecido.
+"""
+
     return f"""Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
+{nota_audio}
 
 Hoy es {hoy}. Usa esta fecha como referencia para calcular fechas relativas que mencione el usuario
 ("ayer", "hoy", "mañana", "el lunes pasado", "el 12 de agosto", "entre el 1 y el 15 de agosto", etc.)
@@ -1116,7 +1127,15 @@ Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna h
 directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer.
 
 Si falta la variedad, especie, productor o packing para poder consultar, pídeselo al usuario en vez de
-inventarlo."""
+inventarlo.
+
+Si una palabra del mensaje NO calza exactamente con ninguna variedad/especie/packing/envase conocido,
+NUNCA te rindas de inmediato ni respondas solo "no entendí" o listes TODAS las opciones disponibles.
+En vez de eso: identifica cuáles 1 a 3 opciones de las listas conocidas se parecen MÁS (por escritura o,
+si el mensaje viene de audio, por sonido) a lo que escribió/dijo el usuario, y pregúntale de forma breve
+cuál de esas quiso decir (ej. "¿Te referías a BINS?" o "¿Es BINS, TOTES o CAJA EQ?"). Solo si de verdad
+no hay ninguna opción remotamente parecida, ahí sí pide que aclare sin sugerir nada. El objetivo es que
+el usuario nunca se quede sin poder avanzar la conversación."""
 
 def ejecutar_tool(tool_name, tool_input):
     if tool_name == "consultar_resumen_productor":
@@ -1168,12 +1187,14 @@ def ejecutar_tool(tool_name, tool_input):
         return obtener_comparacion_estimado_vs_cosechado(variedad, fecha)
     return "No supe qué información buscar para esa pregunta."
 
-def procesar_mensaje(texto_mensaje, numero_sender=None):
+def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
     """
     Usa Claude para interpretar el mensaje: decide si llamar una herramienta de consulta
     o responder directamente (saludo, ayuda, pregunta fuera de alcance).
     Si se da numero_sender, incluye los mensajes recientes de esa conversación como
     contexto, para que Claude entienda preguntas de seguimiento.
+    Si es_audio=True, el mensaje viene de una transcripción de voz y puede tener errores
+    fonéticos (ej. "beans" en vez de "bins").
     """
     try:
         messages = []
@@ -1186,7 +1207,7 @@ def procesar_mensaje(texto_mensaje, numero_sender=None):
         response = claude_client.messages.create(
             model="claude-sonnet-5",
             max_tokens=300,
-            system=construir_system_prompt(),
+            system=construir_system_prompt(es_audio),
             tools=TOOLS,
             messages=messages,
         )
@@ -1341,7 +1362,7 @@ async def receive_message(request: Request):
                         logger.info(f"Mensaje de {numero_sender}: {msg_text}")
 
                         # Procesar mensaje
-                        respuesta = procesar_mensaje(msg_text, numero_sender)
+                        respuesta = procesar_mensaje(msg_text, numero_sender, es_audio=(msg_type == "audio"))
 
                         # Guardar en el historial local
                         guardar_conversacion(numero_sender, msg_type, msg_text, respuesta)
