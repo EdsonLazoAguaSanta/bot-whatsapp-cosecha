@@ -1281,31 +1281,73 @@ def transcribir_audio(audio_bytes, mime_type="audio/ogg"):
 # ENVÍO POR WHATSAPP
 # ============================================================================
 
-def enviar_whatsapp(numero_destino, mensaje_texto):
-    """
-    Envía mensaje por WhatsApp Business API (Meta)
-    """
+LIMITE_WHATSAPP_TEXTO = 4000  # margen bajo el límite real de Meta (4096 caracteres por mensaje)
+
+def dividir_mensaje_whatsapp(texto, limite=LIMITE_WHATSAPP_TEXTO):
+    """Divide un texto largo en partes que respeten el límite de caracteres de WhatsApp,
+    cortando preferentemente en saltos de párrafo para no partir tablas a la mitad."""
+    if len(texto) <= limite:
+        return [texto]
+
+    bloques = texto.split("\n\n")
+    partes = []
+    actual = ""
+    for bloque in bloques:
+        candidato = f"{actual}\n\n{bloque}" if actual else bloque
+        if len(candidato) > limite and actual:
+            partes.append(actual)
+            actual = bloque
+        else:
+            actual = candidato
+    if actual:
+        partes.append(actual)
+
+    # Por si un solo bloque (sin saltos de párrafo) sigue superando el límite
+    partes_finales = []
+    for parte in partes:
+        while len(parte) > limite:
+            partes_finales.append(parte[:limite])
+            parte = parte[limite:]
+        if parte:
+            partes_finales.append(parte)
+    return partes_finales
+
+def _enviar_whatsapp_una_parte(numero_destino, mensaje_texto):
     try:
         url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages"
-        
+
         headers = {
             "Authorization": f"Bearer {WHATSAPP_TOKEN}",
             "Content-Type": "application/json",
         }
-        
+
         payload = {
             "messaging_product": "whatsapp",
             "to": numero_destino,
             "type": "text",
             "text": {"body": mensaje_texto}
         }
-        
+
         response = requests.post(url, json=payload, headers=headers)
-        logger.info(f"WhatsApp enviado a {numero_destino}: {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"WhatsApp respondió {response.status_code} al enviar a {numero_destino}: {response.text}")
+        else:
+            logger.info(f"WhatsApp enviado a {numero_destino}: {response.status_code}")
         return response.status_code == 200
     except Exception as e:
         logger.error(f"Error enviando WhatsApp: {str(e)}")
         return False
+
+def enviar_whatsapp(numero_destino, mensaje_texto):
+    """
+    Envía mensaje por WhatsApp Business API (Meta). Si el texto supera el límite de
+    caracteres de un mensaje de WhatsApp, lo divide y envía en varios mensajes seguidos
+    (Meta rechaza en silencio los mensajes demasiado largos).
+    """
+    exito = True
+    for parte in dividir_mensaje_whatsapp(mensaje_texto):
+        exito = _enviar_whatsapp_una_parte(numero_destino, parte) and exito
+    return exito
 
 # ============================================================================
 # WEBHOOKS FASTAPI
