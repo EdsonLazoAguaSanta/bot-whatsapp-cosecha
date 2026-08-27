@@ -1533,7 +1533,7 @@ pensando que hay un default, porque en esa herramienta omitirlo significa "el us
 hará que se le pregunte innecesariamente.
 
 Tienes herramientas para consultar, por variedad: estimado de temporada (trisemanal), cosecha real en
-una fecha, calibre promedio, y comparación de avance (estimado vs cosechado real) en una fecha.
+una fecha, y comparación de avance (estimado vs cosechado real) en una fecha.
 También puedes consultar resúmenes por productor o por packing (no requieren variedad), cuándo fue la
 primera o la última cosecha real de una especie/variedad/productor/packing (útil para "¿cuándo empezó
 la cosecha?" o "¿cuándo fue la última?"), y el detalle de cosecha real entre un rango de fechas
