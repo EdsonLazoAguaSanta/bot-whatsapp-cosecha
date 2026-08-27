@@ -403,11 +403,12 @@ def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_de
     lineas.append("\n".join(resumen))
     return "\n".join(lineas)
 
-def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None, packing=None, fecha_inicio=None, fecha_fin=None, envase=None):
+def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None, packing=None, fecha_inicio=None, fecha_fin=None, envase=None, temporada=None):
     """
     Comparativo Estim Invierno vs Estim Primavera vs Real (Recepción Planta), agrupado por
     variedad, con diferencias y %. Por defecto usa toda la temporada vigente completa (no solo
-    hasta hoy), ya que las estimaciones cubren la temporada entera.
+    hasta hoy), ya que las estimaciones cubren la temporada entera. Si se da temporada (ej. 2025
+    para "la temporada pasada"), usa el rango de esa temporada en vez de la vigente.
     Si se da envase (ej. "BINS"), compara en esa unidad usando el Bultos real que tiene guardado
     cada una de las tres fuentes (Invierno, Primavera y Real), no un factor calculado.
     """
@@ -419,15 +420,21 @@ def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None
         cursor = conn.cursor()
 
         if not fecha_inicio or not fecha_fin:
-            cursor.execute("""
-                SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE))
-                FROM [Recepcion_Consolidada]
-                WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
-            """)
+            if temporada:
+                cursor.execute(
+                    "SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE Temporada = ?",
+                    (temporada,)
+                )
+            else:
+                cursor.execute("""
+                    SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE))
+                    FROM [Recepcion_Consolidada]
+                    WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+                """)
             fila = cursor.fetchone()
             if not fila or not fila[0]:
                 conn.close()
-                return "No pude determinar la temporada vigente. ¿Puedes darme una fecha o rango específico?"
+                return "No pude determinar el rango de esa temporada. ¿Puedes darme una fecha o rango específico?"
             fecha_inicio = fecha_inicio or fila[0].strftime("%Y-%m-%d")
             fecha_fin = fecha_fin or fila[1].strftime("%Y-%m-%d")
 
@@ -623,14 +630,15 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
     )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False, envase=None):
+def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False, envase=None, temporada=None):
     """
     Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
     con columnas de estimado (Trisemanal) y real (Recepción Planta) por fecha, agrupado por
     packing/productor/variedad. Filtros opcionales. Si el rango es muy amplio o hay muchos
     grupos, se colapsa a solo totales para no saturar el mensaje.
     Si no se da fecha_inicio, se usa el inicio de la temporada vigente hasta hoy (para
-    preguntas tipo "toda la temporada", "hasta hoy", sin fechas explícitas).
+    preguntas tipo "toda la temporada", "hasta hoy", sin fechas explícitas). Si se da temporada
+    (ej. 2025 para "la temporada pasada") sin fechas, se usa el rango completo de esa temporada.
     Si se da envase (ej. "BINS", "TOTES", "CAJA EQ"), se filtra por ese tipo de envase y se
     suma la cantidad real de unidades (Bultos) en vez de kilos, sin inventar factores de
     conversión (los factores kg/unidad no son confiables en los datos históricos).
@@ -643,17 +651,29 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
         cursor = conn.cursor()
 
         if not fecha_inicio:
-            cursor.execute("""
-                SELECT MIN(CAST(Fecha AS DATE))
-                FROM [Recepcion_Consolidada]
-                WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
-            """)
-            fila = cursor.fetchone()
-            if not fila or not fila[0]:
-                conn.close()
-                return "No pude determinar el inicio de temporada. ¿Puedes darme una fecha o rango específico?"
-            fecha_inicio = fila[0].strftime("%Y-%m-%d")
-            fecha_fin = datetime.now().strftime("%Y-%m-%d")
+            if temporada:
+                cursor.execute(
+                    "SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE Temporada = ?",
+                    (temporada,)
+                )
+                fila = cursor.fetchone()
+                if not fila or not fila[0]:
+                    conn.close()
+                    return f"No encontré datos para la temporada {temporada}."
+                fecha_inicio = fila[0].strftime("%Y-%m-%d")
+                fecha_fin = fila[1].strftime("%Y-%m-%d")
+            else:
+                cursor.execute("""
+                    SELECT MIN(CAST(Fecha AS DATE))
+                    FROM [Recepcion_Consolidada]
+                    WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+                """)
+                fila = cursor.fetchone()
+                if not fila or not fila[0]:
+                    conn.close()
+                    return "No pude determinar el inicio de temporada. ¿Puedes darme una fecha o rango específico?"
+                fecha_inicio = fila[0].strftime("%Y-%m-%d")
+                fecha_fin = datetime.now().strftime("%Y-%m-%d")
         elif not fecha_fin:
             fecha_fin = fecha_inicio
 
@@ -725,8 +745,8 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
         logger.error(f"Error en obtener_cosecha_detalle: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def obtener_ultima_cosecha(especie=None, variedad=None, packing=None):
-    """Encuentra la última fecha con cosecha real de una especie, variedad y/o packing, y muestra su detalle"""
+def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo):
+    """Función compartida: encuentra la primera (MIN) o última (MAX) fecha con cosecha real."""
     try:
         conn = conectar_sql()
         if not conn:
@@ -744,22 +764,44 @@ def obtener_ultima_cosecha(especie=None, variedad=None, packing=None):
         if packing:
             condiciones.append("Packing LIKE ?")
             params.append(f"%{packing}%")
+        if productor:
+            condiciones.append("Productor LIKE ?")
+            params.append(f"%{productor}%")
+        if temporada:
+            condiciones.append("Temporada = ?")
+            params.append(temporada)
         where = " AND ".join(condiciones)
 
-        cursor.execute(f"SELECT MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE {where}", params)
+        funcion_sql = "MAX" if usar_maximo else "MIN"
+        cursor.execute(f"SELECT {funcion_sql}(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE {where}", params)
         fila = cursor.fetchone()
         conn.close()
 
-        ultima_fecha = fila[0] if fila else None
-        if not ultima_fecha:
-            referencia = especie or variedad or packing or ""
-            return f"No encontré cosecha real registrada de {referencia}" if referencia else "No encontré cosecha real registrada"
+        fecha_encontrada = fila[0] if fila else None
+        if not fecha_encontrada:
+            referencia = especie or variedad or packing or productor or ""
+            temp_desc = f" en la temporada {temporada}" if temporada else ""
+            return f"No encontré cosecha real registrada de {referencia}{temp_desc}" if referencia else f"No encontré cosecha real registrada{temp_desc}"
 
-        fecha_str = ultima_fecha.strftime("%Y-%m-%d") if hasattr(ultima_fecha, "strftime") else str(ultima_fecha)
-        return obtener_cosecha_detalle(fecha_str, fecha_str, especie=especie, variedad=variedad, packing=packing)
+        fecha_str = fecha_encontrada.strftime("%Y-%m-%d") if hasattr(fecha_encontrada, "strftime") else str(fecha_encontrada)
+        return obtener_cosecha_detalle(fecha_str, fecha_str, especie=especie, variedad=variedad, packing=packing, productor=productor)
     except Exception as e:
-        logger.error(f"Error en obtener_ultima_cosecha: {str(e)}")
+        logger.error(f"Error en _obtener_extremo_cosecha: {str(e)}")
         return f"Error al consultar: {str(e)}"
+
+def obtener_ultima_cosecha(especie=None, variedad=None, packing=None, productor=None, temporada=None):
+    """Encuentra la última (más reciente) fecha con cosecha real, y muestra su detalle"""
+    return _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo=True)
+
+def obtener_primera_cosecha(especie=None, variedad=None, packing=None, productor=None, temporada=None):
+    """
+    Encuentra la primera fecha con cosecha real (cuándo empezó), y muestra su detalle.
+    Si no se especifica temporada, se limita a la temporada vigente por defecto (a diferencia
+    de "última cosecha", "primera cosecha" sin temporada casi siempre implica "esta temporada",
+    no la primera vez registrada en toda la historia).
+    """
+    temporada = temporada or TEMPORADA_ACTUAL
+    return _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo=False)
 
 # ============================================================================
 # PROCESAMIENTO DE MENSAJES
@@ -834,6 +876,41 @@ def cargar_envases_conocidos():
         return []
 
 ENVASES_CONOCIDOS = cargar_envases_conocidos()
+
+def cargar_productores_conocidos():
+    """Carga los nombres reales de productor desde la base de datos"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT Productor FROM [Recepcion_Consolidada] WHERE Productor IS NOT NULL")
+        productores = sorted(set(row[0].strip() for row in cursor.fetchall() if row[0] and row[0].strip()))
+        conn.close()
+        logger.info(f"Cargados {len(productores)} productores conocidos")
+        return productores
+    except Exception as e:
+        logger.error(f"Error cargando productores conocidos: {str(e)}")
+        return []
+
+PRODUCTORES_CONOCIDOS = cargar_productores_conocidos()
+
+def obtener_temporada_actual():
+    """Devuelve el número de temporada vigente (la de la fecha de hoy)"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return None
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE()")
+        fila = cursor.fetchone()
+        conn.close()
+        return int(fila[0]) if fila and fila[0] is not None else None
+    except Exception as e:
+        logger.error(f"Error obteniendo temporada actual: {str(e)}")
+        return None
+
+TEMPORADA_ACTUAL = obtener_temporada_actual()
 
 def normalizar_variedad(variedad_usuario):
     """Limpia espacios; la traducción al nombre exacto ya la hace Claude usando VARIEDADES_CONOCIDAS"""
@@ -934,7 +1011,7 @@ TOOLS = [
     },
     {
         "name": "consultar_ultima_cosecha",
-        "description": "Encuentra cuándo fue la última fecha con cosecha REAL registrada de una especie, variedad y/o packing/planta, y muestra el detalle de esa fecha (variedades, productores, totales). Usar para preguntas como '¿cuándo fue la última cosecha de mandarinas?' o '¿cuándo fue la última recepción de cerezas en Lisonjera?'.",
+        "description": "Encuentra cuándo fue la última fecha con cosecha REAL registrada de una especie, variedad, packing/planta y/o productor, y muestra el detalle de esa fecha (variedades, productores, totales). Usar para preguntas como '¿cuándo fue la última cosecha de mandarinas?' o '¿cuándo fue la última recepción de cerezas en Lisonjera?'.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -949,6 +1026,43 @@ TOOLS = [
                 "packing": {
                     "type": "string",
                     "description": "Planta o packing mencionado por el usuario, traducido al nombre EXACTO de la lista de packings conocidos. Opcional."
+                },
+                "productor": {
+                    "type": "string",
+                    "description": "Productor mencionado por el usuario, traducido al nombre EXACTO de la lista de productores conocidos. Opcional."
+                },
+                "temporada": {
+                    "type": "integer",
+                    "description": "Número de temporada (ej. 2025 para 'la temporada pasada'), calculado usando la temporada vigente que se te indica más abajo. Omitir si el usuario no menciona una temporada distinta a la actual."
+                }
+            }
+        }
+    },
+    {
+        "name": "consultar_primera_cosecha",
+        "description": "Encuentra cuándo fue la PRIMERA fecha con cosecha REAL registrada de una especie, variedad, packing/planta y/o productor (cuándo empezó/se inició la cosecha), y muestra el detalle de esa fecha. Usar para preguntas como '¿cuándo empezó la cosecha de mandarinas?', '¿cuándo se inició la cosecha esta temporada/temporada pasada?'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "especie": {
+                    "type": "string",
+                    "description": "Especie mencionada por el usuario, traducida al nombre EXACTO en inglés de la lista de especies conocidas. Opcional."
+                },
+                "variedad": {
+                    "type": "string",
+                    "description": "Variedad específica mencionada por el usuario. Opcional."
+                },
+                "packing": {
+                    "type": "string",
+                    "description": "Planta o packing mencionado por el usuario, traducido al nombre EXACTO de la lista de packings conocidos. Opcional."
+                },
+                "productor": {
+                    "type": "string",
+                    "description": "Productor mencionado por el usuario, traducido al nombre EXACTO de la lista de productores conocidos. Opcional."
+                },
+                "temporada": {
+                    "type": "integer",
+                    "description": "Número de temporada (ej. 2025 para 'la temporada pasada'), calculado usando la temporada vigente que se te indica más abajo. Omitir si el usuario pregunta por la temporada actual (por defecto)."
                 }
             }
         }
@@ -990,6 +1104,10 @@ TOOLS = [
                 "envase": {
                     "type": "string",
                     "description": "SOLO si el usuario pregunta específicamente por bins, totes, cajas u otro tipo de envase/contenedor (no si pregunta por kilos). Traducir al nombre EXACTO de la lista de envases conocidos (ej. 'bins' -> 'BINS'). Cuando se da, la respuesta muestra la cantidad real de unidades de ese envase en vez de kilos (no se convierte desde kilos, es la cantidad real registrada). Omitir si el usuario pregunta por kilos/kg."
+                },
+                "temporada": {
+                    "type": "integer",
+                    "description": "Número de temporada (ej. 2025 para 'la temporada pasada'), calculado usando la temporada vigente que se te indica más abajo. Solo úsalo si NO se dieron fecha_inicio/fecha_fin y el usuario pidió una temporada distinta a la actual (ej. 'toda la temporada pasada'). Si el usuario da fechas explícitas, omite este campo."
                 }
             }
         }
@@ -1027,6 +1145,10 @@ TOOLS = [
                 "envase": {
                     "type": "string",
                     "description": "SOLO si el usuario pide el comparativo en bins, totes, cajas u otro envase (no si pide kilos). Traducir al nombre EXACTO de la lista de envases conocidos. Cuando se da, compara la cantidad real de unidades de ese envase que tiene guardada cada una de las tres fuentes (Invierno, Primavera, Real), no un cálculo. Omitir si pregunta por kilos/kg."
+                },
+                "temporada": {
+                    "type": "integer",
+                    "description": "Número de temporada (ej. 2025 para 'la temporada pasada'), calculado usando la temporada vigente que se te indica más abajo. Solo úsalo si NO se dieron fecha_inicio/fecha_fin y el usuario pidió una temporada distinta a la actual."
                 }
             }
         }
@@ -1055,6 +1177,16 @@ def construir_system_prompt(es_audio=False):
     else:
         lista_envases = "(lista no disponible por ahora)"
 
+    if PRODUCTORES_CONOCIDOS:
+        lista_productores = ", ".join(PRODUCTORES_CONOCIDOS)
+    else:
+        lista_productores = "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
+
+    temporada_texto = (
+        f"La temporada vigente (actual) es {TEMPORADA_ACTUAL}."
+        if TEMPORADA_ACTUAL else "(no se pudo determinar la temporada vigente)"
+    )
+
     hoy = datetime.now().strftime("%Y-%m-%d (%A)")
 
     nota_audio = ""
@@ -1078,10 +1210,17 @@ hasta hoy; "la semana pasada" = lunes a domingo de la semana anterior; "hasta ho
 corresponda y fecha_fin = hoy. Si el usuario no menciona ninguna fecha (ej. "toda la temporada", "cuánto
 llevamos cosechado"), omite fecha_inicio y fecha_fin por completo en vez de inventar una fecha.
 
+{temporada_texto} Las temporadas se numeran como años (ej. 2026, 2025, ...). Si el usuario pregunta por
+"esta temporada"/"esta año" no hace falta nada especial (es el comportamiento por defecto). Si pregunta
+por "la temporada pasada"/"el año pasado" usa el parámetro "temporada" con el número de la temporada
+vigente menos 1; "hace 2 temporadas" sería menos 2, y así sucesivamente. Usa "temporada" (no fechas)
+salvo que el usuario también dé fechas específicas dentro de esa temporada.
+
 Tienes herramientas para consultar, por variedad: estimado de temporada (trisemanal), cosecha real en
 una fecha, calibre promedio, y comparación de avance (estimado vs cosechado real) en una fecha.
 También puedes consultar resúmenes por productor o por packing (no requieren variedad), cuándo fue la
-última cosecha real de una especie o variedad, y el detalle de cosecha real entre un rango de fechas
+primera o la última cosecha real de una especie/variedad/productor/packing (útil para "¿cuándo empezó
+la cosecha?" o "¿cuándo fue la última?"), y el detalle de cosecha real entre un rango de fechas
 (agrupado por especie/variedad/productor, opcionalmente filtrado por especie, variedad o productor).
 
 Además tienes consultar_comparativo_estimaciones: compara Estimación Invierno vs Estimación Primavera
@@ -1128,6 +1267,19 @@ en Almahue", "recibido en Santa Ana"), pasa a la herramienta el nombre EXACTO de
 Las palabras "recepcionado" o "recibido" en una planta/packing significan lo mismo que "cosechado real"
 pero filtrado por esa planta.
 
+PRODUCTORES CONOCIDOS EN EL SISTEMA (nombre exacto como está en la base de datos):
+{lista_productores}
+
+Cuando el usuario mencione un productor, pasa a la herramienta el nombre EXACTO de esta lista.
+
+ATENCIÓN — AMBIGÜEDAD PRODUCTOR VS PLANTA/PACKING: varios nombres existen TANTO en la lista de
+productores COMO en la de plantas/packings (ej. "El Carmelo" es un productor Y también una planta;
+lo mismo puede pasar con "Lisonjera", "Almahue", "Santa Ana", "La Higuera", etc.). Si el usuario
+menciona uno de estos nombres y el mensaje NO deja claro si se refiere al productor (de dónde viene
+la fruta) o a la planta/packing (dónde se procesa), NO asumas ni elijas uno por tu cuenta: pregúntale
+directamente al usuario cuál de los dos quiso decir antes de llamar a ninguna herramienta. Si el
+contexto de la conversación ya lo aclaró antes, no vuelvas a preguntar.
+
 TIPOS DE ENVASE CONOCIDOS EN EL SISTEMA (nombre exacto como está en la base de datos):
 {lista_envases}
 
@@ -1160,7 +1312,24 @@ def ejecutar_tool(tool_name, tool_input):
     if tool_name == "consultar_ultima_cosecha":
         especie = tool_input.get("especie") or None
         variedad_op = normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None
-        return obtener_ultima_cosecha(especie=especie, variedad=variedad_op, packing=tool_input.get("packing") or None)
+        return obtener_ultima_cosecha(
+            especie=especie,
+            variedad=variedad_op,
+            packing=tool_input.get("packing") or None,
+            productor=tool_input.get("productor") or None,
+            temporada=tool_input.get("temporada") or None,
+        )
+
+    if tool_name == "consultar_primera_cosecha":
+        especie = tool_input.get("especie") or None
+        variedad_op = normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None
+        return obtener_primera_cosecha(
+            especie=especie,
+            variedad=variedad_op,
+            packing=tool_input.get("packing") or None,
+            productor=tool_input.get("productor") or None,
+            temporada=tool_input.get("temporada") or None,
+        )
 
     if tool_name == "consultar_cosecha_detalle":
         especie = tool_input.get("especie") or None
@@ -1174,6 +1343,7 @@ def ejecutar_tool(tool_name, tool_input):
             packing=tool_input.get("packing") or None,
             forzar_fechas=bool(tool_input.get("detalle_por_fecha")),
             envase=tool_input.get("envase") or None,
+            temporada=tool_input.get("temporada") or None,
         )
 
     if tool_name == "consultar_comparativo_estimaciones":
@@ -1187,6 +1357,7 @@ def ejecutar_tool(tool_name, tool_input):
             fecha_inicio=tool_input.get("fecha_inicio") or None,
             fecha_fin=tool_input.get("fecha_fin") or None,
             envase=tool_input.get("envase") or None,
+            temporada=tool_input.get("temporada") or None,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
