@@ -510,6 +510,17 @@ def _truncar(texto, ancho):
         return texto
     return texto[:ancho - 1] + "…"
 
+def _formatear_grupo(v):
+    """Varios grupos comparten prefijo (ej. 'AGUA SANTA (P Y)', 'AGUA SANTA (Garcia P)'),
+    lo que los hacía indistinguibles al truncar la columna. Se muestra solo lo que está
+    entre paréntesis cuando existe, que es la parte que realmente los diferencia."""
+    texto = str(v).strip() if v is not None else ""
+    inicio = texto.find("(")
+    fin = texto.find(")", inicio + 1)
+    if inicio != -1 and fin != -1:
+        return texto[inicio + 1:fin].strip()
+    return texto
+
 def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True, unidad="kg"):
     """
     filas: lista de tuplas (Packing, Productor, Especie, Variedad, Fecha, Base Origen, total).
@@ -835,6 +846,8 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
                 texto = _fecha_str(v)
             elif d == "especie":
                 texto = traducir_especie(v)
+            elif d == "grupo":
+                texto = _formatear_grupo(v)
             else:
                 texto = str(v) if v is not None else ""
             fila_texto += f"{_truncar(texto, a):<{a}}"
