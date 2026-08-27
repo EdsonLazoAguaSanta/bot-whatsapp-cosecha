@@ -1093,6 +1093,12 @@ usuario mencione "invierno" y/o "primavera" en el contexto de estimaciones.
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
 
+MUY IMPORTANTE: cuando el usuario pida un dato (cosecha, estimado, comparativo, etc.), SIEMPRE debes
+llamar a la herramienta correspondiente para obtener el dato ACTUAL, incluso si en la conversación
+anterior ya respondiste algo parecido o idéntico. NUNCA repitas, parafrasees ni reutilices un resultado
+de una respuesta anterior sin volver a ejecutar la herramienta — los datos pueden haber cambiado o
+haberse corregido, y responder desde memoria puede dar información desactualizada o incorrecta.
+
 Si el usuario usa la palabra "detalle" (ej. "dame el detalle de...", "detalle de cosecha de..."), SIEMPRE
 llama a consultar_cosecha_detalle con detalle_por_fecha=true, aunque pregunte solo por la cosecha en
 general y no mencione fechas explícitamente — igual debe mostrarse el desglose por fecha.
