@@ -630,7 +630,7 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
     )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, forzar_fechas=False, envase=None, temporada=None):
+def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, grupo=None, forzar_fechas=False, envase=None, temporada=None):
     """
     Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
     con columnas de estimado (Trisemanal) y real (Recepción Planta) por fecha, agrupado por
@@ -703,6 +703,10 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
             condiciones.append("Packing LIKE ?")
             params.append(f"%{packing}%")
             filtro_desc += f" en {packing.upper()}"
+        if grupo:
+            condiciones.append("Grupo LIKE ?")
+            params.append(f"%{grupo}%")
+            filtro_desc += f" del grupo {grupo.upper()}"
 
         columna_suma = "KgsRecepcionados"
         unidad = "kg"
@@ -750,6 +754,7 @@ DIMENSIONES_SQL = {
     "variedad": "Variedad",
     "productor": "Productor",
     "packing": "Packing",
+    "grupo": "Grupo",
     "fecha": "CAST(Fecha AS DATE)",
 }
 DIMENSIONES_ETIQUETA = {
@@ -757,6 +762,7 @@ DIMENSIONES_ETIQUETA = {
     "variedad": "Variedad",
     "productor": "Productor",
     "packing": "Planta",
+    "grupo": "Grupo",
     "fecha": "Fecha",
 }
 MAX_FILAS_FLEXIBLE = 60
@@ -789,6 +795,13 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
 
     rango = fecha_inicio if fecha_inicio == fecha_fin else f"{fecha_inicio} a {fecha_fin}"
     lineas = [f"📅 Resumen {rango}{filtro_desc}:"]
+
+    if n == 0:
+        # Sin dimensiones: el usuario pidió solo el total, sin desglose.
+        tot_est = sum(v.get("estimado", 0) for v in datos.values())
+        tot_real = sum(v.get("real", 0) for v in datos.values())
+        lineas.append(f"\n📦 Total: estimado {formatear_kg(tot_est)} {unidad}, real {formatear_kg(tot_real)} {unidad}")
+        return "\n".join(lineas)
 
     anchos_dim = []
     for d in dimensiones:
@@ -853,17 +866,16 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
     return "\n".join(lineas)
 
 def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, especie=None, variedad=None,
-                              productor=None, packing=None, envase=None, temporada=None):
+                              productor=None, packing=None, grupo=None, envase=None, temporada=None):
     """
     Consulta genérica: agrupa por las dimensiones exactas que se pidan (cualquier combinación
-    de especie/variedad/productor/packing/fecha), sumando estimado (Trisemanal) y real
-    (Recepción Planta) o Bultos si se da envase. A diferencia de las demás consultas, si no se
-    da ningún periodo (ni fechas ni temporada) NO asume nada: pide que se aclare el periodo.
+    de especie/variedad/productor/packing/grupo/fecha, o ninguna si se pide solo el total),
+    sumando estimado (Trisemanal) y real (Recepción Planta) o Bultos si se da envase. A
+    diferencia de las demás consultas, si no se da ningún periodo (ni fechas ni temporada) NO
+    asume nada: pide que se aclare el periodo.
     """
     try:
         dimensiones = [d for d in (agrupar_por or []) if d in DIMENSIONES_SQL]
-        if not dimensiones:
-            dimensiones = ["variedad"]
 
         if not fecha_inicio and not temporada:
             return "¿Para qué periodo necesitas este dato? (por ejemplo: esta temporada, un rango de fechas específico, o solo hoy)"
@@ -914,6 +926,10 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
             condiciones.append("Packing LIKE ?")
             params.append(f"%{packing}%")
             filtro_desc += f" en {packing.upper()}"
+        if grupo:
+            condiciones.append("Grupo LIKE ?")
+            params.append(f"%{grupo}%")
+            filtro_desc += f" del grupo {grupo.upper()}"
 
         columna_suma = "KgsRecepcionados"
         unidad = "kg"
@@ -927,11 +943,13 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
 
         where = " AND ".join(condiciones)
         columnas_sql = ", ".join(DIMENSIONES_SQL[d] for d in dimensiones)
+        select_cols = f"{columnas_sql}, " if columnas_sql else ""
+        group_cols = f"{columnas_sql}, " if columnas_sql else ""
         query = f"""
-            SELECT {columnas_sql}, [Base Origen], SUM({columna_suma}) as total
+            SELECT {select_cols}[Base Origen], SUM({columna_suma}) as total
             FROM [Recepcion_Consolidada]
             WHERE {where}
-            GROUP BY {columnas_sql}, [Base Origen]
+            GROUP BY {group_cols}[Base Origen]
             HAVING SUM({columna_suma}) > 0
         """
         cursor.execute(query, params)
@@ -1095,6 +1113,24 @@ def cargar_productores_conocidos():
         return []
 
 PRODUCTORES_CONOCIDOS = cargar_productores_conocidos()
+
+def cargar_grupos_conocidos():
+    """Carga los nombres reales de grupo (holding/empresa) desde la base de datos"""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT Grupo FROM [Recepcion_Consolidada] WHERE Grupo IS NOT NULL")
+        grupos = sorted(set(row[0].strip() for row in cursor.fetchall() if row[0] and row[0].strip()))
+        conn.close()
+        logger.info(f"Cargados {len(grupos)} grupos conocidos")
+        return grupos
+    except Exception as e:
+        logger.error(f"Error cargando grupos conocidos: {str(e)}")
+        return []
+
+GRUPOS_CONOCIDOS = cargar_grupos_conocidos()
 
 def obtener_temporada_actual():
     """Devuelve el número de temporada vigente (la de la fecha de hoy)"""
@@ -1270,7 +1306,7 @@ TOOLS = [
     },
     {
         "name": "consultar_cosecha_detalle",
-        "description": "Consulta el detalle de cosecha (estimado trisemanal y real), agrupado por packing/productor/variedad, con desglose por fecha si el rango no es muy amplio. Usar para preguntas como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', 'kilos recepcionados en tal planta', '¿cuánto se ha cosechado esta temporada/hasta hoy?', opcionalmente filtrado por especie, variedad, productor o packing/planta. Si el usuario NO da ninguna fecha (ej. 'toda la temporada', 'hasta hoy', 'cuánto llevamos'), omite fecha_inicio y fecha_fin por completo: se usa automáticamente desde el inicio de la temporada vigente hasta hoy.",
+        "description": "Consulta el detalle de cosecha (estimado trisemanal y real), agrupado por packing/productor/variedad, con desglose por fecha si el rango no es muy amplio. Usar para preguntas con un periodo ACOTADO y explícito, como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', 'kilos recepcionados en tal planta esta semana', o cuando el usuario pidió explícitamente el 'detalle'/desglose por fecha, opcionalmente filtrado por especie, variedad, productor, packing/planta o grupo. NO uses esta herramienta como respuesta por defecto a una pregunta abierta tipo 'cosecha de esta temporada' o 'cosecha de tal variedad' sin periodo acotado ni estructura pedida — en esos casos primero hay que preguntarle al usuario cómo quiere el resumen (ver instrucciones generales).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1297,6 +1333,10 @@ TOOLS = [
                 "packing": {
                     "type": "string",
                     "description": "Planta o packing mencionado por el usuario (ej. 'recepcionado en Almahue'), traducido al nombre EXACTO de la lista de packings conocidos. 'Recepcionado' o 'recibido' en una planta/packing se refiere a esto. Opcional."
+                },
+                "grupo": {
+                    "type": "string",
+                    "description": "Grupo/holding empresarial mencionado por el usuario, traducido al nombre EXACTO de la lista de grupos conocidos. No confundir con productor: un grupo puede agrupar varios productores. Opcional."
                 },
                 "detalle_por_fecha": {
                     "type": "boolean",
@@ -1356,14 +1396,14 @@ TOOLS = [
     },
     {
         "name": "consultar_cosecha_flexible",
-        "description": "Consulta GENÉRICA de estimado y real, agrupada EXACTAMENTE por las dimensiones que pida el usuario (cualquier combinación de especie, variedad, productor, packing, fecha). Usar cuando el usuario pide una estructura específica que no calza con las otras herramientas, por ejemplo: 'estimación de cosecha por especie' (agrupar_por=['especie']), 'informe con columnas fecha, estimado y real' (agrupar_por=['fecha']), 'total por productor' (agrupar_por=['productor']). Responde solo con las columnas pedidas, nada más. ESTA HERRAMIENTA NO TIENE PERIODO POR DEFECTO (a diferencia de las demás): si el usuario menciona CUALQUIER periodo, aunque sea 'esta temporada' o 'hasta hoy', DEBES pasar temporada o fecha_inicio/fecha_fin explícitamente — nunca los omitas solo porque suene al comportamiento por defecto de otras herramientas. Solo omite ambos si el usuario literalmente no dijo nada sobre tiempo, para que la herramienta pida aclaración.",
+        "description": "Consulta GENÉRICA de estimado y real, agrupada EXACTAMENTE por las dimensiones que pida el usuario (cualquier combinación de especie, variedad, productor, packing, grupo, fecha — o ninguna si pide solo el total sin desglose). Usar cuando el usuario pide una estructura específica que no calza con las otras herramientas, por ejemplo: 'estimación de cosecha por especie' (agrupar_por=['especie']), 'informe con columnas fecha, estimado y real' (agrupar_por=['fecha']), 'total por productor' (agrupar_por=['productor']), 'solo el total' o 'cuánto es en total' (agrupar_por=[], sin desglose). Responde solo con las columnas pedidas, nada más. ESTA HERRAMIENTA NO TIENE PERIODO POR DEFECTO (a diferencia de las demás): si el usuario menciona CUALQUIER periodo, aunque sea 'esta temporada' o 'hasta hoy', DEBES pasar temporada o fecha_inicio/fecha_fin explícitamente — nunca los omitas solo porque suene al comportamiento por defecto de otras herramientas. Solo omite ambos si el usuario literalmente no dijo nada sobre tiempo, para que la herramienta pida aclaración.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "agrupar_por": {
                     "type": "array",
-                    "items": {"type": "string", "enum": ["especie", "variedad", "productor", "packing", "fecha"]},
-                    "description": "Dimensiones exactas por las que agrupar, en el orden pedido por el usuario. Ej. 'resumen por especie' -> ['especie']; 'informe con fecha, estimado y real' -> ['fecha']; 'total por productor y variedad' -> ['productor','variedad']."
+                    "items": {"type": "string", "enum": ["especie", "variedad", "productor", "packing", "grupo", "fecha"]},
+                    "description": "Dimensiones exactas por las que agrupar, en el orden pedido por el usuario. Ej. 'resumen por especie' -> ['especie']; 'informe con fecha, estimado y real' -> ['fecha']; 'total por productor y variedad' -> ['productor','variedad']; 'solo el total, sin desglose' -> [] (arreglo vacío)."
                 },
                 "fecha_inicio": {
                     "type": "string",
@@ -1392,6 +1432,10 @@ TOOLS = [
                 "packing": {
                     "type": "string",
                     "description": "Filtro opcional de planta/packing."
+                },
+                "grupo": {
+                    "type": "string",
+                    "description": "Filtro opcional de grupo/holding empresarial, traducido al nombre EXACTO de la lista de grupos conocidos (ej. 'Valdés', 'Rodríguez', 'Superfruit'). No confundir con productor: un grupo puede agrupar varios productores."
                 },
                 "envase": {
                     "type": "string",
@@ -1429,6 +1473,11 @@ def construir_system_prompt(es_audio=False):
         lista_productores = ", ".join(PRODUCTORES_CONOCIDOS)
     else:
         lista_productores = "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
+
+    if GRUPOS_CONOCIDOS:
+        lista_grupos = ", ".join(GRUPOS_CONOCIDOS)
+    else:
+        lista_grupos = "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
 
     temporada_texto = (
         f"La temporada vigente (actual) es {TEMPORADA_ACTUAL}."
@@ -1485,9 +1534,9 @@ usuario mencione "invierno" y/o "primavera" en el contexto de estimaciones.
 
 También tienes consultar_cosecha_flexible: para cuando el usuario pide una estructura o agrupación
 específica que no calza con las demás herramientas (ej. "estimación de cosecha por especie", "informe
-con columnas fecha, estimado y real", "total por productor"). Responde SOLO con lo que se pidió, ni más
-ni menos — si piden agrupar solo por especie, no agregues variedad/productor/fecha aunque los tengas
-disponibles.
+con columnas fecha, estimado y real", "total por productor", "por grupo", o "solo el total sin
+desglose" con agrupar_por=[]). Responde SOLO con lo que se pidió, ni más ni menos — si piden agrupar
+solo por especie, no agregues variedad/productor/fecha aunque los tengas disponibles.
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
@@ -1498,9 +1547,34 @@ anterior ya respondiste algo parecido o idéntico. NUNCA repitas, parafrasees ni
 de una respuesta anterior sin volver a ejecutar la herramienta — los datos pueden haber cambiado o
 haberse corregido, y responder desde memoria puede dar información desactualizada o incorrecta.
 
+MUY IMPORTANTE — PREGUNTA LA ESTRUCTURA ANTES DE ASUMIR: cuando el usuario pida la cosecha/estimado/real
+de algo (una especie, variedad, productor, packing, grupo, o una temporada) SIN indicar cómo quiere que
+se resuma la respuesta —es decir, no dijo "detalle", no pidió agrupar "por especie/productor/packing/
+grupo", y no especificó columnas o una estructura concreta— Y ADEMÁS el periodo es abierto (no dio una
+fecha o rango acotado como "ayer", "hoy", "esta semana", "entre el X y el Y", sino que el resultado
+abarcaría toda la temporada o un periodo sin acotar), NO llames a ninguna herramienta todavía. En vez de
+eso, pregúntale primero cómo quiere el resumen, por ejemplo: "¿Cómo quieres que te lo resuma? Puedo
+darte el total general, o desglosado por productor/fundo, por especie, por packing/planta, por grupo, o
+el detalle completo día por día." Si tampoco quedó claro el periodo (recuerda que consultar_cosecha_flexible,
+a diferencia de las demás, NO tiene periodo por defecto), agrega esa pregunta AL MISMO TIEMPO, en el
+mismo mensaje, para no tener que preguntar dos veces seguidas — ej. "...y ¿para qué periodo? (esta
+temporada, un rango de fechas, etc.)". Esto aplica también si el usuario responde a esta pregunta
+indicando SOLO la agrupación (ej. "por productor") sin mencionar el periodo: antes de llamar a la
+herramienta, pregunta el periodo que falte en vez de asumirlo. Solo después de tener ambos datos, llama
+a la herramienta que corresponda: consultar_cosecha_flexible con el agrupar_por elegido (agrupar_por=[]
+si pide solo el total, sin desglose) y el periodo indicado, o consultar_cosecha_detalle con
+detalle_por_fecha=true si pide el detalle completo por fecha. Ejemplos que DEBEN generar esta pregunta
+antes de consultar: "cosecha de esta temporada", "estimación de cosecha por especie" (sin decir período
+ni tenerlo de una respuesta previa), "cosecha de santina", "dame la cosecha del grupo Valdés". Si en
+cambio el usuario SÍ
+dio una fecha o rango acotado (ej. "¿qué se cosechó ayer?", "entre el 1 y el 15 de agosto", "esta
+semana"), no hace falta preguntar nada: usa consultar_cosecha_detalle directamente, como siempre.
+
 Si el usuario usa la palabra "detalle" (ej. "dame el detalle de...", "detalle de cosecha de..."), SIEMPRE
 llama a consultar_cosecha_detalle con detalle_por_fecha=true, aunque pregunte solo por la cosecha en
-general y no mencione fechas explícitamente — igual debe mostrarse el desglose por fecha.
+general y no mencione fechas explícitamente — igual debe mostrarse el desglose por fecha. Usar la
+palabra "detalle" ya cuenta como estructura indicada, así que en ese caso NO hace falta preguntar nada
+más (salvo que falte el periodo).
 
 VARIEDADES CONOCIDAS EN EL SISTEMA (nombre exacto como está en la base de datos):
 {lista_variedades}
@@ -1531,6 +1605,14 @@ PRODUCTORES CONOCIDOS EN EL SISTEMA (nombre exacto como está en la base de dato
 {lista_productores}
 
 Cuando el usuario mencione un productor, pasa a la herramienta el nombre EXACTO de esta lista.
+
+GRUPOS (HOLDINGS EMPRESARIALES) CONOCIDOS EN EL SISTEMA (nombre exacto como está en la base de datos):
+{lista_grupos}
+
+Un "grupo" es la empresa/holding dueña de uno o varios productores (ej. el grupo "VALDES" agrupa varios
+fundos). No es lo mismo que un productor ni que una planta/packing. Cuando el usuario mencione un grupo
+por su nombre, o pida agrupar/filtrar "por grupo", usa el parámetro "grupo" con el nombre EXACTO de esta
+lista.
 
 ATENCIÓN — AMBIGÜEDAD PRODUCTOR VS PLANTA/PACKING: varios nombres existen TANTO en la lista de
 productores COMO en la de plantas/packings (ej. "El Carmelo" es un productor Y también una planta;
@@ -1601,6 +1683,7 @@ def ejecutar_tool(tool_name, tool_input):
             variedad=variedad_op,
             productor=tool_input.get("productor") or None,
             packing=tool_input.get("packing") or None,
+            grupo=tool_input.get("grupo") or None,
             forzar_fechas=bool(tool_input.get("detalle_por_fecha")),
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
@@ -1631,6 +1714,7 @@ def ejecutar_tool(tool_name, tool_input):
             variedad=variedad_op,
             productor=tool_input.get("productor") or None,
             packing=tool_input.get("packing") or None,
+            grupo=tool_input.get("grupo") or None,
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
         )
