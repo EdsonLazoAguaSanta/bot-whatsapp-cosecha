@@ -466,6 +466,10 @@ def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None
             filtro_desc += f" en {envase.upper()}"
             columna_suma = "Bultos"
             unidad = envase.upper()
+            # Hay filas duplicadas en la base para el mismo registro: una con Bultos y
+            # KgsRecepcionados=NULL, y otra con ambos. Sin este filtro, sumar Bultos duplica
+            # el total (verificado: 590 en vez de 295, exactamente el doble).
+            condiciones.append("KgsRecepcionados IS NOT NULL")
 
         where = " AND ".join(condiciones)
         query = f"""
@@ -688,6 +692,10 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
             filtro_desc += f" en {envase.upper()}"
             columna_suma = "Bultos"
             unidad = envase.upper()
+            # Hay filas duplicadas en la base para el mismo registro: una con Bultos y
+            # KgsRecepcionados=NULL, y otra con ambos. Sin este filtro, sumar Bultos duplica
+            # el total (verificado: 590 en vez de 295, exactamente el doble).
+            condiciones.append("KgsRecepcionados IS NOT NULL")
 
         where = " AND ".join(condiciones)
         query = f"""
@@ -1420,7 +1428,7 @@ async def health():
 async def historial(clave: str, limit: int = 50):
     """
     Ver las últimas conversaciones registradas (protegido con clave).
-    Uso: https://bot-whatsapp-asa.com/historial?clave=TU_CLAVE&limit=50
+    Uso: https://bot-whatsapp-asa.com/historial?clave=Matias14&limit=100
     """
     if clave != HISTORIAL_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
