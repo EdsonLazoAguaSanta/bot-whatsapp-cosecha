@@ -133,12 +133,26 @@ def conectar_sql():
 # ============================================================================
 
 # Tabla oficial: Recepcion_Consolidada, distinguida por [Base Origen]
-# 'Trisemanal' = estimación de cosecha | 'Recepción Planta' = cosecha real
-# Verificado contra ejemplo real: W. Murcott 2026-08-12 -> Trisemanal=160.300kg, Recepción Planta=162.136kg (+1.15%)
-BASE_ORIGEN_ESTIMADO = "Trisemanal"
+# 'Recepción Planta' = cosecha real. Hay 3 fuentes de estimado: 'Trisemanal' (rolling 3 semanas),
+# 'Estim Invierno' y 'Estim Primavera' (dos ciclos de planificación de temporada).
+# Por defecto, "estimado" usa Estim Primavera (pedido explícito del usuario: Primavera es la
+# referencia habitual; Trisemanal/Invierno solo se usan si se piden por su nombre).
 BASE_ORIGEN_REAL = "Recepción Planta"
+BASE_ORIGEN_TRISEMANAL = "Trisemanal"
 BASE_ORIGEN_ESTIM_INVIERNO = "Estim Invierno"
 BASE_ORIGEN_ESTIM_PRIMAVERA = "Estim Primavera"
+BASE_ORIGEN_ESTIMADO = BASE_ORIGEN_ESTIM_PRIMAVERA
+
+FUENTES_ESTIMADO = {
+    "primavera": BASE_ORIGEN_ESTIM_PRIMAVERA,
+    "trisemanal": BASE_ORIGEN_TRISEMANAL,
+    "invierno": BASE_ORIGEN_ESTIM_INVIERNO,
+}
+
+def resolver_fuente_estimado(fuente_estimado):
+    """Devuelve el valor real de [Base Origen] a usar como 'estimado'. Por defecto (None u
+    omitido) es Estim Primavera; solo cambia si se pide explícitamente trisemanal/invierno."""
+    return FUENTES_ESTIMADO.get((fuente_estimado or "").strip().lower(), BASE_ORIGEN_ESTIMADO)
 
 ESPECIE_TRADUCCION = {
     "GRAPE": "Uva",
@@ -164,9 +178,11 @@ def formatear_kg(valor):
     """Formatea un entero con separador de miles al estilo chileno (punto)"""
     return f"{int(valor):,}".replace(",", ".")
 
-def obtener_bins_estimados(variedad):
-    """Consulta: ¿Cuántos kg se estiman cosechar esta temporada de [variedad]? (fuente: Trisemanal)"""
+def obtener_bins_estimados(variedad, fuente_estimado=None):
+    """Consulta: ¿Cuántos kg se estiman cosechar esta temporada de [variedad]? Por defecto usa
+    Estim Primavera; fuente_estimado puede forzar 'trisemanal' o 'invierno' explícitamente."""
     try:
+        base = resolver_fuente_estimado(fuente_estimado)
         conn = conectar_sql()
         if not conn:
             return "Error de conexión a base de datos"
@@ -179,14 +195,15 @@ def obtener_bins_estimados(variedad):
         AND [Base Origen] = ?
         AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
         """
-        cursor.execute(query, (f"%{variedad}%", BASE_ORIGEN_ESTIMADO))
+        cursor.execute(query, (f"%{variedad}%", base))
         resultado = cursor.fetchone()
         conn.close()
 
+        etiqueta = base.lower()
         if resultado and resultado[0]:
-            return f"📦 {variedad.upper()}: {formatear_kg(resultado[0])} kg estimados esta temporada (trisemanal)"
+            return f"📦 {variedad.upper()}: {formatear_kg(resultado[0])} kg estimados esta temporada ({etiqueta})"
         else:
-            return f"No hay estimación trisemanal registrada para {variedad}"
+            return f"No hay estimación ({etiqueta}) registrada para {variedad}"
     except Exception as e:
         logger.error(f"Error en obtener_bins_estimados: {str(e)}")
         return f"Error al consultar: {str(e)}"
@@ -223,9 +240,12 @@ def obtener_calibre_promedio(variedad, ano=2025):
     """Consulta: ¿Cuál fue el calibre promedio de [variedad] el año pasado?"""
     return f"📏 Consulta de calibre para {variedad.upper()} aún no disponible: falta confirmar con Erick en qué tabla vive el dato de calibre."
 
-def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None):
-    """Consulta: ¿Cómo vamos de [variedad] respecto a lo estimado, en una fecha? (default: hoy). fecha en formato YYYY-MM-DD"""
+def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estimado=None):
+    """Consulta: ¿Cómo vamos de [variedad] respecto a lo estimado, en una fecha? (default: hoy).
+    fecha en formato YYYY-MM-DD. Por defecto compara contra Estim Primavera; fuente_estimado
+    puede forzar 'trisemanal' o 'invierno' explícitamente."""
     try:
+        base = resolver_fuente_estimado(fuente_estimado)
         conn = conectar_sql()
         if not conn:
             return "Error de conexión a base de datos"
@@ -236,7 +256,7 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None):
             """SELECT SUM(KgsRecepcionados) FROM [Recepcion_Consolidada]
                WHERE Variedad LIKE ? AND [Base Origen] = ?
                AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE))""",
-            (f"%{variedad}%", BASE_ORIGEN_ESTIMADO, fecha)
+            (f"%{variedad}%", base, fecha)
         )
         fila = cursor.fetchone()
         estimado = fila[0] if fila and fila[0] else 0
@@ -267,7 +287,7 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None):
         elif estimado and not real:
             return f"📊 {variedad.upper()} ({etiqueta_fecha}): estimado {formatear_kg(estimado)} kg, aún sin cosecha real registrada"
         else:
-            return f"📊 {variedad.upper()} ({etiqueta_fecha}): cosecha real {formatear_kg(real)} kg, no había estimación trisemanal para esa fecha"
+            return f"📊 {variedad.upper()} ({etiqueta_fecha}): cosecha real {formatear_kg(real)} kg, no había estimación ({base.lower()}) para esa fecha"
     except Exception as e:
         logger.error(f"Error en obtener_comparacion_estimado_vs_cosechado: {str(e)}")
         return f"Error al consultar: {str(e)}"
@@ -521,30 +541,33 @@ def _formatear_grupo(v):
         return texto[inicio + 1:fin].strip()
     return texto
 
-def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True, unidad="kg"):
+def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mostrar_fechas=True, unidad="kg", base_estimado=None):
     """
     filas: lista de tuplas (Packing, Productor, Especie, Variedad, Fecha, Base Origen, total).
     Si el rango es corto y hay pocos grupos, arma una tabla de fecha x (estimado, real) por
     cada packing/productor/variedad. Si no, colapsa a una tabla única con columnas
     Planta | Productor | Especie | Variedad | Estimado | Real.
     unidad: etiqueta del total (ej. "kg", "BINS", "TOTES") según qué columna se sumó.
+    base_estimado: valor real de [Base Origen] que cuenta como "estimado" en estas filas
+    (Estim Primavera por defecto, o Trisemanal/Estim Invierno si se pidió explícitamente).
     """
     if not filas:
         return None
 
+    base_estimado = base_estimado or BASE_ORIGEN_ESTIMADO
     grupos = {}  # (packing, productor, especie, variedad) -> {fecha: {"estimado":x, "real":y}}
     for packing, productor, especie, variedad, fecha, base_origen, total in filas:
         if not total:
             continue
         # Normaliza mayúsculas: la misma planta/productor puede venir escrito distinto
-        # según si la fila es 'Trisemanal' o 'Recepción Planta' en la base de origen.
+        # según si la fila es de estimado o de 'Recepción Planta' en la base de origen.
         clave = (
             (packing or "").strip().upper(),
             (productor or "").strip().upper(),
             (especie or "").strip().upper(),
             (variedad or "").strip().upper(),
         )
-        clave_valor = "estimado" if base_origen == BASE_ORIGEN_ESTIMADO else "real"
+        clave_valor = "estimado" if base_origen == base_estimado else "real"
         grupos.setdefault(clave, {}).setdefault(fecha, {})[clave_valor] = total
 
     if not grupos:
@@ -564,7 +587,7 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
             total_estimado_gral += total_est
             total_real_gral += total_real
 
-            filas_tabla = [f"{'Fecha':<11}{'Trisem.':>9}{'Real':>9}"]
+            filas_tabla = [f"{'Fecha':<11}{'Estimado':>9}{'Real':>9}"]
             for fecha in sorted(fechas.keys()):
                 vals = fechas[fecha]
                 est = vals.get("estimado", 0) or 0
@@ -641,12 +664,14 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
     )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, grupo=None, forzar_fechas=False, envase=None, temporada=None):
+def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, grupo=None, forzar_fechas=False, envase=None, temporada=None, fuente_estimado=None):
     """
     Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
-    con columnas de estimado (Trisemanal) y real (Recepción Planta) por fecha, agrupado por
+    con columnas de estimado y real (Recepción Planta) por fecha, agrupado por
     packing/productor/variedad. Filtros opcionales. Si el rango es muy amplio o hay muchos
     grupos, se colapsa a solo totales para no saturar el mensaje.
+    Por defecto el "estimado" es Estim Primavera; fuente_estimado puede forzar 'trisemanal'
+    o 'invierno' explícitamente.
     Si no se da fecha_inicio, se usa el inicio de la temporada vigente hasta hoy (para
     preguntas tipo "toda la temporada", "hasta hoy", sin fechas explícitas). Si se da temporada
     (ej. 2025 para "la temporada pasada") sin fechas, se usa el rango completo de esa temporada.
@@ -655,6 +680,7 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
     conversión (los factores kg/unidad no son confiables en los datos históricos).
     """
     try:
+        base_estimado = resolver_fuente_estimado(fuente_estimado)
         conn = conectar_sql()
         if not conn:
             return "Error de conexión a base de datos"
@@ -696,7 +722,7 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
             return "No entendí el rango de fechas. ¿Puedes indicarlo como 'entre el DD-MM-YYYY y el DD-MM-YYYY'?"
 
         condiciones = ["[Base Origen] IN (?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
-        params = [BASE_ORIGEN_ESTIMADO, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        params = [base_estimado, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
         filtro_desc = ""
         if especie:
             condiciones.append("Especie LIKE ?")
@@ -752,7 +778,7 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
             dias_rango = 0
         mostrar_fechas = forzar_fechas or dias_rango <= UMBRAL_DIAS_TABLA_DETALLADA
 
-        resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc, mostrar_fechas, unidad)
+        resultado = formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc, mostrar_fechas, unidad, base_estimado)
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
         return resultado
@@ -778,14 +804,17 @@ DIMENSIONES_ETIQUETA = {
 }
 MAX_FILAS_FLEXIBLE = 60
 
-def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg"):
+def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg", base_estimado=None):
     """
     filas: tuplas (valor_dim1, valor_dim2, ..., Base Origen, total), según 'dimensiones'.
     Arma UNA sola tabla con columnas = dimensiones pedidas + Estimado + Real, y fila TOTAL.
+    base_estimado: valor real de [Base Origen] que cuenta como "estimado" en estas filas
+    (Estim Primavera por defecto, o Trisemanal/Estim Invierno si se pidió explícitamente).
     """
     if not filas:
         return None
 
+    base_estimado = base_estimado or BASE_ORIGEN_ESTIMADO
     n = len(dimensiones)
     datos = {}
     for fila in filas:
@@ -797,7 +826,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
         clave = tuple(
             (v.strip().upper() if isinstance(v, str) else v) for v in valores_dim
         )
-        tipo = "estimado" if base_origen == BASE_ORIGEN_ESTIMADO else "real"
+        tipo = "estimado" if base_origen == base_estimado else "real"
         datos.setdefault(clave, {})
         datos[clave][tipo] = datos[clave].get(tipo, 0) + total
 
@@ -879,15 +908,18 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
     return "\n".join(lineas)
 
 def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, especie=None, variedad=None,
-                              productor=None, packing=None, grupo=None, envase=None, temporada=None):
+                              productor=None, packing=None, grupo=None, envase=None, temporada=None,
+                              fuente_estimado=None):
     """
     Consulta genérica: agrupa por las dimensiones exactas que se pidan (cualquier combinación
     de especie/variedad/productor/packing/grupo/fecha, o ninguna si se pide solo el total),
-    sumando estimado (Trisemanal) y real (Recepción Planta) o Bultos si se da envase. A
-    diferencia de las demás consultas, si no se da ningún periodo (ni fechas ni temporada) NO
-    asume nada: pide que se aclare el periodo.
+    sumando estimado y real (Recepción Planta) o Bultos si se da envase. Por defecto el
+    "estimado" es Estim Primavera; fuente_estimado puede forzar 'trisemanal' o 'invierno'
+    explícitamente. A diferencia de las demás consultas, si no se da ningún periodo (ni fechas
+    ni temporada) NO asume nada: pide que se aclare el periodo.
     """
     try:
+        base_estimado = resolver_fuente_estimado(fuente_estimado)
         dimensiones = [d for d in (agrupar_por or []) if d in DIMENSIONES_SQL]
 
         if not fecha_inicio and not temporada:
@@ -921,7 +953,7 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
             return "No entendí el rango de fechas. ¿Puedes indicarlo como 'entre el DD-MM-YYYY y el DD-MM-YYYY'?"
 
         condiciones = ["[Base Origen] IN (?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
-        params = [BASE_ORIGEN_ESTIMADO, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        params = [base_estimado, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
         filtro_desc = ""
         if especie:
             condiciones.append("Especie LIKE ?")
@@ -969,7 +1001,7 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
         filas = cursor.fetchall()
         conn.close()
 
-        resultado = formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad)
+        resultado = formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado)
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
         return resultado
@@ -1169,13 +1201,18 @@ def normalizar_variedad(variedad_usuario):
 TOOLS = [
     {
         "name": "consultar_bins_estimados",
-        "description": "Consulta cuántos bins se estiman cosechar esta temporada para una variedad de fruta.",
+        "description": "Consulta cuántos bins se estiman cosechar esta temporada para una variedad de fruta. Por defecto usa la Estimación Primavera.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "variedad": {
                     "type": "string",
                     "description": "Nombre de la variedad mencionada por el usuario, tal como la escribió (ej. 'tiffany', 'crimson')."
+                },
+                "fuente_estimado": {
+                    "type": "string",
+                    "enum": ["trisemanal", "invierno"],
+                    "description": "Omitir SIEMPRE por defecto (se usa Estim Primavera automáticamente). Solo pasar 'trisemanal' o 'invierno' si el usuario pide explícitamente esa fuente por su nombre."
                 }
             },
             "required": ["variedad"]
@@ -1215,7 +1252,7 @@ TOOLS = [
     },
     {
         "name": "comparar_estimado_vs_cosechado",
-        "description": "Compara lo cosechado REAL contra lo estimado (trisemanal) de una variedad, en una fecha específica, con porcentaje de avance. Usar cuando pregunten 'cómo vamos' de una variedad en una fecha dada (hoy, ayer, mañana, una fecha puntual, etc). Si hay estimado y real, muestra ambos.",
+        "description": "Compara lo cosechado REAL contra lo estimado (Estim Primavera por defecto) de una variedad, en una fecha específica, con porcentaje de avance. Usar cuando pregunten 'cómo vamos' de una variedad en una fecha dada (hoy, ayer, mañana, una fecha puntual, etc). Si hay estimado y real, muestra ambos.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1226,6 +1263,11 @@ TOOLS = [
                 "fecha": {
                     "type": "string",
                     "description": "Fecha en formato YYYY-MM-DD, calculada a partir de la fecha de hoy y lo que diga el usuario (ej. 'ayer', 'mañana', 'el 12 de agosto'). Si el usuario no menciona fecha, omite este campo (se usa hoy por defecto)."
+                },
+                "fuente_estimado": {
+                    "type": "string",
+                    "enum": ["trisemanal", "invierno"],
+                    "description": "Omitir SIEMPRE por defecto (se usa Estim Primavera automáticamente). Solo pasar 'trisemanal' o 'invierno' si el usuario pide explícitamente esa fuente por su nombre."
                 }
             },
             "required": ["variedad"]
@@ -1319,7 +1361,7 @@ TOOLS = [
     },
     {
         "name": "consultar_cosecha_detalle",
-        "description": "Consulta el detalle de cosecha (estimado trisemanal y real), agrupado por packing/productor/variedad, con desglose por fecha si el rango no es muy amplio. Usar para preguntas con un periodo ACOTADO y explícito, como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', 'kilos recepcionados en tal planta esta semana', o cuando el usuario pidió explícitamente el 'detalle'/desglose por fecha, opcionalmente filtrado por especie, variedad, productor, packing/planta o grupo. NO uses esta herramienta como respuesta por defecto a una pregunta abierta tipo 'cosecha de esta temporada' o 'cosecha de tal variedad' sin periodo acotado ni estructura pedida — en esos casos primero hay que preguntarle al usuario cómo quiere el resumen (ver instrucciones generales).",
+        "description": "Consulta el detalle de cosecha (estimado y real), agrupado por packing/productor/variedad, con desglose por fecha si el rango no es muy amplio. Por defecto el estimado usa Estim Primavera. Usar para preguntas con un periodo ACOTADO y explícito, como '¿qué se cosechó ayer?', '¿cuánto se cosechó entre el 1 y el 15 de agosto?', 'kilos recepcionados en tal planta esta semana', o cuando el usuario pidió explícitamente el 'detalle'/desglose por fecha, opcionalmente filtrado por especie, variedad, productor, packing/planta o grupo. NO uses esta herramienta como respuesta por defecto a una pregunta abierta tipo 'cosecha de esta temporada' o 'cosecha de tal variedad' sin periodo acotado ni estructura pedida — en esos casos primero hay que preguntarle al usuario cómo quiere el resumen (ver instrucciones generales).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1362,6 +1404,11 @@ TOOLS = [
                 "temporada": {
                     "type": "integer",
                     "description": "Número de temporada (ej. 2025 para 'la temporada pasada'), calculado usando la temporada vigente que se te indica más abajo. Solo úsalo si NO se dieron fecha_inicio/fecha_fin y el usuario pidió una temporada distinta a la actual (ej. 'toda la temporada pasada'). Si el usuario da fechas explícitas, omite este campo."
+                },
+                "fuente_estimado": {
+                    "type": "string",
+                    "enum": ["trisemanal", "invierno"],
+                    "description": "Omitir SIEMPRE por defecto (se usa Estim Primavera automáticamente). Solo pasar 'trisemanal' o 'invierno' si el usuario pide explícitamente esa fuente por su nombre."
                 }
             }
         }
@@ -1453,6 +1500,11 @@ TOOLS = [
                 "envase": {
                     "type": "string",
                     "description": "SOLO si el usuario pide el resultado en bins, totes, cajas u otro envase (no kilos). Nombre EXACTO de la lista de envases conocidos."
+                },
+                "fuente_estimado": {
+                    "type": "string",
+                    "enum": ["trisemanal", "invierno"],
+                    "description": "Omitir SIEMPRE por defecto (se usa Estim Primavera automáticamente). Solo pasar 'trisemanal' o 'invierno' si el usuario pide explícitamente esa fuente por su nombre."
                 }
             },
             "required": ["agrupar_por"]
@@ -1532,18 +1584,28 @@ DEBES pasar temporada={TEMPORADA_ACTUAL} explícitamente (o las fechas que corre
 pensando que hay un default, porque en esa herramienta omitirlo significa "el usuario no dijo nada" y
 hará que se le pregunte innecesariamente.
 
-Tienes herramientas para consultar, por variedad: estimado de temporada (trisemanal), cosecha real en
+Tienes herramientas para consultar, por variedad: estimado de temporada, cosecha real en
 una fecha, y comparación de avance (estimado vs cosechado real) en una fecha.
 También puedes consultar resúmenes por productor o por packing (no requieren variedad), cuándo fue la
 primera o la última cosecha real de una especie/variedad/productor/packing (útil para "¿cuándo empezó
 la cosecha?" o "¿cuándo fue la última?"), y el detalle de cosecha real entre un rango de fechas
 (agrupado por especie/variedad/productor, opcionalmente filtrado por especie, variedad o productor).
 
+MUY IMPORTANTE — FUENTE DEL "ESTIMADO": hay tres fuentes distintas de estimado en la base: Trisemanal
+(rolling 3 semanas), Estim Invierno y Estim Primavera (dos ciclos de planificación de temporada). Por
+defecto, SIEMPRE que hables de "estimado" o "estimación" (sin que el usuario nombre una fuente distinta),
+usa Estim Primavera — no hace falta pasar ningún parámetro especial, es el comportamiento por defecto de
+consultar_bins_estimados, comparar_estimado_vs_cosechado, consultar_cosecha_detalle y
+consultar_cosecha_flexible. Solo si el usuario menciona explícitamente "trisemanal" o "estimación
+invierno"/"estimado invierno" (una sola fuente, no una comparación), pasa fuente_estimado="trisemanal" o
+fuente_estimado="invierno" en esa misma herramienta para usar esa fuente en vez de Primavera.
+
 Además tienes consultar_comparativo_estimaciones: compara Estimación Invierno vs Estimación Primavera
-vs Cosecha Real, con diferencias y %, para preguntas tipo "comparativo de estimación invierno, primavera
-y real" o "diferencia entre lo estimado en invierno y primavera". Estas son dos ciclos de estimación
-distintos al "estimado" (Trisemanal) que usan las otras herramientas — úsala específicamente cuando el
-usuario mencione "invierno" y/o "primavera" en el contexto de estimaciones.
+vs Cosecha Real EN LA MISMA TABLA, con diferencias y %. Úsala específicamente cuando el usuario pida
+COMPARAR ambas estimaciones (ej. "comparativo de estimación invierno, primavera y real", "diferencia
+entre lo estimado en invierno y primavera", "cómo cambió la estimación de invierno a primavera") — no
+para una consulta simple de una sola fuente, que ya cubren las herramientas normales con
+fuente_estimado.
 
 También tienes consultar_cosecha_flexible: para cuando el usuario pide una estructura o agrupación
 específica que no calza con las demás herramientas (ej. "estimación de cosecha por especie", "informe
@@ -1700,6 +1762,7 @@ def ejecutar_tool(tool_name, tool_input):
             forzar_fechas=bool(tool_input.get("detalle_por_fecha")),
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
+            fuente_estimado=tool_input.get("fuente_estimado") or None,
         )
 
     if tool_name == "consultar_comparativo_estimaciones":
@@ -1730,18 +1793,20 @@ def ejecutar_tool(tool_name, tool_input):
             grupo=tool_input.get("grupo") or None,
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
+            fuente_estimado=tool_input.get("fuente_estimado") or None,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
     fecha = tool_input.get("fecha") or None
+    fuente_estimado = tool_input.get("fuente_estimado") or None
     if tool_name == "consultar_bins_estimados":
-        return obtener_bins_estimados(variedad)
+        return obtener_bins_estimados(variedad, fuente_estimado=fuente_estimado)
     elif tool_name == "consultar_cosecha_hoy":
         return obtener_cosecha_actual(variedad, fecha)
     elif tool_name == "consultar_calibre_promedio":
         return obtener_calibre_promedio(variedad)
     elif tool_name == "comparar_estimado_vs_cosechado":
-        return obtener_comparacion_estimado_vs_cosechado(variedad, fecha)
+        return obtener_comparacion_estimado_vs_cosechado(variedad, fecha, fuente_estimado=fuente_estimado)
     return "No supe qué información buscar para esa pregunta."
 
 def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
@@ -1763,7 +1828,10 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
 
         response = claude_client.messages.create(
             model="claude-sonnet-5",
-            max_tokens=300,
+            # 300 se quedaba corto: con el prompt actual (más largo) Claude a veces gasta el
+            # presupuesto completo en el bloque de "thinking" antes de terminar el tool_use,
+            # devolviendo una respuesta trunca (stop_reason="max_tokens") sin tool_use ni texto.
+            max_tokens=1500,
             system=construir_system_prompt(es_audio),
             tools=TOOLS,
             messages=messages,
