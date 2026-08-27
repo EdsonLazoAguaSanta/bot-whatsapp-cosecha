@@ -745,6 +745,207 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
         logger.error(f"Error en obtener_cosecha_detalle: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
+DIMENSIONES_SQL = {
+    "especie": "Especie",
+    "variedad": "Variedad",
+    "productor": "Productor",
+    "packing": "Packing",
+    "fecha": "CAST(Fecha AS DATE)",
+}
+DIMENSIONES_ETIQUETA = {
+    "especie": "Especie",
+    "variedad": "Variedad",
+    "productor": "Productor",
+    "packing": "Planta",
+    "fecha": "Fecha",
+}
+MAX_FILAS_FLEXIBLE = 60
+
+def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg"):
+    """
+    filas: tuplas (valor_dim1, valor_dim2, ..., Base Origen, total), según 'dimensiones'.
+    Arma UNA sola tabla con columnas = dimensiones pedidas + Estimado + Real, y fila TOTAL.
+    """
+    if not filas:
+        return None
+
+    n = len(dimensiones)
+    datos = {}
+    for fila in filas:
+        valores_dim = fila[:n]
+        base_origen = fila[n]
+        total = fila[n + 1]
+        if not total:
+            continue
+        clave = tuple(
+            (v.strip().upper() if isinstance(v, str) else v) for v in valores_dim
+        )
+        tipo = "estimado" if base_origen == BASE_ORIGEN_ESTIMADO else "real"
+        datos.setdefault(clave, {})
+        datos[clave][tipo] = datos[clave].get(tipo, 0) + total
+
+    if not datos:
+        return None
+
+    rango = fecha_inicio if fecha_inicio == fecha_fin else f"{fecha_inicio} a {fecha_fin}"
+    lineas = [f"📅 Resumen {rango}{filtro_desc}:"]
+
+    anchos_dim = []
+    for d in dimensiones:
+        if d == "fecha":
+            anchos_dim.append(11)
+        elif d in ("productor", "packing"):
+            anchos_dim.append(16)
+        else:
+            anchos_dim.append(13)
+    ancho_num = 11
+
+    header = "".join(
+        f"{DIMENSIONES_ETIQUETA.get(d, d):<{a}}" for d, a in zip(dimensiones, anchos_dim)
+    )
+    header += f"{'Estimado':>{ancho_num}}{'Real':>{ancho_num}}"
+    filas_tabla = [header]
+
+    tot_est = 0
+    tot_real = 0
+    claves_ordenadas = sorted(datos.keys(), key=lambda c: [str(x) for x in c])
+    truncado = len(claves_ordenadas) > MAX_FILAS_FLEXIBLE
+    for clave in claves_ordenadas[:MAX_FILAS_FLEXIBLE]:
+        vals = datos[clave]
+        est = vals.get("estimado", 0)
+        real = vals.get("real", 0)
+        tot_est += est
+        tot_real += real
+        fila_texto = ""
+        for v, a, d in zip(clave, anchos_dim, dimensiones):
+            if d == "fecha":
+                texto = _fecha_str(v)
+            elif d == "especie":
+                texto = traducir_especie(v)
+            else:
+                texto = str(v) if v is not None else ""
+            fila_texto += f"{_truncar(texto, a):<{a}}"
+        est_str = formatear_kg(est) if est else "-"
+        real_str = formatear_kg(real) if real else "-"
+        fila_texto += f"{est_str:>{ancho_num}}{real_str:>{ancho_num}}"
+        filas_tabla.append(fila_texto)
+
+    # Si se truncó, los totales igual deben sumar TODAS las filas, no solo las mostradas
+    if truncado:
+        for clave in claves_ordenadas[MAX_FILAS_FLEXIBLE:]:
+            vals = datos[clave]
+            tot_est += vals.get("estimado", 0)
+            tot_real += vals.get("real", 0)
+
+    ancho_total = sum(anchos_dim) + ancho_num * 2
+    filas_tabla.append("-" * ancho_total)
+    filas_tabla.append(
+        f"{'TOTAL':<{sum(anchos_dim)}}{formatear_kg(tot_est):>{ancho_num}}{formatear_kg(tot_real):>{ancho_num}}"
+    )
+
+    lineas.append(f"```{chr(10).join(filas_tabla)}```")
+    if truncado:
+        lineas.append(f"\n(mostrando {MAX_FILAS_FLEXIBLE} de {len(claves_ordenadas)} filas — acota la consulta para ver el resto; los totales sí incluyen todo)")
+
+    lineas.append(
+        f"\n📦 Total general: estimado {formatear_kg(tot_est)} {unidad}, real {formatear_kg(tot_real)} {unidad}"
+    )
+    return "\n".join(lineas)
+
+def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, especie=None, variedad=None,
+                              productor=None, packing=None, envase=None, temporada=None):
+    """
+    Consulta genérica: agrupa por las dimensiones exactas que se pidan (cualquier combinación
+    de especie/variedad/productor/packing/fecha), sumando estimado (Trisemanal) y real
+    (Recepción Planta) o Bultos si se da envase. A diferencia de las demás consultas, si no se
+    da ningún periodo (ni fechas ni temporada) NO asume nada: pide que se aclare el periodo.
+    """
+    try:
+        dimensiones = [d for d in (agrupar_por or []) if d in DIMENSIONES_SQL]
+        if not dimensiones:
+            dimensiones = ["variedad"]
+
+        if not fecha_inicio and not temporada:
+            return "¿Para qué periodo necesitas este dato? (por ejemplo: esta temporada, un rango de fechas específico, o solo hoy)"
+
+        conn = conectar_sql()
+        if not conn:
+            return "Error de conexión a base de datos"
+
+        cursor = conn.cursor()
+
+        if not fecha_inicio:
+            cursor.execute(
+                "SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE Temporada = ?",
+                (temporada,)
+            )
+            fila = cursor.fetchone()
+            if not fila or not fila[0]:
+                conn.close()
+                return f"No encontré datos para la temporada {temporada}."
+            fecha_inicio = fila[0].strftime("%Y-%m-%d")
+            fecha_fin = fila[1].strftime("%Y-%m-%d")
+        elif not fecha_fin:
+            fecha_fin = fecha_inicio
+
+        try:
+            datetime.strptime(fecha_inicio, "%Y-%m-%d")
+            datetime.strptime(fecha_fin, "%Y-%m-%d")
+        except (ValueError, TypeError):
+            conn.close()
+            return "No entendí el rango de fechas. ¿Puedes indicarlo como 'entre el DD-MM-YYYY y el DD-MM-YYYY'?"
+
+        condiciones = ["[Base Origen] IN (?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
+        params = [BASE_ORIGEN_ESTIMADO, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        filtro_desc = ""
+        if especie:
+            condiciones.append("Especie LIKE ?")
+            params.append(f"%{especie}%")
+            filtro_desc += f" de {traducir_especie(especie)}"
+        if variedad:
+            condiciones.append("Variedad LIKE ?")
+            params.append(f"%{variedad}%")
+            filtro_desc += f" ({variedad.upper()})"
+        if productor:
+            condiciones.append("Productor LIKE ?")
+            params.append(f"%{productor}%")
+            filtro_desc += f" del productor {productor.upper()}"
+        if packing:
+            condiciones.append("Packing LIKE ?")
+            params.append(f"%{packing}%")
+            filtro_desc += f" en {packing.upper()}"
+
+        columna_suma = "KgsRecepcionados"
+        unidad = "kg"
+        if envase:
+            condiciones.append("Envase LIKE ?")
+            params.append(f"%{envase}%")
+            filtro_desc += f" en {envase.upper()}"
+            columna_suma = "Bultos"
+            unidad = envase.upper()
+            condiciones.append("KgsRecepcionados IS NOT NULL")
+
+        where = " AND ".join(condiciones)
+        columnas_sql = ", ".join(DIMENSIONES_SQL[d] for d in dimensiones)
+        query = f"""
+            SELECT {columnas_sql}, [Base Origen], SUM({columna_suma}) as total
+            FROM [Recepcion_Consolidada]
+            WHERE {where}
+            GROUP BY {columnas_sql}, [Base Origen]
+            HAVING SUM({columna_suma}) > 0
+        """
+        cursor.execute(query, params)
+        filas = cursor.fetchall()
+        conn.close()
+
+        resultado = formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad)
+        if not resultado:
+            return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
+        return resultado
+    except Exception as e:
+        logger.error(f"Error en obtener_cosecha_flexible: {str(e)}")
+        return f"Error al consultar: {str(e)}"
+
 def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo):
     """Función compartida: encuentra la primera (MIN) o última (MAX) fecha con cosecha real."""
     try:
@@ -1153,6 +1354,53 @@ TOOLS = [
             }
         }
     },
+    {
+        "name": "consultar_cosecha_flexible",
+        "description": "Consulta GENÉRICA de estimado y real, agrupada EXACTAMENTE por las dimensiones que pida el usuario (cualquier combinación de especie, variedad, productor, packing, fecha). Usar cuando el usuario pide una estructura específica que no calza con las otras herramientas, por ejemplo: 'estimación de cosecha por especie' (agrupar_por=['especie']), 'informe con columnas fecha, estimado y real' (agrupar_por=['fecha']), 'total por productor' (agrupar_por=['productor']). Responde solo con las columnas pedidas, nada más. ESTA HERRAMIENTA NO TIENE PERIODO POR DEFECTO (a diferencia de las demás): si el usuario menciona CUALQUIER periodo, aunque sea 'esta temporada' o 'hasta hoy', DEBES pasar temporada o fecha_inicio/fecha_fin explícitamente — nunca los omitas solo porque suene al comportamiento por defecto de otras herramientas. Solo omite ambos si el usuario literalmente no dijo nada sobre tiempo, para que la herramienta pida aclaración.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "agrupar_por": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["especie", "variedad", "productor", "packing", "fecha"]},
+                    "description": "Dimensiones exactas por las que agrupar, en el orden pedido por el usuario. Ej. 'resumen por especie' -> ['especie']; 'informe con fecha, estimado y real' -> ['fecha']; 'total por productor y variedad' -> ['productor','variedad']."
+                },
+                "fecha_inicio": {
+                    "type": "string",
+                    "description": "Fecha de inicio en formato YYYY-MM-DD. Omitir si el usuario no mencionó ningún periodo (deja que la herramienta pida aclaración) o si mencionó una temporada en vez de fechas."
+                },
+                "fecha_fin": {
+                    "type": "string",
+                    "description": "Fecha de fin en formato YYYY-MM-DD. Omitir junto con fecha_inicio."
+                },
+                "temporada": {
+                    "type": "integer",
+                    "description": "OBLIGATORIO si el usuario mencionó cualquier referencia a temporada, incluyendo 'esta temporada' (usa el número de la temporada vigente indicada más abajo) o 'la temporada pasada' (vigente menos 1)."
+                },
+                "especie": {
+                    "type": "string",
+                    "description": "Filtro opcional de especie, traducido al nombre EXACTO en inglés de la lista de especies conocidas."
+                },
+                "variedad": {
+                    "type": "string",
+                    "description": "Filtro opcional de variedad."
+                },
+                "productor": {
+                    "type": "string",
+                    "description": "Filtro opcional de productor."
+                },
+                "packing": {
+                    "type": "string",
+                    "description": "Filtro opcional de planta/packing."
+                },
+                "envase": {
+                    "type": "string",
+                    "description": "SOLO si el usuario pide el resultado en bins, totes, cajas u otro envase (no kilos). Nombre EXACTO de la lista de envases conocidos."
+                }
+            },
+            "required": ["agrupar_por"]
+        }
+    },
 ]
 
 def construir_system_prompt(es_audio=False):
@@ -1216,6 +1464,12 @@ por "la temporada pasada"/"el año pasado" usa el parámetro "temporada" con el 
 vigente menos 1; "hace 2 temporadas" sería menos 2, y así sucesivamente. Usa "temporada" (no fechas)
 salvo que el usuario también dé fechas específicas dentro de esa temporada.
 
+EXCEPCIÓN a lo anterior: consultar_cosecha_flexible NO tiene ningún periodo por defecto. Si vas a llamar
+esa herramienta específicamente y el usuario dijo "esta temporada" (o cualquier referencia temporal),
+DEBES pasar temporada={TEMPORADA_ACTUAL} explícitamente (o las fechas que correspondan) — no lo omitas
+pensando que hay un default, porque en esa herramienta omitirlo significa "el usuario no dijo nada" y
+hará que se le pregunte innecesariamente.
+
 Tienes herramientas para consultar, por variedad: estimado de temporada (trisemanal), cosecha real en
 una fecha, calibre promedio, y comparación de avance (estimado vs cosechado real) en una fecha.
 También puedes consultar resúmenes por productor o por packing (no requieren variedad), cuándo fue la
@@ -1228,6 +1482,12 @@ vs Cosecha Real, con diferencias y %, para preguntas tipo "comparativo de estima
 y real" o "diferencia entre lo estimado en invierno y primavera". Estas son dos ciclos de estimación
 distintos al "estimado" (Trisemanal) que usan las otras herramientas — úsala específicamente cuando el
 usuario mencione "invierno" y/o "primavera" en el contexto de estimaciones.
+
+También tienes consultar_cosecha_flexible: para cuando el usuario pide una estructura o agrupación
+específica que no calza con las demás herramientas (ej. "estimación de cosecha por especie", "informe
+con columnas fecha, estimado y real", "total por productor"). Responde SOLO con lo que se pidió, ni más
+ni menos — si piden agrupar solo por especie, no agregues variedad/productor/fecha aunque los tengas
+disponibles.
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
@@ -1356,6 +1616,21 @@ def ejecutar_tool(tool_name, tool_input):
             packing=tool_input.get("packing") or None,
             fecha_inicio=tool_input.get("fecha_inicio") or None,
             fecha_fin=tool_input.get("fecha_fin") or None,
+            envase=tool_input.get("envase") or None,
+            temporada=tool_input.get("temporada") or None,
+        )
+
+    if tool_name == "consultar_cosecha_flexible":
+        especie = tool_input.get("especie") or None
+        variedad_op = normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None
+        return obtener_cosecha_flexible(
+            agrupar_por=tool_input.get("agrupar_por") or [],
+            fecha_inicio=tool_input.get("fecha_inicio") or None,
+            fecha_fin=tool_input.get("fecha_fin") or None,
+            especie=especie,
+            variedad=variedad_op,
+            productor=tool_input.get("productor") or None,
+            packing=tool_input.get("packing") or None,
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
         )
