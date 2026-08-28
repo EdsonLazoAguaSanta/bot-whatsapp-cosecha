@@ -10,7 +10,7 @@ import requests
 import os
 import io
 import sqlite3
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import logging
 import anthropic
@@ -210,6 +210,19 @@ def resolver_fuente_estimado(fuente_estimado):
     """Devuelve el valor real de [Base Origen] a usar como 'estimado'. Por defecto (None u
     omitido) es Estim Primavera; solo cambia si se pide explícitamente trisemanal/invierno."""
     return FUENTES_ESTIMADO.get((fuente_estimado or "").strip().lower(), BASE_ORIGEN_ESTIMADO)
+
+def rango_temporada(temporada):
+    """
+    Rango exacto de fechas de una temporada, según la definición del negocio: la temporada N
+    va desde el lunes de la semana ISO 44 del año N-1 hasta el domingo de la semana ISO 43 del
+    año N (el día antes de que empiece la temporada N+1).
+    Ej.: temporada 2026 = 2025-10-27 a 2026-10-25; temporada 2025 = 2024-10-28 a 2025-10-26.
+    No depende de qué datos existan en la base, para no dar un rango incompleto si faltan
+    registros cerca de los bordes de la temporada.
+    """
+    inicio = date.fromisocalendar(temporada - 1, 44, 1)
+    fin = date.fromisocalendar(temporada, 44, 1) - timedelta(days=1)
+    return inicio, fin
 
 ESPECIE_TRADUCCION = {
     "GRAPE": "Uva",
@@ -497,23 +510,13 @@ def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None
         cursor = conn.cursor()
 
         if not fecha_inicio or not fecha_fin:
-            if temporada:
-                cursor.execute(
-                    "SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE Temporada = ?",
-                    (temporada,)
-                )
-            else:
-                cursor.execute("""
-                    SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE))
-                    FROM [Recepcion_Consolidada]
-                    WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
-                """)
-            fila = cursor.fetchone()
-            if not fila or not fila[0]:
+            temporada_rango = temporada or TEMPORADA_ACTUAL
+            if not temporada_rango:
                 conn.close()
                 return "No pude determinar el rango de esa temporada. ¿Puedes darme una fecha o rango específico?"
-            fecha_inicio = fecha_inicio or fila[0].strftime("%Y-%m-%d")
-            fecha_fin = fecha_fin or fila[1].strftime("%Y-%m-%d")
+            inicio_calc, fin_calc = rango_temporada(temporada_rango)
+            fecha_inicio = fecha_inicio or inicio_calc.strftime("%Y-%m-%d")
+            fecha_fin = fecha_fin or fin_calc.strftime("%Y-%m-%d")
 
         try:
             datetime.strptime(fecha_inicio, "%Y-%m-%d")
@@ -746,27 +749,15 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
 
         if not fecha_inicio:
             if temporada:
-                cursor.execute(
-                    "SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE Temporada = ?",
-                    (temporada,)
-                )
-                fila = cursor.fetchone()
-                if not fila or not fila[0]:
-                    conn.close()
-                    return f"No encontré datos para la temporada {temporada}."
-                fecha_inicio = fila[0].strftime("%Y-%m-%d")
-                fecha_fin = fila[1].strftime("%Y-%m-%d")
+                inicio_calc, fin_calc = rango_temporada(temporada)
+                fecha_inicio = inicio_calc.strftime("%Y-%m-%d")
+                fecha_fin = fin_calc.strftime("%Y-%m-%d")
             else:
-                cursor.execute("""
-                    SELECT MIN(CAST(Fecha AS DATE))
-                    FROM [Recepcion_Consolidada]
-                    WHERE Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
-                """)
-                fila = cursor.fetchone()
-                if not fila or not fila[0]:
+                if not TEMPORADA_ACTUAL:
                     conn.close()
                     return "No pude determinar el inicio de temporada. ¿Puedes darme una fecha o rango específico?"
-                fecha_inicio = fila[0].strftime("%Y-%m-%d")
+                inicio_calc, _ = rango_temporada(TEMPORADA_ACTUAL)
+                fecha_inicio = inicio_calc.strftime("%Y-%m-%d")
                 fecha_fin = datetime.now().strftime("%Y-%m-%d")
         elif not fecha_fin:
             fecha_fin = fecha_inicio
@@ -989,16 +980,9 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
         cursor = conn.cursor()
 
         if not fecha_inicio:
-            cursor.execute(
-                "SELECT MIN(CAST(Fecha AS DATE)), MAX(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE Temporada = ?",
-                (temporada,)
-            )
-            fila = cursor.fetchone()
-            if not fila or not fila[0]:
-                conn.close()
-                return f"No encontré datos para la temporada {temporada}."
-            fecha_inicio = fila[0].strftime("%Y-%m-%d")
-            fecha_fin = fila[1].strftime("%Y-%m-%d")
+            inicio_calc, fin_calc = rango_temporada(temporada)
+            fecha_inicio = inicio_calc.strftime("%Y-%m-%d")
+            fecha_fin = fin_calc.strftime("%Y-%m-%d")
         elif not fecha_fin:
             fecha_fin = fecha_inicio
 
@@ -2066,7 +2050,7 @@ async def receive_message(request: Request):
                             enviar_whatsapp(
                                 numero_sender,
                                 "No tienes acceso a este asistente. Si deberías tenerlo, contacta a quien "
-                                "lo administra para solicitar acceso."
+                                "lo administra (Edson Lazo +56954482135) para solicitar acceso."
                             )
                             continue
 
