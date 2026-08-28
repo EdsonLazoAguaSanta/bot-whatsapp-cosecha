@@ -45,6 +45,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 HISTORIAL_CLAVE = os.getenv("HISTORIAL_CLAVE", "cambiar_esta_clave")
+ADMIN_CLAVE = os.getenv("ADMIN_CLAVE", "cambiar_esta_clave")
 
 # ============================================================================
 # HISTORIAL LOCAL DE CONVERSACIONES (SQLite, no toca el SQL Server de Agua Santa)
@@ -64,10 +65,66 @@ def inicializar_db_local():
             fecha_hora TEXT DEFAULT (datetime('now', 'localtime'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS numeros_permitidos (
+            numero TEXT PRIMARY KEY,
+            nombre TEXT,
+            fecha_agregado TEXT DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
     conn.commit()
     conn.close()
 
 inicializar_db_local()
+
+# ============================================================================
+# CONTROL DE ACCESO: solo los números en numeros_permitidos reciben respuesta
+# ============================================================================
+
+def normalizar_numero(numero):
+    """Deja solo dígitos (WhatsApp manda el 'from' sin '+', pero por si lo pegan con
+    espacios, guiones o el '+' delante al administrar la lista)."""
+    return "".join(c for c in (numero or "") if c.isdigit())
+
+def numero_esta_permitido(numero):
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        cursor = conn.execute(
+            "SELECT 1 FROM numeros_permitidos WHERE numero = ?",
+            (normalizar_numero(numero),)
+        )
+        existe = cursor.fetchone() is not None
+        conn.close()
+        return existe
+    except Exception as e:
+        logger.error(f"Error verificando número permitido: {str(e)}")
+        return False
+
+def agregar_numero_permitido(numero, nombre=None):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.execute(
+        "INSERT INTO numeros_permitidos (numero, nombre) VALUES (?, ?) "
+        "ON CONFLICT(numero) DO UPDATE SET nombre = excluded.nombre",
+        (normalizar_numero(numero), nombre)
+    )
+    conn.commit()
+    conn.close()
+
+def quitar_numero_permitido(numero):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    cursor = conn.execute("DELETE FROM numeros_permitidos WHERE numero = ?", (normalizar_numero(numero),))
+    eliminado = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return eliminado
+
+def listar_numeros_permitidos():
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute("SELECT numero, nombre, fecha_agregado FROM numeros_permitidos ORDER BY fecha_agregado DESC")
+    filas = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return filas
 
 def guardar_conversacion(numero_sender, tipo_mensaje, mensaje, respuesta):
     try:
@@ -2004,6 +2061,15 @@ async def receive_message(request: Request):
                         msg_id = message.get("id")
                         msg_type = message.get("type")
 
+                        if not numero_esta_permitido(numero_sender):
+                            logger.warning(f"Mensaje rechazado (número no autorizado): {numero_sender}")
+                            enviar_whatsapp(
+                                numero_sender,
+                                "No tienes acceso a este asistente. Si deberías tenerlo, contacta a quien "
+                                "lo administra para solicitar acceso."
+                            )
+                            continue
+
                         if msg_type == "text":
                             msg_text = message.get("text", {}).get("body", "")
                         elif msg_type == "audio":
@@ -2104,6 +2170,53 @@ async def historial(clave: str, limit: int = 50):
         return {"total": len(filas), "conversaciones": filas}
     except Exception as e:
         logger.error(f"Error obteniendo historial: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/admin/numeros")
+async def admin_listar_numeros(clave: str):
+    """
+    Lista los números con acceso al bot (protegido con clave).
+    Uso: https://bot-whatsapp-asa.com/admin/numeros?clave=...
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        numeros = listar_numeros_permitidos()
+        return {"total": len(numeros), "numeros": numeros}
+    except Exception as e:
+        logger.error(f"Error listando números permitidos: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/admin/numeros/agregar")
+async def admin_agregar_numero(clave: str, numero: str, nombre: str = None):
+    """
+    Da acceso a un número (protegido con clave). Si el número ya existía, actualiza el nombre.
+    Uso: https://bot-whatsapp-asa.com/admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        agregar_numero_permitido(numero, nombre)
+        return {"status": "ok", "numero": normalizar_numero(numero), "nombre": nombre}
+    except Exception as e:
+        logger.error(f"Error agregando número permitido: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/admin/numeros/quitar")
+async def admin_quitar_numero(clave: str, numero: str):
+    """
+    Quita el acceso a un número (protegido con clave).
+    Uso: https://bot-whatsapp-asa.com/admin/numeros/quitar?clave=...&numero=56912345678
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        eliminado = quitar_numero_permitido(numero)
+        if not eliminado:
+            return JSONResponse({"status": "error", "error": "Ese número no estaba en la lista"}, status_code=404)
+        return {"status": "ok", "numero": normalizar_numero(numero)}
+    except Exception as e:
+        logger.error(f"Error quitando número permitido: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/test/mensaje")
