@@ -46,11 +46,6 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else Non
 
 HISTORIAL_CLAVE = os.getenv("HISTORIAL_CLAVE", "cambiar_esta_clave")
 ADMIN_CLAVE = os.getenv("ADMIN_CLAVE", "cambiar_esta_clave")
-# Clave aparte, de un solo uso (solo sirve para AGREGAR, no para listar ni quitar), pensada
-# para links de "solicitar acceso" que se comparten fuera del control del administrador (ej.
-# en una guía). Si se filtra, el daño se limita a poder agregar números — no a ver ni borrar
-# la lista completa de accesos, que sigue protegida solo por ADMIN_CLAVE.
-ADMIN_CLAVE_INVITACION = os.getenv("ADMIN_CLAVE_INVITACION", "cambiar_esta_clave")
 
 # ============================================================================
 # HISTORIAL LOCAL DE CONVERSACIONES (SQLite, no toca el SQL Server de Agua Santa)
@@ -2181,9 +2176,8 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza el nombre.
     Uso: https://bot-whatsapp-asa.com/admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias
-    Acepta ADMIN_CLAVE o ADMIN_CLAVE_INVITACION (esta última solo sirve para este endpoint).
     """
-    if clave not in (ADMIN_CLAVE, ADMIN_CLAVE_INVITACION):
+    if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
     try:
         agregar_numero_permitido(numero, nombre)
