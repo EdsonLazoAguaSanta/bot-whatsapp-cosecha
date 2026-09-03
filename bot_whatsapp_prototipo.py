@@ -248,11 +248,16 @@ def formatear_kg(valor):
     """Formatea un entero con separador de miles al estilo chileno (punto)"""
     return f"{int(valor):,}".replace(",", ".")
 
-def obtener_bins_estimados(variedad, fuente_estimado=None):
-    """Consulta: ¿Cuántos kg se estiman cosechar esta temporada de [variedad]? Por defecto usa
-    Estim Primavera; fuente_estimado puede forzar 'trisemanal' o 'invierno' explícitamente."""
+def obtener_bins_estimados(variedad, fuente_estimado=None, temporada=None):
+    """Consulta: ¿Cuántos kg se estiman cosechar de [variedad] en una temporada? Por defecto usa
+    la temporada vigente y Estim Primavera; fuente_estimado puede forzar 'trisemanal' o
+    'invierno' explícitamente, y temporada puede pedir una temporada distinta a la vigente
+    (ej. la próxima, que puede tener Invierno/Primavera cargados antes de que empiece)."""
     try:
         base = resolver_fuente_estimado(fuente_estimado)
+        temporada = temporada or TEMPORADA_ACTUAL
+        if not temporada:
+            return "No pude determinar la temporada vigente. ¿Puedes indicarme el número de temporada?"
         conn = conectar_sql()
         if not conn:
             return "Error de conexión a base de datos"
@@ -263,17 +268,17 @@ def obtener_bins_estimados(variedad, fuente_estimado=None):
         FROM [Recepcion_Consolidada]
         WHERE Variedad LIKE ?
         AND [Base Origen] = ?
-        AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+        AND Temporada = ?
         """
-        cursor.execute(query, (f"%{variedad}%", base))
+        cursor.execute(query, (f"%{variedad}%", base, temporada))
         resultado = cursor.fetchone()
         conn.close()
 
         etiqueta = base.lower()
         if resultado and resultado[0]:
-            return f"📦 {variedad.upper()}: {formatear_kg(resultado[0])} kg estimados esta temporada ({etiqueta})"
+            return f"📦 {variedad.upper()}: {formatear_kg(resultado[0])} kg estimados para la temporada {temporada} ({etiqueta})"
         else:
-            return f"No hay estimación ({etiqueta}) registrada para {variedad}"
+            return f"No hay estimación ({etiqueta}) registrada para {variedad} en la temporada {temporada}"
     except Exception as e:
         logger.error(f"Error en obtener_bins_estimados: {str(e)}")
         return f"Error al consultar: {str(e)}"
@@ -1242,7 +1247,7 @@ def normalizar_variedad(variedad_usuario):
 TOOLS = [
     {
         "name": "consultar_bins_estimados",
-        "description": "Consulta cuántos bins se estiman cosechar esta temporada para una variedad de fruta. Por defecto usa la Estimación Primavera.",
+        "description": "Consulta cuántos bins/kg se estiman cosechar para una variedad de fruta, en una temporada. Por defecto usa la temporada vigente y la Estimación Primavera. También sirve para preguntar por una temporada distinta a la vigente (ej. la próxima temporada, que puede ya tener Estim Invierno y/o Estim Primavera cargadas antes de que empiece la cosecha real).",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1254,6 +1259,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["trisemanal", "invierno"],
                     "description": "Omitir SIEMPRE por defecto (se usa Estim Primavera automáticamente). Solo pasar 'trisemanal' o 'invierno' si el usuario pide explícitamente esa fuente por su nombre."
+                },
+                "temporada": {
+                    "type": "integer",
+                    "description": "Número de temporada (ej. 2027 para 'la próxima temporada'), calculado usando la temporada vigente que se te indica más abajo. Omitir si el usuario pregunta por la temporada actual (por defecto)."
                 }
             },
             "required": ["variedad"]
@@ -1619,6 +1628,12 @@ por "la temporada pasada"/"el año pasado" usa el parámetro "temporada" con el 
 vigente menos 1; "hace 2 temporadas" sería menos 2, y así sucesivamente. Usa "temporada" (no fechas)
 salvo que el usuario también dé fechas específicas dentro de esa temporada.
 
+También puede preguntar por una temporada FUTURA: "la próxima temporada"/"la temporada que viene" es
+la vigente más 1, y así sucesivamente ("en 2 temporadas más" sería más 2). Esto es válido aunque esa
+temporada todavía no empiece ni tenga cosecha real: puede tener ya cargada Estim Invierno y/o Estim
+Primavera (la planificación de una temporada suele empezar antes de que termine la anterior), así que
+no asumas que "no ha empezado" significa que no hay nada que consultar — intenta la consulta igual.
+
 EXCEPCIÓN a lo anterior: consultar_cosecha_flexible NO tiene ningún periodo por defecto. Si vas a llamar
 esa herramienta específicamente y el usuario dijo "esta temporada" (o cualquier referencia temporal),
 DEBES pasar temporada={TEMPORADA_ACTUAL} explícitamente (o las fechas que correspondan) — no lo omitas
@@ -1841,7 +1856,7 @@ def ejecutar_tool(tool_name, tool_input):
     fecha = tool_input.get("fecha") or None
     fuente_estimado = tool_input.get("fuente_estimado") or None
     if tool_name == "consultar_bins_estimados":
-        return obtener_bins_estimados(variedad, fuente_estimado=fuente_estimado)
+        return obtener_bins_estimados(variedad, fuente_estimado=fuente_estimado, temporada=tool_input.get("temporada") or None)
     elif tool_name == "consultar_cosecha_hoy":
         return obtener_cosecha_actual(variedad, fecha)
     elif tool_name == "consultar_calibre_promedio":
