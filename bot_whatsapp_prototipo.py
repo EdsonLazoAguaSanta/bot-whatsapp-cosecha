@@ -2186,17 +2186,43 @@ async def admin_listar_numeros(clave: str):
         logger.error(f"Error listando números permitidos: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
+def construir_mensaje_bienvenida(nombre=None):
+    saludo = f"¡Hola {nombre.strip()}!" if nombre and nombre.strip() else "¡Hola!"
+    return (
+        f"{saludo} 👋 Ya tienes acceso al Asistente de Cosecha de Agua Santa.\n\n"
+        "Escríbeme cualquier pregunta sobre estimaciones o cosecha, en lenguaje normal, como le "
+        "escribirías a una persona del equipo. Por ejemplo:\n"
+        "- ¿Qué se cosechó ayer de garcica?\n"
+        "- ¿Cuánto se estima de tiffany esta temporada?\n"
+        "- Detalle de cosecha de boreal entre el 1 y el 15 de agosto\n\n"
+        "También entiendo notas de voz. Cualquier duda, pregúntame no más."
+    )
+
 @app.get("/admin/numeros/agregar")
 async def admin_agregar_numero(clave: str, numero: str, nombre: str = None):
     """
-    Da acceso a un número (protegido con clave). Si el número ya existía, actualiza el nombre.
+    Da acceso a un número (protegido con clave). Si el número ya existía, solo actualiza el
+    nombre. Si es nuevo, además le envía un mensaje de bienvenida por WhatsApp.
     Uso: https://bot-whatsapp-asa.com/admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
     try:
+        es_nuevo = not numero_esta_permitido(numero)
         agregar_numero_permitido(numero, nombre)
-        return {"status": "ok", "numero": normalizar_numero(numero), "nombre": nombre}
+        numero_normalizado = normalizar_numero(numero)
+
+        bienvenida_enviada = False
+        if es_nuevo:
+            bienvenida_enviada = enviar_whatsapp(numero_normalizado, construir_mensaje_bienvenida(nombre))
+
+        return {
+            "status": "ok",
+            "numero": numero_normalizado,
+            "nombre": nombre,
+            "nuevo": es_nuevo,
+            "bienvenida_enviada": bienvenida_enviada,
+        }
     except Exception as e:
         logger.error(f"Error agregando número permitido: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
