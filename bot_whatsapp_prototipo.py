@@ -211,6 +211,14 @@ def resolver_fuente_estimado(fuente_estimado):
     omitido) es Estim Primavera; solo cambia si se pide explícitamente trisemanal/invierno."""
     return FUENTES_ESTIMADO.get((fuente_estimado or "").strip().lower(), BASE_ORIGEN_ESTIMADO)
 
+# Etiquetas de visualización pedidas por el negocio para las respuestas del bot (no cambian
+# el valor real de [Base Origen] usado en las consultas, solo cómo se muestra al usuario).
+ETIQUETA_FUENTE = {
+    BASE_ORIGEN_TRISEMANAL: "Trisemanal",
+    BASE_ORIGEN_ESTIM_INVIERNO: "Estim. Inv",
+    BASE_ORIGEN_ESTIM_PRIMAVERA: "Presosecha",
+}
+
 def rango_temporada(temporada):
     """
     Rango exacto de fechas de una temporada, según la definición del negocio: la temporada N
@@ -274,7 +282,7 @@ def obtener_bins_estimados(variedad, fuente_estimado=None, temporada=None):
         resultado = cursor.fetchone()
         conn.close()
 
-        etiqueta = base.lower()
+        etiqueta = ETIQUETA_FUENTE.get(base, base)
         if resultado and resultado[0]:
             return f"📦 {variedad.upper()}: {formatear_kg(resultado[0])} kg estimados para la temporada {temporada} ({etiqueta})"
         else:
@@ -362,7 +370,7 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estim
         elif estimado and not real:
             return f"📊 {variedad.upper()} ({etiqueta_fecha}): estimado {formatear_kg(estimado)} kg, aún sin cosecha real registrada"
         else:
-            return f"📊 {variedad.upper()} ({etiqueta_fecha}): cosecha real {formatear_kg(real)} kg, no había estimación ({base.lower()}) para esa fecha"
+            return f"📊 {variedad.upper()} ({etiqueta_fecha}): cosecha real {formatear_kg(real)} kg, no había estimación ({ETIQUETA_FUENTE.get(base, base)}) para esa fecha"
     except Exception as e:
         logger.error(f"Error en obtener_comparacion_estimado_vs_cosechado: {str(e)}")
         return f"Error al consultar: {str(e)}"
@@ -448,10 +456,12 @@ def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_de
     rango = fecha_inicio if fecha_inicio == fecha_fin else f"{fecha_inicio} a {fecha_fin}"
     lineas = [f"📊 Comparativo estimaciones {rango}{filtro_desc}:"]
 
+    etiqueta_inv = ETIQUETA_FUENTE[BASE_ORIGEN_ESTIM_INVIERNO]
+    etiqueta_prim = ETIQUETA_FUENTE[BASE_ORIGEN_ESTIM_PRIMAVERA]
     anchos = {"variedad": 14, "num": 11}
     header = (
-        f"{'Variedad':<{anchos['variedad']}}{'Invierno':>{anchos['num']}}"
-        f"{'Primavera':>{anchos['num']}}{'Real':>{anchos['num']}}"
+        f"{'Variedad':<{anchos['variedad']}}{etiqueta_inv:>{anchos['num']}}"
+        f"{etiqueta_prim:>{anchos['num']}}{'Real':>{anchos['num']}}"
     )
     filas_tabla = [header]
 
@@ -486,11 +496,11 @@ def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_de
         signo = "+" if pct >= 0 else ""
         return f"{etiqueta}: {signo}{pct:.1f}% ({signo}{formatear_kg(a - b)} {unidad})"
 
-    resumen = [f"\n📦 Totales: Invierno {formatear_kg(tot_inv)} {unidad} · Primavera {formatear_kg(tot_prim)} {unidad} · Real {formatear_kg(tot_real)} {unidad}"]
+    resumen = [f"\n📦 Totales: {etiqueta_inv} {formatear_kg(tot_inv)} {unidad} · {etiqueta_prim} {formatear_kg(tot_prim)} {unidad} · Real {formatear_kg(tot_real)} {unidad}"]
     for texto in [
-        variacion(tot_real, tot_inv, "Real vs Invierno"),
-        variacion(tot_real, tot_prim, "Real vs Primavera"),
-        variacion(tot_prim, tot_inv, "Primavera vs Invierno"),
+        variacion(tot_real, tot_inv, f"Real vs {etiqueta_inv}"),
+        variacion(tot_real, tot_prim, f"Real vs {etiqueta_prim}"),
+        variacion(tot_prim, tot_inv, f"{etiqueta_prim} vs {etiqueta_inv}"),
     ]:
         if texto:
             resumen.append(texto)
