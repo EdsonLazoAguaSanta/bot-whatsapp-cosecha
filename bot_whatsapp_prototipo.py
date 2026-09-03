@@ -360,17 +360,18 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estim
         if not estimado and not real:
             return f"No hay datos (ni estimado ni cosecha real) de {variedad} para {etiqueta_fecha}"
 
+        etiqueta = ETIQUETA_FUENTE.get(base, base)
         if estimado and real:
             porcentaje = ((real - estimado) / estimado) * 100
             signo = "+" if porcentaje >= 0 else ""
             return (
-                f"📊 {variedad.upper()} ({etiqueta_fecha}): estimado {formatear_kg(estimado)} kg, "
-                f"real {formatear_kg(real)} kg ({signo}{porcentaje:.1f}% vs estimado)"
+                f"📊 {variedad.upper()} ({etiqueta_fecha}): {etiqueta} {formatear_kg(estimado)} kg, "
+                f"real {formatear_kg(real)} kg ({signo}{porcentaje:.1f}% vs {etiqueta})"
             )
         elif estimado and not real:
-            return f"📊 {variedad.upper()} ({etiqueta_fecha}): estimado {formatear_kg(estimado)} kg, aún sin cosecha real registrada"
+            return f"📊 {variedad.upper()} ({etiqueta_fecha}): {etiqueta} {formatear_kg(estimado)} kg, aún sin cosecha real registrada"
         else:
-            return f"📊 {variedad.upper()} ({etiqueta_fecha}): cosecha real {formatear_kg(real)} kg, no había estimación ({ETIQUETA_FUENTE.get(base, base)}) para esa fecha"
+            return f"📊 {variedad.upper()} ({etiqueta_fecha}): cosecha real {formatear_kg(real)} kg, no había {etiqueta} registrada para esa fecha"
     except Exception as e:
         logger.error(f"Error en obtener_comparacion_estimado_vs_cosechado: {str(e)}")
         return f"Error al consultar: {str(e)}"
@@ -630,6 +631,7 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
         return None
 
     base_estimado = base_estimado or BASE_ORIGEN_ESTIMADO
+    etiqueta_estimado = ETIQUETA_FUENTE.get(base_estimado, "Estimado")
     grupos = {}  # (packing, productor, especie, variedad) -> {fecha: {"estimado":x, "real":y}}
     for packing, productor, especie, variedad, fecha, base_origen, total in filas:
         if not total:
@@ -662,16 +664,16 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
             total_estimado_gral += total_est
             total_real_gral += total_real
 
-            filas_tabla = [f"{'Fecha':<11}{'Estimado':>9}{'Real':>9}"]
+            filas_tabla = [f"{'Fecha':<11}{etiqueta_estimado:>10}{'Real':>9}"]
             for fecha in sorted(fechas.keys()):
                 vals = fechas[fecha]
                 est = vals.get("estimado", 0) or 0
                 real = vals.get("real", 0) or 0
                 est_str = formatear_kg(est) if est else "-"
                 real_str = formatear_kg(real) if real else "-"
-                filas_tabla.append(f"{_fecha_str(fecha):<11}{est_str:>9}{real_str:>9}")
-            filas_tabla.append("-" * 29)
-            filas_tabla.append(f"{'TOTAL':<11}{formatear_kg(total_est):>9}{formatear_kg(total_real):>9}")
+                filas_tabla.append(f"{_fecha_str(fecha):<11}{est_str:>10}{real_str:>9}")
+            filas_tabla.append("-" * 30)
+            filas_tabla.append(f"{'TOTAL':<11}{formatear_kg(total_est):>10}{formatear_kg(total_real):>9}")
 
             tabla_texto = "\n".join(filas_tabla)
             lineas.append(f"\n🏭 {packing} · {productor} · {variedad}\n```{tabla_texto}```")
@@ -707,7 +709,7 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
 
             filas_tabla = [
                 f"{'Especie':<{anchos['especie']}}{'Variedad':<{anchos['variedad']}}"
-                f"{'Estimado':>{anchos['num']}}{'Real':>{anchos['num']}}"
+                f"{etiqueta_estimado:>{anchos['num']}}{'Real':>{anchos['num']}}"
             ]
             sub_est = 0
             sub_real = 0
@@ -734,7 +736,7 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
             lineas.append(f"\n(mostrando {MAX_SECCIONES} de {total_secciones} productores — acota la consulta para ver el resto)")
 
     lineas.append(
-        f"\n📦 Total general: estimado {formatear_kg(total_estimado_gral)} {unidad}, "
+        f"\n📦 Total general: {etiqueta_estimado} {formatear_kg(total_estimado_gral)} {unidad}, "
         f"real {formatear_kg(total_real_gral)} {unidad}"
     )
     return "\n".join(lineas)
@@ -878,6 +880,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
         return None
 
     base_estimado = base_estimado or BASE_ORIGEN_ESTIMADO
+    etiqueta_estimado = ETIQUETA_FUENTE.get(base_estimado, "Estimado")
     n = len(dimensiones)
     datos = {}
     for fila in filas:
@@ -903,7 +906,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
         # Sin dimensiones: el usuario pidió solo el total, sin desglose.
         tot_est = sum(v.get("estimado", 0) for v in datos.values())
         tot_real = sum(v.get("real", 0) for v in datos.values())
-        lineas.append(f"\n📦 Total: estimado {formatear_kg(tot_est)} {unidad}, real {formatear_kg(tot_real)} {unidad}")
+        lineas.append(f"\n📦 Total: {etiqueta_estimado} {formatear_kg(tot_est)} {unidad}, real {formatear_kg(tot_real)} {unidad}")
         return "\n".join(lineas)
 
     anchos_dim = []
@@ -919,7 +922,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
     header = "".join(
         f"{DIMENSIONES_ETIQUETA.get(d, d):<{a}}" for d, a in zip(dimensiones, anchos_dim)
     )
-    header += f"{'Estimado':>{ancho_num}}{'Real':>{ancho_num}}"
+    header += f"{etiqueta_estimado:>{ancho_num}}{'Real':>{ancho_num}}"
     filas_tabla = [header]
 
     tot_est = 0
@@ -966,7 +969,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
         lineas.append(f"\n(mostrando {MAX_FILAS_FLEXIBLE} de {len(claves_ordenadas)} filas — acota la consulta para ver el resto; los totales sí incluyen todo)")
 
     lineas.append(
-        f"\n📦 Total general: estimado {formatear_kg(tot_est)} {unidad}, real {formatear_kg(tot_real)} {unidad}"
+        f"\n📦 Total general: {etiqueta_estimado} {formatear_kg(tot_est)} {unidad}, real {formatear_kg(tot_real)} {unidad}"
     )
     return "\n".join(lineas)
 
