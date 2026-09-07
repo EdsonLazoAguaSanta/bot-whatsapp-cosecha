@@ -216,7 +216,7 @@ def resolver_fuente_estimado(fuente_estimado):
 ETIQUETA_FUENTE = {
     BASE_ORIGEN_TRISEMANAL: "Trisemanal",
     BASE_ORIGEN_ESTIM_INVIERNO: "Estim. Inv",
-    BASE_ORIGEN_ESTIM_PRIMAVERA: "Presosecha",
+    BASE_ORIGEN_ESTIM_PRIMAVERA: "Precosecha",
 }
 
 def rango_temporada(temporada):
@@ -2199,17 +2199,55 @@ async def admin_listar_numeros(clave: str):
         logger.error(f"Error listando números permitidos: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
-def construir_mensaje_bienvenida(nombre=None):
-    saludo = f"¡Hola {nombre.strip()}!" if nombre and nombre.strip() else "¡Hola!"
-    return (
-        f"{saludo} 👋 Ya tienes acceso al Asistente de Cosecha de Agua Santa.\n\n"
-        "Escríbeme cualquier pregunta sobre estimaciones o cosecha, en lenguaje normal, como le "
-        "escribirías a una persona del equipo. Por ejemplo:\n"
-        "- ¿Qué se cosechó ayer de garcica?\n"
-        "- ¿Cuánto se estima de tiffany esta temporada?\n"
-        "- Detalle de cosecha de boreal entre el 1 y el 15 de agosto\n\n"
-        "También entiendo notas de voz. Cualquier duda, pregúntame no más."
-    )
+PLANTILLA_BIENVENIDA_NOMBRE = "bienvenida_asistente_cosecha"
+PLANTILLA_BIENVENIDA_IDIOMA = "en"  # idioma real aprobado en Meta (aunque el contenido esté en español)
+
+def enviar_plantilla_bienvenida(numero_destino, nombre=None):
+    """
+    Envía la plantilla de WhatsApp "bienvenida_asistente_cosecha", aprobada por Meta. A
+    diferencia de un mensaje de texto libre, una plantilla SÍ puede enviarse a un número que
+    nunca le ha escrito al bot (no aplica la restricción de la ventana de 24 horas de
+    WhatsApp — ver commit anterior: error 131047 "Re-engagement message").
+    El contenido del mensaje vive en Meta (WhatsApp Manager > Plantillas de mensajes,
+    id 1059735476635950) — cambiarlo aquí no tiene ningún efecto; hay que editarlo y
+    volver a aprobarlo ahí.
+    """
+    try:
+        url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": numero_destino,
+            "type": "template",
+            "template": {
+                "name": PLANTILLA_BIENVENIDA_NOMBRE,
+                "language": {"code": PLANTILLA_BIENVENIDA_IDIOMA},
+                "components": [
+                    {
+                        "type": "body",
+                        "parameters": [
+                            {
+                                "type": "text",
+                                "parameter_name": "nombre",
+                                "text": (nombre or "").strip() or "equipo",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+        response = requests.post(url, json=payload, headers=headers)
+        if response.status_code != 200:
+            logger.error(f"Plantilla de bienvenida respondió {response.status_code} al enviar a {numero_destino}: {response.text}")
+        else:
+            logger.info(f"Plantilla de bienvenida enviada a {numero_destino}: {response.status_code}")
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Error enviando plantilla de bienvenida: {str(e)}")
+        return False
 
 @app.get("/admin/numeros/agregar")
 async def admin_agregar_numero(clave: str, numero: str, nombre: str = None):
@@ -2227,7 +2265,7 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None):
 
         bienvenida_enviada = False
         if es_nuevo:
-            bienvenida_enviada = enviar_whatsapp(numero_normalizado, construir_mensaje_bienvenida(nombre))
+            bienvenida_enviada = enviar_plantilla_bienvenida(numero_normalizado, nombre)
 
         return {
             "status": "ok",
