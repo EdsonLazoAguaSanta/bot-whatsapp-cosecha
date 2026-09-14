@@ -232,6 +232,24 @@ def rango_temporada(temporada):
     fin = date.fromisocalendar(temporada, 44, 1) - timedelta(days=1)
     return inicio, fin
 
+def temporada_de_fecha(fecha):
+    """Determina a qué temporada pertenece una fecha, usando la misma definición de
+    rango_temporada (temporada N empieza el lunes de la semana ISO 44 del año N-1)."""
+    if fecha >= date.fromisocalendar(fecha.year, 44, 1):
+        return fecha.year + 1
+    return fecha.year
+
+def etiqueta_semana_temporada(fecha, inicio_temporada, temporada_num):
+    """Arma la etiqueta 'Sem. NN Temp. AAAA (DD/MM/AAAA - DD/MM/AAAA)' para una fecha,
+    numerando las semanas de la temporada desde 1 a partir de inicio_temporada (lunes)."""
+    numero_semana = (fecha - inicio_temporada).days // 7 + 1
+    inicio_semana = inicio_temporada + timedelta(days=(numero_semana - 1) * 7)
+    fin_semana = inicio_semana + timedelta(days=6)
+    return (
+        f"Sem. {numero_semana:02d} Temp. {temporada_num} "
+        f"({inicio_semana.strftime('%d/%m/%Y')} - {fin_semana.strftime('%d/%m/%Y')})"
+    )
+
 ESPECIE_TRADUCCION = {
     "GRAPE": "Uva",
     "MANDARIN": "Mandarina",
@@ -858,6 +876,7 @@ DIMENSIONES_SQL = {
     "packing": "Packing",
     "grupo": "Grupo",
     "fecha": "CAST(Fecha AS DATE)",
+    "semana": "CAST(Fecha AS DATE)",
 }
 DIMENSIONES_ETIQUETA = {
     "especie": "Especie",
@@ -866,15 +885,18 @@ DIMENSIONES_ETIQUETA = {
     "packing": "Planta",
     "grupo": "Grupo",
     "fecha": "Fecha",
+    "semana": "Semana",
 }
 MAX_FILAS_FLEXIBLE = 60
 
-def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg", base_estimado=None):
+def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg", base_estimado=None, inicio_temporada_semana=None, temporada_semana=None):
     """
     filas: tuplas (valor_dim1, valor_dim2, ..., Base Origen, total), según 'dimensiones'.
     Arma UNA sola tabla con columnas = dimensiones pedidas + Estimado + Real, y fila TOTAL.
     base_estimado: valor real de [Base Origen] que cuenta como "estimado" en estas filas
     (Estim Primavera por defecto, o Trisemanal/Estim Invierno si se pidió explícitamente).
+    inicio_temporada_semana/temporada_semana: necesarios si "semana" está en dimensiones,
+    para numerar las semanas desde el inicio de esa temporada (ver etiqueta_semana_temporada).
     """
     if not filas:
         return None
@@ -889,9 +911,15 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
         total = fila[n + 1]
         if not total:
             continue
-        clave = tuple(
-            (v.strip().upper() if isinstance(v, str) else v) for v in valores_dim
-        )
+        clave_partes = []
+        for valor, dim in zip(valores_dim, dimensiones):
+            if dim == "semana" and valor is not None:
+                clave_partes.append(etiqueta_semana_temporada(valor, inicio_temporada_semana, temporada_semana))
+            elif isinstance(valor, str):
+                clave_partes.append(valor.strip().upper())
+            else:
+                clave_partes.append(valor)
+        clave = tuple(clave_partes)
         tipo = "estimado" if base_origen == base_estimado else "real"
         datos.setdefault(clave, {})
         datos[clave][tipo] = datos[clave].get(tipo, 0) + total
@@ -911,7 +939,9 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
 
     anchos_dim = []
     for d in dimensiones:
-        if d == "fecha":
+        if d == "semana":
+            anchos_dim.append(46)
+        elif d == "fecha":
             anchos_dim.append(11)
         elif d in ("productor", "packing"):
             anchos_dim.append(16)
@@ -1060,7 +1090,19 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
         filas = cursor.fetchall()
         conn.close()
 
-        resultado = formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado)
+        inicio_temporada_semana = None
+        temporada_semana = None
+        if "semana" in dimensiones:
+            # Ancla la numeración de semanas a la temporada indicada; si no se dio
+            # temporada explícita (se filtró solo por fechas), la infiere a partir del
+            # inicio del rango consultado.
+            temporada_semana = temporada or temporada_de_fecha(datetime.strptime(fecha_inicio, "%Y-%m-%d").date())
+            inicio_temporada_semana, _ = rango_temporada(temporada_semana)
+
+        resultado = formatear_cosecha_flexible(
+            filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado,
+            inicio_temporada_semana=inicio_temporada_semana, temporada_semana=temporada_semana,
+        )
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
         return resultado
@@ -1519,14 +1561,14 @@ TOOLS = [
     },
     {
         "name": "consultar_cosecha_flexible",
-        "description": "Consulta GENÉRICA de estimado y real, agrupada EXACTAMENTE por las dimensiones que pida el usuario (cualquier combinación de especie, variedad, productor, packing, grupo, fecha — o ninguna si pide solo el total sin desglose). Usar cuando el usuario pide una estructura específica que no calza con las otras herramientas, por ejemplo: 'estimación de cosecha por especie' (agrupar_por=['especie']), 'informe con columnas fecha, estimado y real' (agrupar_por=['fecha']), 'total por productor' (agrupar_por=['productor']), 'solo el total' o 'cuánto es en total' (agrupar_por=[], sin desglose). Responde solo con las columnas pedidas, nada más. ESTA HERRAMIENTA NO TIENE PERIODO POR DEFECTO (a diferencia de las demás): si el usuario menciona CUALQUIER periodo, aunque sea 'esta temporada' o 'hasta hoy', DEBES pasar temporada o fecha_inicio/fecha_fin explícitamente — nunca los omitas solo porque suene al comportamiento por defecto de otras herramientas. Solo omite ambos si el usuario literalmente no dijo nada sobre tiempo, para que la herramienta pida aclaración.",
+        "description": "Consulta GENÉRICA de estimado y real, agrupada EXACTAMENTE por las dimensiones que pida el usuario (cualquier combinación de especie, variedad, productor, packing, grupo, fecha, semana — o ninguna si pide solo el total sin desglose). Usar cuando el usuario pide una estructura específica que no calza con las otras herramientas, por ejemplo: 'estimación de cosecha por especie' (agrupar_por=['especie']), 'informe con columnas fecha, estimado y real' (agrupar_por=['fecha']), 'total por productor' (agrupar_por=['productor']), 'solo el total' o 'cuánto es en total' (agrupar_por=[], sin desglose), 'por semana' (agrupar_por=['semana']). Responde solo con las columnas pedidas, nada más. ESTA HERRAMIENTA NO TIENE PERIODO POR DEFECTO (a diferencia de las demás): si el usuario menciona CUALQUIER periodo, aunque sea 'esta temporada' o 'hasta hoy', DEBES pasar temporada o fecha_inicio/fecha_fin explícitamente — nunca los omitas solo porque suene al comportamiento por defecto de otras herramientas. Solo omite ambos si el usuario literalmente no dijo nada sobre tiempo, para que la herramienta pida aclaración.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "agrupar_por": {
                     "type": "array",
-                    "items": {"type": "string", "enum": ["especie", "variedad", "productor", "packing", "grupo", "fecha"]},
-                    "description": "Dimensiones exactas por las que agrupar, en el orden pedido por el usuario. Ej. 'resumen por especie' -> ['especie']; 'informe con fecha, estimado y real' -> ['fecha']; 'total por productor y variedad' -> ['productor','variedad']; 'solo el total, sin desglose' -> [] (arreglo vacío)."
+                    "items": {"type": "string", "enum": ["especie", "variedad", "productor", "packing", "grupo", "fecha", "semana"]},
+                    "description": "Dimensiones exactas por las que agrupar, en el orden pedido por el usuario. Ej. 'resumen por especie' -> ['especie']; 'informe con fecha, estimado y real' -> ['fecha']; 'total por productor y variedad' -> ['productor','variedad']; 'solo el total, sin desglose' -> [] (arreglo vacío); 'por semana' -> ['semana'] (agrupa por semana calendario de la temporada, lunes a domingo, con la etiqueta 'Sem. NN Temp. AAAA (DD/MM/AAAA - DD/MM/AAAA)')."
                 },
                 "fecha_inicio": {
                     "type": "string",
@@ -1678,9 +1720,12 @@ fuente_estimado.
 
 También tienes consultar_cosecha_flexible: para cuando el usuario pide una estructura o agrupación
 específica que no calza con las demás herramientas (ej. "estimación de cosecha por especie", "informe
-con columnas fecha, estimado y real", "total por productor", "por grupo", o "solo el total sin
-desglose" con agrupar_por=[]). Responde SOLO con lo que se pidió, ni más ni menos — si piden agrupar
-solo por especie, no agregues variedad/productor/fecha aunque los tengas disponibles.
+con columnas fecha, estimado y real", "total por productor", "por grupo", "por semana", o "solo el
+total sin desglose" con agrupar_por=[]). Responde SOLO con lo que se pidió, ni más ni menos — si piden
+agrupar solo por especie, no agregues variedad/productor/fecha aunque los tengas disponibles.
+"Por semana" (agrupar_por=['semana']) agrupa en semanas calendario de lunes a domingo, numeradas desde
+el inicio de la temporada correspondiente (no son las semanas ISO del año calendario) — la propia
+herramienta arma la etiqueta de cada semana con su rango de fechas, no necesitas calcularla tú.
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
@@ -1698,8 +1743,8 @@ grupo", y no especificó columnas o una estructura concreta— Y ADEMÁS el peri
 fecha o rango acotado como "ayer", "hoy", "esta semana", "entre el X y el Y", sino que el resultado
 abarcaría toda la temporada o un periodo sin acotar), NO llames a ninguna herramienta todavía. En vez de
 eso, pregúntale primero cómo quiere el resumen, por ejemplo: "¿Cómo quieres que te lo resuma? Puedo
-darte el total general, o desglosado por productor/fundo, por especie, por packing/planta, por grupo, o
-el detalle completo día por día." Si tampoco quedó claro el periodo (recuerda que consultar_cosecha_flexible,
+darte el total general, o desglosado por productor/fundo, por especie, por packing/planta, por grupo,
+por semana, o el detalle completo día por día." Si tampoco quedó claro el periodo (recuerda que consultar_cosecha_flexible,
 a diferencia de las demás, NO tiene periodo por defecto), agrega esa pregunta AL MISMO TIEMPO, en el
 mismo mensaje, para no tener que preguntar dos veces seguidas — ej. "...y ¿para qué periodo? (esta
 temporada, un rango de fechas, etc.)". Esto aplica también si el usuario responde a esta pregunta
