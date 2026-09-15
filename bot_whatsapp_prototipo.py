@@ -239,16 +239,28 @@ def temporada_de_fecha(fecha):
         return fecha.year + 1
     return fecha.year
 
-def etiqueta_semana_temporada(fecha, inicio_temporada, temporada_num):
-    """Arma la etiqueta 'Sem. NN Temp. AAAA (DD/MM/AAAA - DD/MM/AAAA)' para una fecha,
-    numerando las semanas de la temporada desde 1 a partir de inicio_temporada (lunes)."""
-    numero_semana = (fecha - inicio_temporada).days // 7 + 1
-    inicio_semana = inicio_temporada + timedelta(days=(numero_semana - 1) * 7)
+def etiqueta_semana(numero_semana, temporada_num):
+    """
+    Arma la etiqueta 'Sem. NN Temp. AAAA (DD/MM/AAAA - DD/MM/AAAA)' para un número de
+    semana (columna Semana de la base — semana ISO estándar del año calendario, verificado
+    contra Fecha: 2025-10-27 = semana 44). Una temporada abarca las semanas 44-52 del año
+    anterior y 1-43 del año de la temporada, así que el año calendario de cada semana se
+    infiere del propio número.
+    """
+    numero_semana = int(numero_semana)
+    anio = temporada_num - 1 if numero_semana >= 44 else temporada_num
+    inicio_semana = date.fromisocalendar(anio, numero_semana, 1)
     fin_semana = inicio_semana + timedelta(days=6)
     return (
         f"Sem. {numero_semana:02d} Temp. {temporada_num} "
         f"({inicio_semana.strftime('%d/%m/%Y')} - {fin_semana.strftime('%d/%m/%Y')})"
     )
+
+def orden_semana(numero_semana):
+    """Clave de orden para que las semanas de una temporada queden en su orden natural
+    (44, 45, ..., 52, 1, 2, ..., 43), no en orden numérico simple."""
+    numero_semana = int(numero_semana)
+    return numero_semana if numero_semana >= 44 else numero_semana + 100
 
 ESPECIE_TRADUCCION = {
     "GRAPE": "Uva",
@@ -876,7 +888,7 @@ DIMENSIONES_SQL = {
     "packing": "Packing",
     "grupo": "Grupo",
     "fecha": "CAST(Fecha AS DATE)",
-    "semana": "CAST(Fecha AS DATE)",
+    "semana": "CAST(Semana AS INT)",
 }
 DIMENSIONES_ETIQUETA = {
     "especie": "Especie",
@@ -889,14 +901,14 @@ DIMENSIONES_ETIQUETA = {
 }
 MAX_FILAS_FLEXIBLE = 60
 
-def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg", base_estimado=None, inicio_temporada_semana=None, temporada_semana=None):
+def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg", base_estimado=None, temporada_semana=None):
     """
     filas: tuplas (valor_dim1, valor_dim2, ..., Base Origen, total), según 'dimensiones'.
     Arma UNA sola tabla con columnas = dimensiones pedidas + Estimado + Real, y fila TOTAL.
     base_estimado: valor real de [Base Origen] que cuenta como "estimado" en estas filas
     (Estim Primavera por defecto, o Trisemanal/Estim Invierno si se pidió explícitamente).
-    inicio_temporada_semana/temporada_semana: necesarios si "semana" está en dimensiones,
-    para numerar las semanas desde el inicio de esa temporada (ver etiqueta_semana_temporada).
+    temporada_semana: necesario si "semana" está en dimensiones, para etiquetar cada semana
+    con la temporada y el año calendario que le corresponde (ver etiqueta_semana).
     """
     if not filas:
         return None
@@ -911,15 +923,9 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
         total = fila[n + 1]
         if not total:
             continue
-        clave_partes = []
-        for valor, dim in zip(valores_dim, dimensiones):
-            if dim == "semana" and valor is not None:
-                clave_partes.append(etiqueta_semana_temporada(valor, inicio_temporada_semana, temporada_semana))
-            elif isinstance(valor, str):
-                clave_partes.append(valor.strip().upper())
-            else:
-                clave_partes.append(valor)
-        clave = tuple(clave_partes)
+        clave = tuple(
+            (v.strip().upper() if isinstance(v, str) else v) for v in valores_dim
+        )
         tipo = "estimado" if base_origen == base_estimado else "real"
         datos.setdefault(clave, {})
         datos[clave][tipo] = datos[clave].get(tipo, 0) + total
@@ -955,9 +961,15 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
     header += f"{etiqueta_estimado:>{ancho_num}}{'Real':>{ancho_num}}"
     filas_tabla = [header]
 
+    def clave_orden(clave):
+        return [
+            orden_semana(v) if d == "semana" and v is not None else str(v)
+            for v, d in zip(clave, dimensiones)
+        ]
+
     tot_est = 0
     tot_real = 0
-    claves_ordenadas = sorted(datos.keys(), key=lambda c: [str(x) for x in c])
+    claves_ordenadas = sorted(datos.keys(), key=clave_orden)
     truncado = len(claves_ordenadas) > MAX_FILAS_FLEXIBLE
     for clave in claves_ordenadas[:MAX_FILAS_FLEXIBLE]:
         vals = datos[clave]
@@ -969,6 +981,8 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
         for v, a, d in zip(clave, anchos_dim, dimensiones):
             if d == "fecha":
                 texto = _fecha_str(v)
+            elif d == "semana":
+                texto = etiqueta_semana(v, temporada_semana) if v is not None else "-"
             elif d == "especie":
                 texto = traducir_especie(v)
             elif d == "grupo":
@@ -1090,18 +1104,16 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
         filas = cursor.fetchall()
         conn.close()
 
-        inicio_temporada_semana = None
         temporada_semana = None
         if "semana" in dimensiones:
-            # Ancla la numeración de semanas a la temporada indicada; si no se dio
+            # Ancla la etiqueta de cada semana a la temporada indicada; si no se dio
             # temporada explícita (se filtró solo por fechas), la infiere a partir del
             # inicio del rango consultado.
             temporada_semana = temporada or temporada_de_fecha(datetime.strptime(fecha_inicio, "%Y-%m-%d").date())
-            inicio_temporada_semana, _ = rango_temporada(temporada_semana)
 
         resultado = formatear_cosecha_flexible(
             filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado,
-            inicio_temporada_semana=inicio_temporada_semana, temporada_semana=temporada_semana,
+            temporada_semana=temporada_semana,
         )
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
@@ -1723,9 +1735,10 @@ específica que no calza con las demás herramientas (ej. "estimación de cosech
 con columnas fecha, estimado y real", "total por productor", "por grupo", "por semana", o "solo el
 total sin desglose" con agrupar_por=[]). Responde SOLO con lo que se pidió, ni más ni menos — si piden
 agrupar solo por especie, no agregues variedad/productor/fecha aunque los tengas disponibles.
-"Por semana" (agrupar_por=['semana']) agrupa en semanas calendario de lunes a domingo, numeradas desde
-el inicio de la temporada correspondiente (no son las semanas ISO del año calendario) — la propia
-herramienta arma la etiqueta de cada semana con su rango de fechas, no necesitas calcularla tú.
+"Por semana" (agrupar_por=['semana']) agrupa por la semana calendario ISO estándar (la misma columna
+"Semana" que usa la base de datos, 1-52, lunes a domingo) en el orden natural de la temporada
+(44, 45, ..., 52, 1, 2, ..., 43) — la propia herramienta arma la etiqueta de cada semana con su rango
+de fechas, no necesitas calcularla tú.
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).

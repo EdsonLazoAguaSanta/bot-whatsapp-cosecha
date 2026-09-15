@@ -1,0 +1,12 @@
+INFO:__main__:Cargadas 122 variedades conocidas
+INFO:__main__:Cargados 23 packings conocidos
+INFO:__main__:Cargados 17 tipos de envase conocidos
+INFO:__main__:Cargados 59 productores conocidos
+INFO:__main__:Cargados 19 grupos conocidos
+INFO:     Started server process [13424]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8005 (Press CTRL+C to quit)
+INFO:httpx:HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+INFO:httpx:HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
+INFO:httpx:HTTP Request: POST https://api.anthropic.com/v1/messages "HTTP/1.1 200 OK"
