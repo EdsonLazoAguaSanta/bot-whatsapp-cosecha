@@ -1,3 +1,0 @@
-INFO:     127.0.0.1:57796 - "GET /test/mensaje?mensaje=mandarinas+de+La+Torina+por+semana+de+esta+temporada&numero=1 HTTP/1.1" 200 OK
-INFO:     127.0.0.1:56854 - "GET /test/mensaje?mensaje=cosecha+de+garcica+por+semana%2C+temporada+2026&numero=2 HTTP/1.1" 200 OK
-INFO:     127.0.0.1:53316 - "GET /test/mensaje?mensaje=cosecha+de+garcica+agrupado+por+semana+y+especie%2C+entre+el+1+y+el+20+de+diciembre+de+2025&numero=3 HTTP/1.1" 200 OK

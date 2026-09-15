@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 tools/
 conversaciones.db
+*.log
