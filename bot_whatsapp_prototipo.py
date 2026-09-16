@@ -232,33 +232,15 @@ def rango_temporada(temporada):
     fin = date.fromisocalendar(temporada, 44, 1) - timedelta(days=1)
     return inicio, fin
 
-def temporada_de_fecha(fecha):
-    """Determina a qué temporada pertenece una fecha, usando la misma definición de
-    rango_temporada (temporada N empieza el lunes de la semana ISO 44 del año N-1)."""
-    if fecha >= date.fromisocalendar(fecha.year, 44, 1):
-        return fecha.year + 1
-    return fecha.year
-
-def etiqueta_semana(numero_semana, temporada_num):
-    """
-    Arma la etiqueta 'Sem. NN Temp. AAAA (DD/MM/AAAA - DD/MM/AAAA)' para un número de
-    semana (columna Semana de la base — semana ISO estándar del año calendario, verificado
-    contra Fecha: 2025-10-27 = semana 44). Una temporada abarca las semanas 44-52 del año
-    anterior y 1-43 del año de la temporada, así que el año calendario de cada semana se
-    infiere del propio número.
-    """
-    numero_semana = int(numero_semana)
-    anio = temporada_num - 1 if numero_semana >= 44 else temporada_num
-    inicio_semana = date.fromisocalendar(anio, numero_semana, 1)
-    fin_semana = inicio_semana + timedelta(days=6)
-    return (
-        f"Sem. {numero_semana:02d} Temp. {temporada_num} "
-        f"({inicio_semana.strftime('%d/%m/%Y')} - {fin_semana.strftime('%d/%m/%Y')})"
-    )
+def etiqueta_semana(numero_semana):
+    """Número de semana con 2 dígitos (columna Semana de la base: semana ISO estándar del
+    año calendario, verificado contra Fecha: 2025-10-27 = semana 44)."""
+    return f"{int(numero_semana):02d}"
 
 def orden_semana(numero_semana):
     """Clave de orden para que las semanas de una temporada queden en su orden natural
-    (44, 45, ..., 52, 1, 2, ..., 43), no en orden numérico simple."""
+    (44, 45, ..., 52, 1, 2, ..., 43), no en orden numérico simple: una temporada abarca
+    las semanas 44-52 del año anterior y 1-43 del año de la temporada."""
     numero_semana = int(numero_semana)
     return numero_semana if numero_semana >= 44 else numero_semana + 100
 
@@ -901,14 +883,12 @@ DIMENSIONES_ETIQUETA = {
 }
 MAX_FILAS_FLEXIBLE = 60
 
-def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg", base_estimado=None, temporada_semana=None):
+def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc="", unidad="kg", base_estimado=None):
     """
     filas: tuplas (valor_dim1, valor_dim2, ..., Base Origen, total), según 'dimensiones'.
     Arma UNA sola tabla con columnas = dimensiones pedidas + Estimado + Real, y fila TOTAL.
     base_estimado: valor real de [Base Origen] que cuenta como "estimado" en estas filas
     (Estim Primavera por defecto, o Trisemanal/Estim Invierno si se pidió explícitamente).
-    temporada_semana: necesario si "semana" está en dimensiones, para etiquetar cada semana
-    con la temporada y el año calendario que le corresponde (ver etiqueta_semana).
     """
     if not filas:
         return None
@@ -946,7 +926,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
     anchos_dim = []
     for d in dimensiones:
         if d == "semana":
-            anchos_dim.append(46)
+            anchos_dim.append(8)
         elif d == "fecha":
             anchos_dim.append(11)
         elif d in ("productor", "packing"):
@@ -982,7 +962,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
             if d == "fecha":
                 texto = _fecha_str(v)
             elif d == "semana":
-                texto = etiqueta_semana(v, temporada_semana) if v is not None else "-"
+                texto = etiqueta_semana(v) if v is not None else "-"
             elif d == "especie":
                 texto = traducir_especie(v)
             elif d == "grupo":
@@ -1104,17 +1084,7 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
         filas = cursor.fetchall()
         conn.close()
 
-        temporada_semana = None
-        if "semana" in dimensiones:
-            # Ancla la etiqueta de cada semana a la temporada indicada; si no se dio
-            # temporada explícita (se filtró solo por fechas), la infiere a partir del
-            # inicio del rango consultado.
-            temporada_semana = temporada or temporada_de_fecha(datetime.strptime(fecha_inicio, "%Y-%m-%d").date())
-
-        resultado = formatear_cosecha_flexible(
-            filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado,
-            temporada_semana=temporada_semana,
-        )
+        resultado = formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado)
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
         return resultado
@@ -1580,7 +1550,7 @@ TOOLS = [
                 "agrupar_por": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["especie", "variedad", "productor", "packing", "grupo", "fecha", "semana"]},
-                    "description": "Dimensiones exactas por las que agrupar, en el orden pedido por el usuario. Ej. 'resumen por especie' -> ['especie']; 'informe con fecha, estimado y real' -> ['fecha']; 'total por productor y variedad' -> ['productor','variedad']; 'solo el total, sin desglose' -> [] (arreglo vacío); 'por semana' -> ['semana'] (agrupa por semana calendario de la temporada, lunes a domingo, con la etiqueta 'Sem. NN Temp. AAAA (DD/MM/AAAA - DD/MM/AAAA)')."
+                    "description": "Dimensiones exactas por las que agrupar, en el orden pedido por el usuario. Ej. 'resumen por especie' -> ['especie']; 'informe con fecha, estimado y real' -> ['fecha']; 'total por productor y variedad' -> ['productor','variedad']; 'solo el total, sin desglose' -> [] (arreglo vacío); 'por semana' -> ['semana'] (agrupa por número de semana calendario, la misma columna Semana de la base, en el orden natural de la temporada 44..52, 1..43)."
                 },
                 "fecha_inicio": {
                     "type": "string",
@@ -1737,8 +1707,8 @@ total sin desglose" con agrupar_por=[]). Responde SOLO con lo que se pidió, ni 
 agrupar solo por especie, no agregues variedad/productor/fecha aunque los tengas disponibles.
 "Por semana" (agrupar_por=['semana']) agrupa por la semana calendario ISO estándar (la misma columna
 "Semana" que usa la base de datos, 1-52, lunes a domingo) en el orden natural de la temporada
-(44, 45, ..., 52, 1, 2, ..., 43) — la propia herramienta arma la etiqueta de cada semana con su rango
-de fechas, no necesitas calcularla tú.
+(44, 45, ..., 52, 1, 2, ..., 43) — la tabla muestra solo el número de semana; no necesitas
+calcular ni agregar nada.
 
 Usa la herramienta que corresponda cuando el usuario pregunte por alguno de esos datos y haya mencionado
 (o puedas inferir) el dato que falta (variedad, especie, productor, packing, fecha o rango de fechas).
