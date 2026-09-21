@@ -1681,10 +1681,11 @@ TOOLS = [
 ]
 
 # Herramienta que se agrega a TOOLS SOLO cuando el usuario tiene un cuestionario de
-# proyección pendiente (ver procesar_mensaje): registra su confirmación o ajuste.
+# proyección vigente (pendiente o respondido hace menos de 24 h, ver procesar_mensaje):
+# registra su confirmación o ajuste, o corrige lo que ya había respondido.
 TOOL_REGISTRAR_CUESTIONARIO = {
     "name": "registrar_respuesta_cuestionario",
-    "description": "Registra la respuesta del usuario al cuestionario de proyección de cosecha que tiene pendiente. Usar cuando su mensaje confirma la proyección enviada ('confirmo', 'ok', 'está bien') o indica un ajuste o corrección de las cifras ('serán unos 10.000 kg menos de tiffany'). NO usar para consultas normales de datos.",
+    "description": "Registra la respuesta del usuario al cuestionario de proyección de cosecha vigente, o CORRIGE la respuesta que ya había dado (la corrección reemplaza por completo lo registrado antes). Usar cuando su mensaje confirma la proyección enviada ('confirmo', 'ok', 'está bien'), indica un ajuste de cifras ('serán unos 10.000 kg menos de tiffany'), o corrige su respuesta anterior ('mejor serán 10 mil más', 'al final déjalo como estaba'). NO usar para consultas normales de datos.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -1702,7 +1703,7 @@ TOOL_REGISTRAR_CUESTIONARIO = {
     },
 }
 
-def construir_system_prompt(es_audio=False, cuestionario_pendiente=None):
+def construir_system_prompt(es_audio=False, cuestionario_activo=None):
     if VARIEDADES_CONOCIDAS:
         lista_variedades = ", ".join(VARIEDADES_CONOCIDAS)
     else:
@@ -1752,12 +1753,12 @@ escribe parecido.
 """
 
     nota_cuestionario = ""
-    if cuestionario_pendiente:
+    if cuestionario_activo and cuestionario_activo.get("estado") == "pendiente":
         nota_cuestionario = f"""
 CUESTIONARIO PENDIENTE: hace poco el bot le envió a este usuario el siguiente cuestionario de
 proyección de cosecha y todavía no lo responde:
 ---
-{cuestionario_pendiente["mensaje"]}
+{cuestionario_activo["mensaje"]}
 ---
 Si el mensaje del usuario es una respuesta a ese cuestionario (confirma la proyección, o indica un
 ajuste o corrección de cifras, aunque sea informal: "ok", "confirmo", "está bien", "va a ser menos",
@@ -1765,6 +1766,26 @@ ajuste o corrección de cifras, aunque sea informal: "ok", "confirmo", "está bi
 con resultado "confirmado" o "ajustado" y el detalle del ajuste si lo hay. Si el mensaje es una
 consulta normal que no tiene relación con el cuestionario, atiéndela con las demás herramientas
 como siempre (el cuestionario queda pendiente; no insistas con él en cada mensaje).
+"""
+    elif cuestionario_activo:
+        respuesta_previa = (
+            cuestionario_activo.get("ajuste")
+            or cuestionario_activo.get("respuesta")
+            or "(confirmó la proyección tal cual)"
+        )
+        nota_cuestionario = f"""
+CUESTIONARIO YA RESPONDIDO (todavía corregible): hace poco el bot le envió a este usuario el
+siguiente cuestionario de proyección de cosecha:
+---
+{cuestionario_activo["mensaje"]}
+---
+El usuario ya lo respondió (estado: {cuestionario_activo["estado"]}; lo registrado: {respuesta_previa}).
+Si su mensaje de ahora es una CORRECCIÓN o un nuevo ajuste sobre esa misma proyección (ej. "mejor
+serán 10 mil kilos más", "me equivoqué, era garcica", "al final déjalo como estaba"), usa la
+herramienta registrar_respuesta_cuestionario para ACTUALIZAR lo registrado: resultado "ajustado"
+con el detalle nuevo COMPLETO (reemplaza al anterior, no lo complementa), o "confirmado" si vuelve
+a la proyección original. Si el mensaje es una consulta normal que no tiene relación con el
+cuestionario, atiéndela con las demás herramientas como siempre.
 """
 
     return f"""Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
@@ -2050,8 +2071,8 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
                 messages.append({"role": "assistant", "content": turno["respuesta"]})
         messages.append({"role": "user", "content": texto_mensaje})
 
-        cuestionario_pendiente = obtener_cuestionario_pendiente(numero_sender) if numero_sender else None
-        tools = (TOOLS + [TOOL_REGISTRAR_CUESTIONARIO]) if cuestionario_pendiente else TOOLS
+        cuestionario_activo = obtener_cuestionario_activo(numero_sender) if numero_sender else None
+        tools = (TOOLS + [TOOL_REGISTRAR_CUESTIONARIO]) if cuestionario_activo else TOOLS
 
         response = claude_client.messages.create(
             model="claude-sonnet-5",
@@ -2059,7 +2080,7 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
             # presupuesto completo en el bloque de "thinking" antes de terminar el tool_use,
             # devolviendo una respuesta trunca (stop_reason="max_tokens") sin tool_use ni texto.
             max_tokens=1500,
-            system=construir_system_prompt(es_audio, cuestionario_pendiente=cuestionario_pendiente),
+            system=construir_system_prompt(es_audio, cuestionario_activo=cuestionario_activo),
             tools=tools,
             messages=messages,
         )
@@ -2213,14 +2234,16 @@ def registrar_cuestionario_enviado(numero, turno, mensaje):
     conn.commit()
     conn.close()
 
-def obtener_cuestionario_pendiente(numero):
-    """Último cuestionario 'pendiente' de las últimas 24 h para ese número, o None."""
+def obtener_cuestionario_activo(numero):
+    """Último cuestionario de las últimas 24 h para ese número, esté pendiente O ya
+    respondido: mientras siga vigente, el usuario puede corregir su respuesta (ej. ajustó
+    en la mañana y a las horas quiere cambiar la cifra). None si no hay ninguno vigente."""
     try:
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.row_factory = sqlite3.Row
         fila = conn.execute(
-            "SELECT id, turno, mensaje, fecha_hora_envio FROM cuestionarios "
-            "WHERE numero = ? AND estado = 'pendiente' "
+            "SELECT id, turno, mensaje, estado, respuesta, ajuste, fecha_hora_envio FROM cuestionarios "
+            "WHERE numero = ? AND estado != 'vencido' "
             "AND fecha_hora_envio >= datetime('now', 'localtime', '-1 day') "
             "ORDER BY id DESC LIMIT 1",
             (normalizar_numero(numero),)
@@ -2228,25 +2251,28 @@ def obtener_cuestionario_pendiente(numero):
         conn.close()
         return dict(fila) if fila else None
     except Exception as e:
-        logger.error(f"Error buscando cuestionario pendiente: {str(e)}")
+        logger.error(f"Error buscando cuestionario activo: {str(e)}")
         return None
 
 def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, texto_usuario=None):
-    """Marca el cuestionario pendiente del número como respondido. La llama Claude vía la
-    herramienta registrar_respuesta_cuestionario; lo que retorna se le envía al usuario."""
+    """Registra (o corrige) la respuesta del cuestionario vigente del número. Mientras el
+    cuestionario esté dentro de sus 24 h se puede responder de nuevo: la corrección REEMPLAZA
+    lo registrado y vuelve a avisar al EAS. La llama Claude vía la herramienta
+    registrar_respuesta_cuestionario; lo que retorna se le envía al usuario."""
     if not numero:
         return "No pude asociar tu respuesta a un cuestionario (falta el número de origen)."
-    pendiente = obtener_cuestionario_pendiente(numero)
-    if not pendiente:
-        return "No tienes ningún cuestionario pendiente por responder."
+    activo = obtener_cuestionario_activo(numero)
+    if not activo:
+        return "No tienes ningún cuestionario vigente para responder o corregir."
     if resultado not in ("confirmado", "ajustado"):
         resultado = "confirmado"
+    es_correccion = activo.get("estado") != "pendiente"
     try:
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.execute(
             "UPDATE cuestionarios SET estado = ?, respuesta = ?, ajuste = ?, "
             "fecha_hora_respuesta = datetime('now', 'localtime') WHERE id = ?",
-            (resultado, texto_usuario, detalle_ajuste, pendiente["id"])
+            (resultado, texto_usuario, detalle_ajuste, activo["id"])
         )
         conn.commit()
         conn.close()
@@ -2255,18 +2281,27 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         return "Tuve un problema registrando tu respuesta. Intenta de nuevo en un momento."
 
     if resultado == "ajustado":
-        notificar_ajuste_cuestionario(numero, detalle_ajuste or texto_usuario or "(sin detalle)")
+        notificar_ajuste_cuestionario(
+            numero, detalle_ajuste or texto_usuario or "(sin detalle)", es_correccion=es_correccion
+        )
         detalle = f":\n{detalle_ajuste}" if detalle_ajuste else "."
+        if es_correccion:
+            return f"✅ Corrección registrada{detalle}\nGracias, reemplacé lo anterior y le avisamos al equipo EAS."
         return f"✅ Ajuste registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS."
+    if es_correccion:
+        return "✅ Listo, dejé la proyección registrada como confirmada (sin ajustes)."
     return "✅ Proyección confirmada, quedó registrada. ¡Gracias!"
 
-def notificar_ajuste_cuestionario(numero_origen, detalle):
+def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False):
     """Aviso inmediato al EAS (o solo admin en modo prueba) cuando alguien ajusta su proyección."""
     try:
         num = normalizar_numero(numero_origen)
         info = next((n for n in listar_numeros_permitidos() if n["numero"] == num), None)
         quien = (info.get("nombre") if info else None) or num
-        mensaje = f"📝 Ajuste de proyección reportado por {quien} (+{num}):\n\n{detalle}"
+        if es_correccion:
+            mensaje = f"📝 CORRECCIÓN de proyección de {quien} (+{num}), reemplaza su reporte anterior:\n\n{detalle}"
+        else:
+            mensaje = f"📝 Ajuste de proyección reportado por {quien} (+{num}):\n\n{detalle}"
         destinatarios = [d for d in destinatarios_envios(("eas", "admin")) if d["numero"] != num]
         for d in destinatarios:
             enviar_whatsapp(d["numero"], mensaje)
