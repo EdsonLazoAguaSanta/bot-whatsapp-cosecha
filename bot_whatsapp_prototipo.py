@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 import logging
 import anthropic
 import openai
+from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 
@@ -47,6 +48,28 @@ openai_client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else Non
 HISTORIAL_CLAVE = os.getenv("HISTORIAL_CLAVE", "cambiar_esta_clave")
 ADMIN_CLAVE = os.getenv("ADMIN_CLAVE", "cambiar_esta_clave")
 
+# --- Envíos automáticos (Fase 2: cuestionarios de proyección y alertas de desviación) ---
+# Mientras ENVIOS_AUTOMATICOS_PRODUCCION no sea "1", TODOS los envíos automáticos van solo
+# a los números con rol admin (modo prueba), sin importar a qué rol estaban dirigidos.
+ENVIOS_AUTOMATICOS_PRODUCCION = os.getenv("ENVIOS_AUTOMATICOS_PRODUCCION", "0") == "1"
+CUESTIONARIO_HORA_AM = os.getenv("CUESTIONARIO_HORA_AM", "08:30")
+CUESTIONARIO_HORA_PM = os.getenv("CUESTIONARIO_HORA_PM", "16:30")
+CUESTIONARIO_DIAS_PROYECCION = int(os.getenv("CUESTIONARIO_DIAS_PROYECCION", "7"))
+ALERTA_SEMANAL_DIA = os.getenv("ALERTA_SEMANAL_DIA", "mon")  # día en formato cron: mon, tue, ...
+ALERTA_SEMANAL_HORA = os.getenv("ALERTA_SEMANAL_HORA", "08:00")
+UMBRAL_DESVIACION_PCT = float(os.getenv("UMBRAL_DESVIACION_PCT", "15"))
+# Variedades con estimado acumulado bajo este mínimo no generan alerta (evita ruido de
+# variedades chicas donde un % de desviación grande son pocos kilos).
+ALERTA_MIN_KG = float(os.getenv("ALERTA_MIN_KG", "1000"))
+# La tabla de la alerta solo lista variedades CON movimiento (estimado o real) en los últimos
+# N días: son las accionables. Las desviadas sin movimiento (cosecha terminada o no iniciada)
+# se resumen en una línea aparte. 0 = sin filtro (verificado: sin esto salen 56 de 82
+# variedades, la mayoría ya cerradas). Configurable con ALERTA_DIAS_ACTIVIDAD.
+ALERTA_DIAS_ACTIVIDAD = int(os.getenv("ALERTA_DIAS_ACTIVIDAD", "14"))
+# Máximo de filas en la tabla de la alerta (ordenada por diferencia en kg, así lo grande
+# queda arriba aunque su % sea menor); el resto se resume en una línea.
+ALERTA_MAX_FILAS = int(os.getenv("ALERTA_MAX_FILAS", "30"))
+
 # ============================================================================
 # HISTORIAL LOCAL DE CONVERSACIONES (SQLite, no toca el SQL Server de Agua Santa)
 # ============================================================================
@@ -72,6 +95,35 @@ def inicializar_db_local():
             fecha_agregado TEXT DEFAULT (datetime('now', 'localtime'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cuestionarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero TEXT,
+            turno TEXT,
+            mensaje TEXT,
+            estado TEXT DEFAULT 'pendiente',
+            respuesta TEXT,
+            ajuste TEXT,
+            fecha_hora_envio TEXT DEFAULT (datetime('now', 'localtime')),
+            fecha_hora_respuesta TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alertas_enviadas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo TEXT,
+            contenido TEXT,
+            destinatarios TEXT,
+            fecha_hora TEXT DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
+    # Migración Fase 2: rol/perfil por número (admin | eas | zonal | productor) y productor
+    # asociado opcional (para acotar el cuestionario de proyección a su campo).
+    columnas = [fila[1] for fila in conn.execute("PRAGMA table_info(numeros_permitidos)")]
+    if "rol" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN rol TEXT DEFAULT 'productor'")
+    if "productor" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN productor TEXT")
     conn.commit()
     conn.close()
 
@@ -100,15 +152,44 @@ def numero_esta_permitido(numero):
         logger.error(f"Error verificando número permitido: {str(e)}")
         return False
 
-def agregar_numero_permitido(numero, nombre=None):
+# Roles: admin gestiona el bot y recibe todos los envíos en modo prueba; eas recibe las
+# alertas de desviación; zonal y productor reciben los cuestionarios de proyección.
+# Todos los números permitidos, sin importar el rol, pueden hacer consultas.
+ROLES_VALIDOS = ("admin", "eas", "zonal", "productor")
+ROL_POR_DEFECTO = "productor"
+
+def agregar_numero_permitido(numero, nombre=None, rol=None, productor=None):
+    """Inserta o actualiza un número. rol y productor solo se cambian si vienen explícitos,
+    para no pisar el rol existente al re-agregar un número solo para cambiarle el nombre."""
     conn = sqlite3.connect(DB_LOCAL_PATH)
-    conn.execute(
-        "INSERT INTO numeros_permitidos (numero, nombre) VALUES (?, ?) "
-        "ON CONFLICT(numero) DO UPDATE SET nombre = excluded.nombre",
-        (normalizar_numero(numero), nombre)
-    )
+    num = normalizar_numero(numero)
+    existe = conn.execute("SELECT 1 FROM numeros_permitidos WHERE numero = ?", (num,)).fetchone()
+    if existe:
+        conn.execute(
+            "UPDATE numeros_permitidos SET nombre = COALESCE(?, nombre), "
+            "rol = COALESCE(?, rol), productor = COALESCE(?, productor) WHERE numero = ?",
+            (nombre, rol, productor, num)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO numeros_permitidos (numero, nombre, rol, productor) VALUES (?, ?, ?, ?)",
+            (num, nombre, rol or ROL_POR_DEFECTO, productor)
+        )
     conn.commit()
     conn.close()
+
+def numeros_por_rol(roles):
+    """Números permitidos cuyo rol está en `roles` (tupla/lista de roles)."""
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.row_factory = sqlite3.Row
+    marcadores = ",".join("?" for _ in roles)
+    cursor = conn.execute(
+        f"SELECT numero, nombre, rol, productor FROM numeros_permitidos WHERE rol IN ({marcadores})",
+        list(roles)
+    )
+    filas = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return filas
 
 def quitar_numero_permitido(numero):
     conn = sqlite3.connect(DB_LOCAL_PATH)
@@ -121,7 +202,7 @@ def quitar_numero_permitido(numero):
 def listar_numeros_permitidos():
     conn = sqlite3.connect(DB_LOCAL_PATH)
     conn.row_factory = sqlite3.Row
-    cursor = conn.execute("SELECT numero, nombre, fecha_agregado FROM numeros_permitidos ORDER BY fecha_agregado DESC")
+    cursor = conn.execute("SELECT numero, nombre, rol, productor, fecha_agregado FROM numeros_permitidos ORDER BY fecha_agregado DESC")
     filas = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return filas
@@ -1599,7 +1680,29 @@ TOOLS = [
     },
 ]
 
-def construir_system_prompt(es_audio=False):
+# Herramienta que se agrega a TOOLS SOLO cuando el usuario tiene un cuestionario de
+# proyección pendiente (ver procesar_mensaje): registra su confirmación o ajuste.
+TOOL_REGISTRAR_CUESTIONARIO = {
+    "name": "registrar_respuesta_cuestionario",
+    "description": "Registra la respuesta del usuario al cuestionario de proyección de cosecha que tiene pendiente. Usar cuando su mensaje confirma la proyección enviada ('confirmo', 'ok', 'está bien') o indica un ajuste o corrección de las cifras ('serán unos 10.000 kg menos de tiffany'). NO usar para consultas normales de datos.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "resultado": {
+                "type": "string",
+                "enum": ["confirmado", "ajustado"],
+                "description": "'confirmado' si el usuario está de acuerdo con la proyección tal cual; 'ajustado' si indica cualquier corrección."
+            },
+            "detalle_ajuste": {
+                "type": "string",
+                "description": "Solo si resultado='ajustado': resumen claro y concreto del ajuste que indicó el usuario (variedad, cuánto más o menos, unidad). Ej: 'TIFFANY: ~10.000 kg menos que lo proyectado'."
+            }
+        },
+        "required": ["resultado"]
+    },
+}
+
+def construir_system_prompt(es_audio=False, cuestionario_pendiente=None):
     if VARIEDADES_CONOCIDAS:
         lista_variedades = ", ".join(VARIEDADES_CONOCIDAS)
     else:
@@ -1648,8 +1751,24 @@ al interpretar el mensaje: prioriza qué palabra conocida SUENA parecido a lo tr
 escribe parecido.
 """
 
+    nota_cuestionario = ""
+    if cuestionario_pendiente:
+        nota_cuestionario = f"""
+CUESTIONARIO PENDIENTE: hace poco el bot le envió a este usuario el siguiente cuestionario de
+proyección de cosecha y todavía no lo responde:
+---
+{cuestionario_pendiente["mensaje"]}
+---
+Si el mensaje del usuario es una respuesta a ese cuestionario (confirma la proyección, o indica un
+ajuste o corrección de cifras, aunque sea informal: "ok", "confirmo", "está bien", "va a ser menos",
+"serán unos 10 mil kilos menos de tiffany"), usa la herramienta registrar_respuesta_cuestionario
+con resultado "confirmado" o "ajustado" y el detalle del ajuste si lo hay. Si el mensaje es una
+consulta normal que no tiene relación con el cuestionario, atiéndela con las demás herramientas
+como siempre (el cuestionario queda pendiente; no insistas con él en cada mensaje).
+"""
+
     return f"""Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
-{nota_audio}
+{nota_audio}{nota_cuestionario}
 
 Hoy es {hoy}. Usa esta fecha como referencia para calcular fechas relativas que mencione el usuario
 ("ayer", "hoy", "mañana", "el lunes pasado", "el 12 de agosto", "entre el 1 y el 15 de agosto", etc.)
@@ -1817,7 +1936,15 @@ cuál de esas quiso decir (ej. "¿Te referías a BINS?" o "¿Es BINS, TOTES o CA
 no hay ninguna opción remotamente parecida, ahí sí pide que aclare sin sugerir nada. El objetivo es que
 el usuario nunca se quede sin poder avanzar la conversación."""
 
-def ejecutar_tool(tool_name, tool_input):
+def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None):
+    if tool_name == "registrar_respuesta_cuestionario":
+        return registrar_respuesta_cuestionario(
+            numero_sender,
+            tool_input.get("resultado", "confirmado"),
+            detalle_ajuste=tool_input.get("detalle_ajuste"),
+            texto_usuario=texto_usuario,
+        )
+
     if tool_name == "consultar_resumen_productor":
         return obtener_resumen_por_productor(tool_input.get("productor", ""))
     if tool_name == "consultar_resumen_packing":
@@ -1923,14 +2050,17 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
                 messages.append({"role": "assistant", "content": turno["respuesta"]})
         messages.append({"role": "user", "content": texto_mensaje})
 
+        cuestionario_pendiente = obtener_cuestionario_pendiente(numero_sender) if numero_sender else None
+        tools = (TOOLS + [TOOL_REGISTRAR_CUESTIONARIO]) if cuestionario_pendiente else TOOLS
+
         response = claude_client.messages.create(
             model="claude-sonnet-5",
             # 300 se quedaba corto: con el prompt actual (más largo) Claude a veces gasta el
             # presupuesto completo en el bloque de "thinking" antes de terminar el tool_use,
             # devolviendo una respuesta trunca (stop_reason="max_tokens") sin tool_use ni texto.
             max_tokens=1500,
-            system=construir_system_prompt(es_audio),
-            tools=TOOLS,
+            system=construir_system_prompt(es_audio, cuestionario_pendiente=cuestionario_pendiente),
+            tools=tools,
             messages=messages,
         )
 
@@ -1941,7 +2071,7 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
             # sin depender de que Claude lo haya marcado (instrucción "sí o sí").
             if tool_use_block.name == "consultar_cosecha_detalle" and "detalle" in texto_mensaje.lower():
                 tool_input = {**tool_input, "detalle_por_fecha": True}
-            return ejecutar_tool(tool_use_block.name, tool_input)
+            return ejecutar_tool(tool_use_block.name, tool_input, numero_sender=numero_sender, texto_usuario=texto_mensaje)
 
         text_block = next((b for b in response.content if b.type == "text"), None)
         if text_block:
@@ -2056,6 +2186,343 @@ def enviar_whatsapp(numero_destino, mensaje_texto):
     for parte in dividir_mensaje_whatsapp(mensaje_texto):
         exito = _enviar_whatsapp_una_parte(numero_destino, parte) and exito
     return exito
+
+# ============================================================================
+# FASE 2: CUESTIONARIOS AUTOMÁTICOS DE PROYECCIÓN Y ALERTAS DE DESVIACIÓN
+# ============================================================================
+
+def destinatarios_envios(roles):
+    """Destinatarios de un envío automático según rol. En modo prueba
+    (ENVIOS_AUTOMATICOS_PRODUCCION != "1") todo envío va SOLO a los admin,
+    sin importar los roles pedidos."""
+    if not ENVIOS_AUTOMATICOS_PRODUCCION:
+        return numeros_por_rol(("admin",))
+    return numeros_por_rol(roles)
+
+def registrar_cuestionario_enviado(numero, turno, mensaje):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    # Un cuestionario nuevo deja obsoleto cualquier pendiente anterior del mismo número
+    conn.execute(
+        "UPDATE cuestionarios SET estado = 'vencido' WHERE numero = ? AND estado = 'pendiente'",
+        (normalizar_numero(numero),)
+    )
+    conn.execute(
+        "INSERT INTO cuestionarios (numero, turno, mensaje) VALUES (?, ?, ?)",
+        (normalizar_numero(numero), turno, mensaje)
+    )
+    conn.commit()
+    conn.close()
+
+def obtener_cuestionario_pendiente(numero):
+    """Último cuestionario 'pendiente' de las últimas 24 h para ese número, o None."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        fila = conn.execute(
+            "SELECT id, turno, mensaje, fecha_hora_envio FROM cuestionarios "
+            "WHERE numero = ? AND estado = 'pendiente' "
+            "AND fecha_hora_envio >= datetime('now', 'localtime', '-1 day') "
+            "ORDER BY id DESC LIMIT 1",
+            (normalizar_numero(numero),)
+        ).fetchone()
+        conn.close()
+        return dict(fila) if fila else None
+    except Exception as e:
+        logger.error(f"Error buscando cuestionario pendiente: {str(e)}")
+        return None
+
+def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, texto_usuario=None):
+    """Marca el cuestionario pendiente del número como respondido. La llama Claude vía la
+    herramienta registrar_respuesta_cuestionario; lo que retorna se le envía al usuario."""
+    if not numero:
+        return "No pude asociar tu respuesta a un cuestionario (falta el número de origen)."
+    pendiente = obtener_cuestionario_pendiente(numero)
+    if not pendiente:
+        return "No tienes ningún cuestionario pendiente por responder."
+    if resultado not in ("confirmado", "ajustado"):
+        resultado = "confirmado"
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.execute(
+            "UPDATE cuestionarios SET estado = ?, respuesta = ?, ajuste = ?, "
+            "fecha_hora_respuesta = datetime('now', 'localtime') WHERE id = ?",
+            (resultado, texto_usuario, detalle_ajuste, pendiente["id"])
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error registrando respuesta de cuestionario: {str(e)}")
+        return "Tuve un problema registrando tu respuesta. Intenta de nuevo en un momento."
+
+    if resultado == "ajustado":
+        notificar_ajuste_cuestionario(numero, detalle_ajuste or texto_usuario or "(sin detalle)")
+        detalle = f":\n{detalle_ajuste}" if detalle_ajuste else "."
+        return f"✅ Ajuste registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS."
+    return "✅ Proyección confirmada, quedó registrada. ¡Gracias!"
+
+def notificar_ajuste_cuestionario(numero_origen, detalle):
+    """Aviso inmediato al EAS (o solo admin en modo prueba) cuando alguien ajusta su proyección."""
+    try:
+        num = normalizar_numero(numero_origen)
+        info = next((n for n in listar_numeros_permitidos() if n["numero"] == num), None)
+        quien = (info.get("nombre") if info else None) or num
+        mensaje = f"📝 Ajuste de proyección reportado por {quien} (+{num}):\n\n{detalle}"
+        destinatarios = [d for d in destinatarios_envios(("eas", "admin")) if d["numero"] != num]
+        for d in destinatarios:
+            enviar_whatsapp(d["numero"], mensaje)
+        if destinatarios:
+            registrar_alerta_enviada("ajuste_cuestionario", mensaje, destinatarios)
+    except Exception as e:
+        logger.error(f"Error notificando ajuste de cuestionario: {str(e)}")
+
+def construir_cuestionario_proyeccion(turno, productor=None):
+    """Texto del cuestionario: proyección de la fuente de estimado por defecto (Precosecha)
+    para los próximos CUESTIONARIO_DIAS_PROYECCION días, por variedad, acotada al productor
+    asociado al número si tiene uno. None si no hay datos proyectados en ese rango."""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return None
+        hoy = date.today()
+        hasta = hoy + timedelta(days=CUESTIONARIO_DIAS_PROYECCION - 1)
+        condiciones = ["[Base Origen] = ?", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
+        params = [BASE_ORIGEN_ESTIMADO, hoy.strftime("%Y-%m-%d"), hasta.strftime("%Y-%m-%d")]
+        if productor:
+            condiciones.append("Productor LIKE ?")
+            params.append(f"%{productor}%")
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT Variedad, SUM(KgsRecepcionados) as total
+            FROM [Recepcion_Consolidada]
+            WHERE {" AND ".join(condiciones)}
+            GROUP BY Variedad
+            HAVING SUM(KgsRecepcionados) > 0
+            ORDER BY SUM(KgsRecepcionados) DESC
+        """, params)
+        filas = cursor.fetchall()
+        conn.close()
+        if not filas:
+            return None
+
+        etiqueta_turno = "mañana" if turno == "manana" else "tarde"
+        alcance = f" del productor {productor.upper()}" if productor else ""
+        anchos = {"variedad": 18, "num": 12}
+        filas_tabla = [f"{'Variedad':<{anchos['variedad']}}{'Kg':>{anchos['num']}}"]
+        total = 0
+        for variedad, kg in filas:
+            total += kg or 0
+            filas_tabla.append(
+                f"{_truncar(str(variedad), anchos['variedad']):<{anchos['variedad']}}{formatear_kg(kg):>{anchos['num']}}"
+            )
+        filas_tabla.append(f"{'TOTAL':<{anchos['variedad']}}{formatear_kg(total):>{anchos['num']}}")
+
+        lineas = [
+            f"📋 Cuestionario de proyección ({etiqueta_turno})",
+            "",
+            f"Proyección {ETIQUETA_FUENTE[BASE_ORIGEN_ESTIMADO]}{alcance} "
+            f"del {hoy.strftime('%d-%m')} al {hasta.strftime('%d-%m')}:",
+            f"```{chr(10).join(filas_tabla)}```",
+            "",
+            "¿Confirmas esta proyección o hay que ajustarla? Responde \"confirmo\" o "
+            "indícame el ajuste (ej: \"tiffany serán unos 10.000 kg menos\").",
+        ]
+        return "\n".join(lineas)
+    except Exception as e:
+        logger.error(f"Error construyendo cuestionario de proyección: {str(e)}")
+        return None
+
+def enviar_cuestionarios(turno):
+    """Job programado (2x día): envía el cuestionario de proyección a zonales y productores
+    (solo admin mientras dure el modo prueba)."""
+    try:
+        destinatarios = destinatarios_envios(("zonal", "productor"))
+        if not destinatarios:
+            logger.warning("Cuestionario: no hay destinatarios (¿ningún número con el rol requerido?)")
+            return {"enviados": 0, "sin_datos": 0, "errores": 0, "detalle": "sin destinatarios"}
+        enviados = sin_datos = errores = 0
+        for d in destinatarios:
+            mensaje = construir_cuestionario_proyeccion(turno, productor=d.get("productor"))
+            if not mensaje:
+                sin_datos += 1
+                logger.info(f"Cuestionario: sin proyección para {d['numero']} (productor={d.get('productor')})")
+                continue
+            if enviar_whatsapp(d["numero"], mensaje):
+                registrar_cuestionario_enviado(d["numero"], turno, mensaje)
+                enviados += 1
+            else:
+                # Falla típica: ventana de 24 h cerrada (error 131047). Para producción hay
+                # que aprobar una plantilla de re-enganche en Meta, como la de bienvenida.
+                errores += 1
+        logger.info(f"Cuestionario {turno}: {enviados} enviados, {sin_datos} sin datos, {errores} errores")
+        return {"enviados": enviados, "sin_datos": sin_datos, "errores": errores}
+    except Exception as e:
+        logger.error(f"Error en job de cuestionarios: {str(e)}")
+        return {"error": str(e)}
+
+def construir_alerta_desviaciones():
+    """Compara real acumulado vs estimado (Precosecha) acumulado a la fecha por variedad,
+    para la temporada vigente. Retorna (texto, cantidad_desviadas) o None si no hay datos."""
+    try:
+        if not TEMPORADA_ACTUAL:
+            return None
+        conn = conectar_sql()
+        if not conn:
+            return None
+        inicio, _ = rango_temporada(TEMPORADA_ACTUAL)
+        ayer = date.today() - timedelta(days=1)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT Variedad, [Base Origen], SUM(KgsRecepcionados) as total
+            FROM [Recepcion_Consolidada]
+            WHERE [Base Origen] IN (?, ?) AND CAST(Fecha AS DATE) BETWEEN ? AND ?
+            GROUP BY Variedad, [Base Origen]
+            HAVING SUM(KgsRecepcionados) > 0
+        """, [BASE_ORIGEN_ESTIMADO, BASE_ORIGEN_REAL, inicio.strftime("%Y-%m-%d"), ayer.strftime("%Y-%m-%d")])
+        filas = cursor.fetchall()
+
+        variedades_activas = None
+        if ALERTA_DIAS_ACTIVIDAD > 0:
+            desde_actividad = (date.today() - timedelta(days=ALERTA_DIAS_ACTIVIDAD)).strftime("%Y-%m-%d")
+            cursor.execute("""
+                SELECT DISTINCT Variedad
+                FROM [Recepcion_Consolidada]
+                WHERE [Base Origen] IN (?, ?) AND CAST(Fecha AS DATE) >= ?
+            """, [BASE_ORIGEN_ESTIMADO, BASE_ORIGEN_REAL, desde_actividad])
+            variedades_activas = {f[0] for f in cursor.fetchall()}
+        conn.close()
+        if not filas:
+            return None
+
+        datos = {}
+        for variedad, origen, total in filas:
+            d = datos.setdefault(variedad, {"est": 0, "real": 0})
+            if origen == BASE_ORIGEN_ESTIMADO:
+                d["est"] = total or 0
+            else:
+                d["real"] = total or 0
+
+        desviadas = []
+        inactivas_desviadas = 0
+        con_estimado = 0
+        for variedad, d in datos.items():
+            if d["est"] < ALERTA_MIN_KG:
+                continue
+            con_estimado += 1
+            desv = (d["real"] - d["est"]) / d["est"] * 100
+            if abs(desv) <= UMBRAL_DESVIACION_PCT:
+                continue
+            if variedades_activas is not None and variedad not in variedades_activas:
+                inactivas_desviadas += 1
+                continue
+            desviadas.append((variedad, d["est"], d["real"], desv))
+        # Orden por diferencia absoluta en kg (no por %): una desviación de -28% en una
+        # variedad de 2,8 millones de kg importa más que un +145% en una de 55 mil.
+        desviadas.sort(key=lambda x: abs(x[2] - x[1]), reverse=True)
+
+        umbral = f"{UMBRAL_DESVIACION_PCT:g}"
+        encabezado = (
+            f"🚨 Alerta semanal de desviaciones (>{umbral}%)\n"
+            f"Temporada {TEMPORADA_ACTUAL}, acumulado al {ayer.strftime('%d-%m-%Y')}\n"
+            f"Real vs {ETIQUETA_FUENTE[BASE_ORIGEN_ESTIMADO]} a la fecha"
+        )
+        nota_inactivas = ""
+        if inactivas_desviadas:
+            nota_inactivas = (
+                f"\nAdemás hay {inactivas_desviadas} variedad(es) desviadas SIN movimiento en los "
+                f"últimos {ALERTA_DIAS_ACTIVIDAD} días (cosecha terminada o no iniciada), no listadas."
+            )
+        if not desviadas:
+            texto = (
+                f"{encabezado}\n\n✅ Sin variedades activas con desviación sobre {umbral}%."
+                f"{nota_inactivas}"
+            )
+            return texto, 0
+
+        anchos = {"variedad": 15, "num": 10, "pct": 7}
+        filas_tabla = [
+            f"{'Variedad':<{anchos['variedad']}}{'Estim':>{anchos['num']}}{'Real':>{anchos['num']}}{'Desv%':>{anchos['pct']}}"
+        ]
+        for variedad, est, real, desv in desviadas[:ALERTA_MAX_FILAS]:
+            filas_tabla.append(
+                f"{_truncar(str(variedad), anchos['variedad']):<{anchos['variedad']}}"
+                f"{formatear_kg(est):>{anchos['num']}}{formatear_kg(real):>{anchos['num']}}"
+                f"{desv:>+{anchos['pct'] - 1}.0f}%"
+            )
+        nota_tope = ""
+        if len(desviadas) > ALERTA_MAX_FILAS:
+            nota_tope = f" (se muestran las {ALERTA_MAX_FILAS} con mayor diferencia en kg)"
+        texto = (
+            f"{encabezado}\n"
+            f"```{chr(10).join(filas_tabla)}```\n"
+            f"{len(desviadas)} variedad(es) activas fuera de rango, de {con_estimado} con estimado a la fecha{nota_tope}."
+            f"{nota_inactivas}"
+        )
+        return texto, len(desviadas)
+    except Exception as e:
+        logger.error(f"Error construyendo alerta de desviaciones: {str(e)}")
+        return None
+
+def registrar_alerta_enviada(tipo, contenido, destinatarios):
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.execute(
+            "INSERT INTO alertas_enviadas (tipo, contenido, destinatarios) VALUES (?, ?, ?)",
+            (tipo, contenido, ", ".join(d["numero"] for d in destinatarios))
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error registrando alerta enviada: {str(e)}")
+
+def enviar_alerta_desviaciones():
+    """Job programado (semanal): envía al EAS (solo admin en modo prueba) el resumen de
+    variedades desviadas más de UMBRAL_DESVIACION_PCT % respecto del estimado."""
+    try:
+        resultado = construir_alerta_desviaciones()
+        if not resultado:
+            logger.warning("Alerta de desviaciones: sin datos para calcular")
+            return {"enviados": 0, "detalle": "sin datos"}
+        mensaje, num_desviadas = resultado
+        destinatarios = destinatarios_envios(("eas", "admin"))
+        if not destinatarios:
+            logger.warning("Alerta de desviaciones: no hay destinatarios")
+            return {"enviados": 0, "detalle": "sin destinatarios"}
+        enviados = 0
+        for d in destinatarios:
+            if enviar_whatsapp(d["numero"], mensaje):
+                enviados += 1
+        registrar_alerta_enviada("desviacion_semanal", mensaje, destinatarios)
+        logger.info(f"Alerta de desviaciones: {enviados} enviados, {num_desviadas} variedades fuera de rango")
+        return {"enviados": enviados, "variedades_desviadas": num_desviadas}
+    except Exception as e:
+        logger.error(f"Error en job de alerta de desviaciones: {str(e)}")
+        return {"error": str(e)}
+
+def _hora_cron(hhmm, por_defecto):
+    try:
+        h, m = hhmm.strip().split(":")
+        return int(h), int(m)
+    except Exception:
+        return por_defecto
+
+scheduler = BackgroundScheduler()
+
+@app.on_event("startup")
+def iniciar_scheduler():
+    if scheduler.running:
+        return
+    h_am, m_am = _hora_cron(CUESTIONARIO_HORA_AM, (8, 30))
+    h_pm, m_pm = _hora_cron(CUESTIONARIO_HORA_PM, (16, 30))
+    h_al, m_al = _hora_cron(ALERTA_SEMANAL_HORA, (8, 0))
+    scheduler.add_job(enviar_cuestionarios, "cron", args=["manana"], hour=h_am, minute=m_am, id="cuestionario_am")
+    scheduler.add_job(enviar_cuestionarios, "cron", args=["tarde"], hour=h_pm, minute=m_pm, id="cuestionario_pm")
+    scheduler.add_job(enviar_alerta_desviaciones, "cron", day_of_week=ALERTA_SEMANAL_DIA, hour=h_al, minute=m_al, id="alerta_semanal")
+    scheduler.start()
+    modo = "PRODUCCIÓN" if ENVIOS_AUTOMATICOS_PRODUCCION else "PRUEBA (solo números admin)"
+    logger.info(
+        f"Scheduler iniciado en modo {modo}: cuestionarios {h_am:02d}:{m_am:02d} y {h_pm:02d}:{m_pm:02d}, "
+        f"alerta semanal {ALERTA_SEMANAL_DIA} {h_al:02d}:{m_al:02d}"
+    )
 
 # ============================================================================
 # WEBHOOKS FASTAPI
@@ -2278,17 +2745,24 @@ def enviar_plantilla_bienvenida(numero_destino, nombre=None):
         return False
 
 @app.get("/admin/numeros/agregar")
-async def admin_agregar_numero(clave: str, numero: str, nombre: str = None):
+async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol: str = None, productor: str = None):
     """
-    Da acceso a un número (protegido con clave). Si el número ya existía, solo actualiza el
-    nombre. Si es nuevo, además le envía un mensaje de bienvenida por WhatsApp.
-    Uso: https://bot-whatsapp-asa.com/admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias
+    Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
+    campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
+    rol: admin | eas | zonal | productor (por defecto: productor).
+    productor: nombre del productor asociado, para acotar su cuestionario de proyección.
+    Uso: https://bot-whatsapp-asa.com/admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias&rol=zonal
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if rol is not None and rol not in ROLES_VALIDOS:
+        return JSONResponse(
+            {"status": "error", "error": f"Rol inválido: {rol}. Válidos: {', '.join(ROLES_VALIDOS)}"},
+            status_code=400,
+        )
     try:
         es_nuevo = not numero_esta_permitido(numero)
-        agregar_numero_permitido(numero, nombre)
+        agregar_numero_permitido(numero, nombre, rol=rol, productor=productor)
         numero_normalizado = normalizar_numero(numero)
 
         bienvenida_enviada = False
@@ -2299,11 +2773,97 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None):
             "status": "ok",
             "numero": numero_normalizado,
             "nombre": nombre,
+            "rol": rol or (ROL_POR_DEFECTO if es_nuevo else "(sin cambio)"),
+            "productor": productor,
             "nuevo": es_nuevo,
             "bienvenida_enviada": bienvenida_enviada,
         }
     except Exception as e:
         logger.error(f"Error agregando número permitido: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/admin/numeros/rol")
+async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor: str = None):
+    """
+    Cambia el rol y/o el productor asociado de un número que ya tiene acceso.
+    Roles: admin (gestiona y recibe todos los envíos en modo prueba), eas (recibe alertas de
+    desviación), zonal y productor (reciben los cuestionarios de proyección).
+    Uso: https://bot-whatsapp-asa.com/admin/numeros/rol?clave=...&numero=56912345678&rol=eas
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if rol is None and productor is None:
+        return JSONResponse({"status": "error", "error": "Indica rol y/o productor"}, status_code=400)
+    if rol is not None and rol not in ROLES_VALIDOS:
+        return JSONResponse(
+            {"status": "error", "error": f"Rol inválido: {rol}. Válidos: {', '.join(ROLES_VALIDOS)}"},
+            status_code=400,
+        )
+    try:
+        if not numero_esta_permitido(numero):
+            return JSONResponse({"status": "error", "error": "Ese número no está en la lista"}, status_code=404)
+        agregar_numero_permitido(numero, rol=rol, productor=productor)
+        return {"status": "ok", "numero": normalizar_numero(numero), "rol": rol, "productor": productor}
+    except Exception as e:
+        logger.error(f"Error cambiando rol de número: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+def _modo_envios():
+    return "produccion" if ENVIOS_AUTOMATICOS_PRODUCCION else "prueba (solo números admin)"
+
+@app.get("/admin/cuestionario/enviar")
+async def admin_enviar_cuestionario(clave: str, turno: str = "manana", solo_ver: bool = False):
+    """
+    Dispara manualmente el cuestionario de proyección (mismo envío que el job programado,
+    respeta el modo prueba/producción). Con solo_ver=true muestra el texto sin enviar nada.
+    Uso: https://bot-whatsapp-asa.com/admin/cuestionario/enviar?clave=...&turno=manana
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if turno not in ("manana", "tarde"):
+        return JSONResponse({"status": "error", "error": "turno debe ser 'manana' o 'tarde'"}, status_code=400)
+    if solo_ver:
+        texto = construir_cuestionario_proyeccion(turno)
+        return {"status": "ok", "texto": texto or "(sin proyección en el rango: no se enviaría nada)"}
+    return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_cuestionarios(turno)}
+
+@app.get("/admin/alerta/desviaciones")
+async def admin_alerta_desviaciones(clave: str, solo_ver: bool = False):
+    """
+    Dispara manualmente la alerta semanal de desviaciones (respeta el modo prueba/producción).
+    Con solo_ver=true muestra el texto sin enviar nada.
+    Uso: https://bot-whatsapp-asa.com/admin/alerta/desviaciones?clave=...&solo_ver=true
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if solo_ver:
+        resultado = construir_alerta_desviaciones()
+        return {"status": "ok", "texto": resultado[0] if resultado else "(sin datos para calcular)"}
+    return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_alerta_desviaciones()}
+
+@app.get("/admin/cuestionario/respuestas")
+async def admin_respuestas_cuestionario(clave: str, limit: int = 30):
+    """
+    Últimos cuestionarios enviados con su estado y respuesta (para revisar qué contestó cada uno).
+    Uso: https://bot-whatsapp-asa.com/admin/cuestionario/respuestas?clave=...
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT c.id, c.numero, n.nombre, c.turno, c.estado, c.respuesta, c.ajuste, "
+            "c.fecha_hora_envio, c.fecha_hora_respuesta "
+            "FROM cuestionarios c LEFT JOIN numeros_permitidos n ON n.numero = c.numero "
+            "ORDER BY c.id DESC LIMIT ?",
+            (limit,)
+        )
+        filas = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return {"total": len(filas), "cuestionarios": filas}
+    except Exception as e:
+        logger.error(f"Error listando respuestas de cuestionarios: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/admin/numeros/quitar")
