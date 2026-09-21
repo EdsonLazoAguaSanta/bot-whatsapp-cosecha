@@ -5,3 +5,4 @@ __pycache__/
 tools/
 conversaciones.db
 *.log
+caddy.exe

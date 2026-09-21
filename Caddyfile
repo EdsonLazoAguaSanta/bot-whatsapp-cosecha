@@ -1,0 +1,3 @@
+﻿bot-whatsapp-asa.com {
+    reverse_proxy localhost:8005
+}
