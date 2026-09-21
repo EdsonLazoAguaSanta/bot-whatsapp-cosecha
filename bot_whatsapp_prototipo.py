@@ -471,7 +471,7 @@ def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_de
 
     etiqueta_inv = ETIQUETA_FUENTE[BASE_ORIGEN_ESTIM_INVIERNO]
     etiqueta_prim = ETIQUETA_FUENTE[BASE_ORIGEN_ESTIM_PRIMAVERA]
-    anchos = {"variedad": 14, "num": 11}
+    anchos = {"variedad": 18, "num": 11}
     header = (
         f"{'Variedad':<{anchos['variedad']}}{etiqueta_inv:>{anchos['num']}}"
         f"{etiqueta_prim:>{anchos['num']}}{'Real':>{anchos['num']}}"
@@ -701,8 +701,8 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
             clave_pp = (packing, productor)
             por_planta_productor.setdefault(clave_pp, []).append((especie, variedad, total_est, total_real))
 
-        anchos = {"especie": 8, "variedad": 12, "num": 10}
-        ancho_total = anchos["especie"] + anchos["variedad"] + anchos["num"] * 2
+        anchos = {"productor": 45, "especie": 8, "variedad": 18, "num": 10}
+        ancho_total = anchos["productor"] + anchos["especie"] + anchos["variedad"] + anchos["num"] * 2
         MAX_SECCIONES = 20
         secciones_mostradas = 0
         total_secciones = len(por_planta_productor)
