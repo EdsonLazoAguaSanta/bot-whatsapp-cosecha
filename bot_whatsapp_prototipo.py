@@ -52,9 +52,11 @@ ADMIN_CLAVE = os.getenv("ADMIN_CLAVE", "cambiar_esta_clave")
 # Mientras ENVIOS_AUTOMATICOS_PRODUCCION no sea "1", TODOS los envíos automáticos van solo
 # a los números con rol admin (modo prueba), sin importar a qué rol estaban dirigidos.
 ENVIOS_AUTOMATICOS_PRODUCCION = os.getenv("ENVIOS_AUTOMATICOS_PRODUCCION", "0") == "1"
-CUESTIONARIO_HORA_AM = os.getenv("CUESTIONARIO_HORA_AM", "08:30")
-CUESTIONARIO_HORA_PM = os.getenv("CUESTIONARIO_HORA_PM", "16:30")
-CUESTIONARIO_DIAS_PROYECCION = int(os.getenv("CUESTIONARIO_DIAS_PROYECCION", "7"))
+CUESTIONARIO_HORA_AM = os.getenv("CUESTIONARIO_HORA_AM", "08:00")
+CUESTIONARIO_HORA_PM = os.getenv("CUESTIONARIO_HORA_PM", "15:00")
+# Resumen semanal informativo de precosecha (lunes), separado de la alerta de desviaciones.
+RESUMEN_SEMANAL_DIA = os.getenv("RESUMEN_SEMANAL_DIA", "mon")
+RESUMEN_SEMANAL_HORA = os.getenv("RESUMEN_SEMANAL_HORA", "08:00")
 ALERTA_SEMANAL_DIA = os.getenv("ALERTA_SEMANAL_DIA", "mon")  # día en formato cron: mon, tue, ...
 ALERTA_SEMANAL_HORA = os.getenv("ALERTA_SEMANAL_HORA", "08:00")
 UMBRAL_DESVIACION_PCT = float(os.getenv("UMBRAL_DESVIACION_PCT", "15"))
@@ -280,6 +282,10 @@ BASE_ORIGEN_TRISEMANAL = "Trisemanal"
 BASE_ORIGEN_ESTIM_INVIERNO = "Estim Invierno"
 BASE_ORIGEN_ESTIM_PRIMAVERA = "Estim Primavera"
 BASE_ORIGEN_ESTIMADO = BASE_ORIGEN_ESTIM_PRIMAVERA
+# Fuente de los cuestionarios diarios y del resumen semanal: la trisemanal es la proyección
+# operativa de corto plazo (la que dice qué se cosecha estos días), a diferencia de Estim
+# Primavera que cubre la temporada entera y es la que usan las consultas del bot.
+BASE_ORIGEN_CUESTIONARIO = BASE_ORIGEN_TRISEMANAL
 
 FUENTES_ESTIMADO = {
     "primavera": BASE_ORIGEN_ESTIM_PRIMAVERA,
@@ -1080,7 +1086,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
 
 def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, especie=None, variedad=None,
                               productor=None, packing=None, grupo=None, envase=None, temporada=None,
-                              fuente_estimado=None):
+                              fuente_estimado=None, kg_por_caja_eq=None):
     """
     Consulta genérica: agrupa por las dimensiones exactas que se pidan (cualquier combinación
     de especie/variedad/productor/packing/grupo/fecha, o ninguna si se pide solo el total),
@@ -1142,13 +1148,35 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
 
         columna_suma = "KgsRecepcionados"
         unidad = "kg"
+        convertir_a_cajas = None
         if envase:
-            condiciones.append("Envase LIKE ?")
-            params.append(f"%{envase}%")
-            filtro_desc += f" en {envase.upper()}"
-            columna_suma = "Bultos"
-            unidad = envase.upper()
-            condiciones.append("KgsRecepcionados IS NOT NULL")
+            # "Caja Eq" solo existe en la base para algunas especies/variedades (uva y una
+            # pera). Para el resto no hay bultos que sumar: se consulta en kilos y se
+            # convierte con el factor que dé el usuario, porque los kg/caja que se podrían
+            # derivar de la base son inconsistentes (de 8 a 254.000 kg/caja por filas dobles).
+            if _es_caja_eq(envase) and not hay_datos_caja_eq(
+                conn, fecha_inicio, fecha_fin, especie, variedad, productor, packing, grupo
+            ):
+                if not kg_por_caja_eq:
+                    conn.close()
+                    return _pregunta_kg_por_caja_eq(variedad or especie)
+                try:
+                    convertir_a_cajas = float(kg_por_caja_eq)
+                except (TypeError, ValueError):
+                    conn.close()
+                    return _pregunta_kg_por_caja_eq(variedad or especie)
+                if convertir_a_cajas <= 0:
+                    conn.close()
+                    return _pregunta_kg_por_caja_eq(variedad or especie)
+                unidad = "CAJA EQ"
+                filtro_desc += f" en CAJA EQ (a {formatear_kg(convertir_a_cajas)} kg por caja)"
+            else:
+                condiciones.append("Envase LIKE ?")
+                params.append(f"%{envase}%")
+                filtro_desc += f" en {envase.upper()}"
+                columna_suma = "Bultos"
+                unidad = envase.upper()
+                condiciones.append("KgsRecepcionados IS NOT NULL")
 
         where = " AND ".join(condiciones)
         columnas_sql = ", ".join(DIMENSIONES_SQL[d] for d in dimensiones)
@@ -1165,6 +1193,13 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
         filas = cursor.fetchall()
         conn.close()
 
+        if convertir_a_cajas:
+            # Los kilos consultados se pasan a cajas equivalentes con el factor del usuario.
+            filas = [
+                tuple(fila[:-1]) + ((fila[-1] or 0) / convertir_a_cajas,)
+                for fila in filas
+            ]
+
         resultado = formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado)
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
@@ -1172,6 +1207,46 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
     except Exception as e:
         logger.error(f"Error en obtener_cosecha_flexible: {str(e)}")
         return f"Error al consultar: {str(e)}"
+
+def _es_caja_eq(envase):
+    """True si el envase pedido es la unidad 'Caja Eq' (tolera 'cajas eq', 'CAJA EQ', etc.)."""
+    if not envase:
+        return False
+    texto = str(envase).upper().replace(".", "").strip()
+    return "CAJA" in texto and "EQ" in texto
+
+def _pregunta_kg_por_caja_eq(que):
+    """Pregunta que se le devuelve al usuario cuando falta el factor de conversión."""
+    nombre = (que or "consultada").upper()
+    return (
+        f'Para la variedad "{nombre}" consultada, ¿cuántos kilos equivalen a una Caja Eq?\n\n'
+        "Esa variedad no tiene Caja Eq registrada como envase en el sistema, así que necesito "
+        "el equivalente para hacer la conversión desde kilos."
+    )
+
+def hay_datos_caja_eq(conn, fecha_inicio, fecha_fin, especie=None, variedad=None,
+                      productor=None, packing=None, grupo=None):
+    """¿Hay filas con envase CAJA EQ para esos filtros y periodo? Si las hay se consulta
+    directo la columna Bultos; si no, hay que convertir desde kilos."""
+    try:
+        condiciones = ["Envase LIKE '%CAJA EQ%'", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
+        params = [fecha_inicio, fecha_fin]
+        for columna, valor in (
+            ("Especie", especie), ("Variedad", variedad), ("Productor", productor),
+            ("Packing", packing), ("Grupo", grupo),
+        ):
+            if valor:
+                condiciones.append(f"{columna} LIKE ?")
+                params.append(f"%{valor}%")
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT TOP 1 1 FROM [Recepcion_Consolidada] WHERE {' AND '.join(condiciones)}",
+            params,
+        )
+        return cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error verificando datos de CAJA EQ: {str(e)}")
+        return False
 
 def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo):
     """Función compartida: encuentra la primera (MIN) o última (MAX) fecha con cosecha real."""
@@ -1673,6 +1748,10 @@ TOOLS = [
                     "type": "string",
                     "enum": ["trisemanal", "invierno"],
                     "description": "Omitir SIEMPRE por defecto (se usa Estim Primavera automáticamente). Solo pasar 'trisemanal' o 'invierno' si el usuario pide explícitamente esa fuente por su nombre."
+                },
+                "kg_por_caja_eq": {
+                    "type": "number",
+                    "description": "Cuántos kilos equivalen a una Caja Eq para la variedad consultada. Pasarlo SOLO cuando el usuario ya respondió esa cifra, después de que la herramienta la haya pedido. No inventarlo ni asumir un valor típico."
                 }
             },
             "required": ["agrupar_por"]
@@ -1953,6 +2032,16 @@ la cantidad REAL de unidades registradas de ese envase, no una conversión calcu
 kilos por unidad varían según la fruta y no son un factor fijo confiable). Si el usuario pregunta por
 kilos/kg, no uses este parámetro.
 
+CAJAS EQ (caso especial): "Caja Eq" es una unidad que solo algunas especies/variedades manejan en el
+sistema (principalmente uva). Cuando el usuario pregunte por cajas eq / cajas equivalentes, usa
+SIEMPRE consultar_cosecha_flexible con envase="CAJA EQ" (esa herramienta es la única que sabe
+manejar este caso). Si la variedad sí tiene cajas eq registradas, te devolverá los datos normalmente.
+Si NO las tiene, te devolverá una pregunta pidiendo cuántos kilos equivalen a una Caja Eq: trasládale
+esa pregunta al usuario tal cual, sin inventar ni suponer un factor. Cuando el usuario responda con la
+cifra (ej. "8,2 kilos", "son 10 kilos por caja"), vuelve a llamar a consultar_cosecha_flexible con los
+MISMOS parámetros de la consulta original MÁS kg_por_caja_eq con ese número, y entrégale el resultado
+ya convertido.
+
 Si el usuario saluda, pide ayuda, o pregunta algo que no corresponde a ninguna herramienta, respóndele tú
 directamente: breve, amable, en español, y si corresponde explícale qué puedes hacer.
 
@@ -2049,6 +2138,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
             fuente_estimado=tool_input.get("fuente_estimado") or None,
+            kg_por_caja_eq=tool_input.get("kg_por_caja_eq") or None,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
@@ -2341,76 +2431,173 @@ def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False):
     except Exception as e:
         logger.error(f"Error notificando ajuste de cuestionario: {str(e)}")
 
-def construir_cuestionario_proyeccion(turno, productor=None):
-    """Texto del cuestionario: proyección de la fuente de estimado por defecto (Precosecha)
-    para los próximos CUESTIONARIO_DIAS_PROYECCION días, por variedad, acotada al productor
-    asociado al número si tiene uno. None si no hay datos proyectados en ese rango."""
+MAX_SECCIONES_CUESTIONARIO = 12
+
+def obtener_previsto(fecha_inicio, fecha_fin, productor=None):
+    """Filas previstas por la fuente del cuestionario (Trisemanal) entre dos fechas, como
+    (productor, especie, envase, kg, bultos). La base trae filas duplicadas del mismo
+    registro —una con Bultos y KgsRecepcionados NULL y otra con ambos—, así que se filtran
+    las de kg NULL: sin eso los bultos se duplican (verificado 15-01-2026: 2.203 vs 1.712)."""
+    conn = conectar_sql()
+    if not conn:
+        return None
     try:
-        conn = conectar_sql()
-        if not conn:
-            return None
-        hoy = date.today()
-        hasta = hoy + timedelta(days=CUESTIONARIO_DIAS_PROYECCION - 1)
-        condiciones = ["[Base Origen] = ?", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
-        params = [BASE_ORIGEN_ESTIMADO, hoy.strftime("%Y-%m-%d"), hasta.strftime("%Y-%m-%d")]
+        condiciones = [
+            "[Base Origen] = ?",
+            "CAST(Fecha AS DATE) BETWEEN ? AND ?",
+            "KgsRecepcionados IS NOT NULL",
+        ]
+        params = [
+            BASE_ORIGEN_CUESTIONARIO,
+            fecha_inicio.strftime("%Y-%m-%d"),
+            fecha_fin.strftime("%Y-%m-%d"),
+        ]
         if productor:
             condiciones.append("Productor LIKE ?")
             params.append(f"%{productor}%")
         cursor = conn.cursor()
         cursor.execute(f"""
-            SELECT Variedad, SUM(KgsRecepcionados) as total
+            SELECT Productor, Especie, Envase,
+                   SUM(KgsRecepcionados) as kg, SUM(Bultos) as bultos
             FROM [Recepcion_Consolidada]
             WHERE {" AND ".join(condiciones)}
-            GROUP BY Variedad
+            GROUP BY Productor, Especie, Envase
             HAVING SUM(KgsRecepcionados) > 0
-            ORDER BY SUM(KgsRecepcionados) DESC
+            ORDER BY Productor, SUM(KgsRecepcionados) DESC
         """, params)
-        filas = cursor.fetchall()
+        return cursor.fetchall()
+    finally:
         conn.close()
+
+def _tabla_previsto(filas_productor):
+    """Tabla Especie | Envase | Kilos | Bultos con su total, para un productor."""
+    anchos = {"especie": 10, "envase": 8, "kg": 10, "bultos": 8}
+    lineas = [
+        f"{'Especie':<{anchos['especie']}}{'Envase':<{anchos['envase']}}"
+        f"{'Kilos':>{anchos['kg']}}{'Bultos':>{anchos['bultos']}}"
+    ]
+    total_kg = total_bultos = 0
+    for especie, envase, kg, bultos in filas_productor:
+        total_kg += kg or 0
+        total_bultos += bultos or 0
+        lineas.append(
+            # Envase viene de un campo de ancho fijo: sin strip() llega con espacios de
+            # relleno y _truncar lo corta como si no cupiera ("BINS   …").
+            f"{_truncar(traducir_especie(especie), anchos['especie']):<{anchos['especie']}}"
+            f"{_truncar(str(envase or '-').strip(), anchos['envase']):<{anchos['envase']}}"
+            f"{formatear_kg(kg):>{anchos['kg']}}{formatear_kg(bultos):>{anchos['bultos']}}"
+        )
+    lineas.append(
+        f"{'TOTAL':<{anchos['especie'] + anchos['envase']}}"
+        f"{formatear_kg(total_kg):>{anchos['kg']}}{formatear_kg(total_bultos):>{anchos['bultos']}}"
+    )
+    return "\n".join(lineas), total_kg, total_bultos
+
+def _agrupar_por_productor(filas):
+    agrupado = {}
+    for productor, especie, envase, kg, bultos in filas:
+        agrupado.setdefault(productor, []).append((especie, envase, kg, bultos))
+    return agrupado
+
+def construir_cuestionario_diario(fecha=None, nombre=None, productor=None):
+    """Mensaje de las 08:00: lo previsto para ese día por productor, con el formato
+    acordado (Especie | Envase | Kilos | Bultos). None si no hay nada previsto ese día."""
+    try:
+        fecha = fecha or date.today()
+        filas = obtener_previsto(fecha, fecha, productor=productor)
         if not filas:
             return None
-
-        etiqueta_turno = "mañana" if turno == "manana" else "tarde"
-        alcance = f" del productor {productor.upper()}" if productor else ""
-        anchos = {"variedad": 18, "num": 12}
-        filas_tabla = [f"{'Variedad':<{anchos['variedad']}}{'Kg':>{anchos['num']}}"]
-        total = 0
-        for variedad, kg in filas:
-            total += kg or 0
-            filas_tabla.append(
-                f"{_truncar(str(variedad), anchos['variedad']):<{anchos['variedad']}}{formatear_kg(kg):>{anchos['num']}}"
-            )
-        filas_tabla.append(f"{'TOTAL':<{anchos['variedad']}}{formatear_kg(total):>{anchos['num']}}")
-
+        agrupado = _agrupar_por_productor(filas)
+        saludo = f"Hola {nombre.strip()}" if nombre and nombre.strip() else "Hola"
         lineas = [
-            f"📋 Cuestionario de proyección ({etiqueta_turno})",
+            f"{saludo}, para hoy tienes prevista una Precosecha "
+            f"({ETIQUETA_FUENTE[BASE_ORIGEN_CUESTIONARIO].lower()}) por Productor de:",
             "",
-            f"Proyección {ETIQUETA_FUENTE[BASE_ORIGEN_ESTIMADO]}{alcance} "
-            f"del {hoy.strftime('%d-%m')} al {hasta.strftime('%d-%m')}:",
-            f"```{chr(10).join(filas_tabla)}```",
-            "",
-            "¿Confirmas esta proyección o hay que ajustarla? Responde \"confirmo\" o "
-            "indícame el ajuste (ej: \"tiffany serán unos 10.000 kg menos\").",
         ]
+        for prod in list(agrupado)[:MAX_SECCIONES_CUESTIONARIO]:
+            tabla, _, _ = _tabla_previsto(agrupado[prod])
+            lineas.append(f"Productor {prod}:")
+            lineas.append(f"```{tabla}```")
+            lineas.append("")
+        if len(agrupado) > MAX_SECCIONES_CUESTIONARIO:
+            lineas.append(
+                f"(se muestran {MAX_SECCIONES_CUESTIONARIO} de {len(agrupado)} productores)"
+            )
+            lineas.append("")
+        lineas.append("¿Se confirma cantidades previstas?")
         return "\n".join(lineas)
     except Exception as e:
-        logger.error(f"Error construyendo cuestionario de proyección: {str(e)}")
+        logger.error(f"Error construyendo cuestionario diario: {str(e)}")
         return None
 
-def enviar_cuestionarios(turno):
-    """Job programado (2x día): envía el cuestionario de proyección a zonales y productores
-    (solo admin mientras dure el modo prueba)."""
+def construir_confirmacion_tarde(fecha=None, nombre=None, productor=None, ajuste_previo=None):
+    """Mensaje de las 15:00: repite lo que quedó informado en la mañana (lo previsto, más
+    el ajuste que el usuario haya reportado) y pide confirmarlo al cierre del día."""
     try:
+        fecha = fecha or date.today()
+        filas = obtener_previsto(fecha, fecha, productor=productor)
+        if not filas:
+            return None
+        agrupado = _agrupar_por_productor(filas)
+        saludo = f"Hola {nombre.strip()}" if nombre and nombre.strip() else "Hola"
+        lineas = [f"{saludo}, esta mañana quedó informado para hoy:", ""]
+        for prod in list(agrupado)[:MAX_SECCIONES_CUESTIONARIO]:
+            tabla, _, _ = _tabla_previsto(agrupado[prod])
+            lineas.append(f"Productor {prod}:")
+            lineas.append(f"```{tabla}```")
+            lineas.append("")
+        if ajuste_previo:
+            lineas.append(f"Ajuste que reportaste hoy: {ajuste_previo}")
+            lineas.append("")
+        lineas.append("¿Confirmas estas cantidades al cierre del día?")
+        return "\n".join(lineas)
+    except Exception as e:
+        logger.error(f"Error construyendo confirmación de tarde: {str(e)}")
+        return None
+
+def _ajuste_registrado_hoy(numero, fecha=None):
+    """Ajuste que el número reportó hoy (para repetirlo en el mensaje de las 15:00)."""
+    try:
+        fecha = fecha or date.today()
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT ajuste FROM cuestionarios WHERE numero = ? AND estado = 'ajustado' "
+            "AND date(fecha_hora_respuesta) = ? AND ajuste IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (normalizar_numero(numero), fecha.strftime("%Y-%m-%d"))
+        ).fetchone()
+        conn.close()
+        return fila[0] if fila else None
+    except Exception as e:
+        logger.error(f"Error buscando ajuste del día: {str(e)}")
+        return None
+
+def enviar_cuestionarios(turno, fecha=None):
+    """Job programado: 'diario_am' (08:00) manda lo previsto del día y pide confirmar;
+    'diario_pm' (15:00) repite lo informado en la mañana y pide confirmarlo al cierre.
+    Va a zonales y productores (solo a los admin mientras dure el modo prueba)."""
+    try:
+        fecha = fecha or date.today()
         destinatarios = destinatarios_envios(("zonal", "productor"))
         if not destinatarios:
             logger.warning("Cuestionario: no hay destinatarios (¿ningún número con el rol requerido?)")
             return {"enviados": 0, "sin_datos": 0, "errores": 0, "detalle": "sin destinatarios"}
         enviados = sin_datos = errores = 0
         for d in destinatarios:
-            mensaje = construir_cuestionario_proyeccion(turno, productor=d.get("productor"))
+            if turno == "diario_pm":
+                mensaje = construir_confirmacion_tarde(
+                    fecha,
+                    nombre=d.get("nombre"),
+                    productor=d.get("productor"),
+                    ajuste_previo=_ajuste_registrado_hoy(d["numero"], fecha),
+                )
+            else:
+                mensaje = construir_cuestionario_diario(
+                    fecha, nombre=d.get("nombre"), productor=d.get("productor")
+                )
             if not mensaje:
                 sin_datos += 1
-                logger.info(f"Cuestionario: sin proyección para {d['numero']} (productor={d.get('productor')})")
+                logger.info(f"Cuestionario {turno}: sin previsto para {d['numero']} (productor={d.get('productor')})")
                 continue
             if enviar_whatsapp(d["numero"], mensaje):
                 registrar_cuestionario_enviado(d["numero"], turno, mensaje)
@@ -2423,6 +2610,100 @@ def enviar_cuestionarios(turno):
         return {"enviados": enviados, "sin_datos": sin_datos, "errores": errores}
     except Exception as e:
         logger.error(f"Error en job de cuestionarios: {str(e)}")
+        return {"error": str(e)}
+
+def _lunes_de(fecha):
+    return fecha - timedelta(days=fecha.weekday())
+
+def construir_resumen_semanal(fecha=None, nombre=None, productor=None, para_eas=False):
+    """Mensaje de los lunes 08:00: total previsto de la semana. Para el productor va su
+    propio desglose por especie; para el EAS, el consolidado por productor."""
+    try:
+        fecha = fecha or date.today()
+        inicio = _lunes_de(fecha)
+        fin = inicio + timedelta(days=6)
+        filas = obtener_previsto(inicio, fin, productor=productor)
+        if not filas:
+            return None
+        rango = f"del {inicio.strftime('%d-%m')} al {fin.strftime('%d-%m')}"
+        etiqueta = ETIQUETA_FUENTE[BASE_ORIGEN_CUESTIONARIO].lower()
+
+        if para_eas:
+            por_productor = {}
+            for prod, _especie, _envase, kg, bultos in filas:
+                acum = por_productor.setdefault(prod, [0, 0])
+                acum[0] += kg or 0
+                acum[1] += bultos or 0
+            anchos = {"prod": 22, "kg": 11, "bultos": 8}
+            tabla = [
+                f"{'Productor':<{anchos['prod']}}{'Kilos':>{anchos['kg']}}{'Bultos':>{anchos['bultos']}}"
+            ]
+            tot_kg = tot_bultos = 0
+            for prod, (kg, bultos) in sorted(por_productor.items(), key=lambda x: x[1][0], reverse=True):
+                tot_kg += kg
+                tot_bultos += bultos
+                tabla.append(
+                    f"{_truncar(str(prod), anchos['prod']):<{anchos['prod']}}"
+                    f"{formatear_kg(kg):>{anchos['kg']}}{formatear_kg(bultos):>{anchos['bultos']}}"
+                )
+            tabla.append(
+                f"{'TOTAL':<{anchos['prod']}}{formatear_kg(tot_kg):>{anchos['kg']}}"
+                f"{formatear_kg(tot_bultos):>{anchos['bultos']}}"
+            )
+            return "\n".join([
+                f"📅 Precosecha ({etiqueta}) prevista para la semana {rango}",
+                "",
+                f"```{chr(10).join(tabla)}```",
+                "",
+                f"{len(por_productor)} productores. Mensaje informativo, no requiere respuesta.",
+            ])
+
+        agrupado = _agrupar_por_productor(filas)
+        saludo = f"Hola {nombre.strip()}" if nombre and nombre.strip() else "Hola"
+        lineas = [
+            f"{saludo}, esta es tu Precosecha ({etiqueta}) prevista para la semana {rango}:",
+            "",
+        ]
+        for prod in list(agrupado)[:MAX_SECCIONES_CUESTIONARIO]:
+            tabla, _, _ = _tabla_previsto(agrupado[prod])
+            lineas.append(f"Productor {prod}:")
+            lineas.append(f"```{tabla}```")
+            lineas.append("")
+        lineas.append("Mensaje informativo, no requiere respuesta.")
+        return "\n".join(lineas)
+    except Exception as e:
+        logger.error(f"Error construyendo resumen semanal: {str(e)}")
+        return None
+
+def enviar_resumen_semanal(fecha=None):
+    """Job de los lunes 08:00: su semana a cada productor/zonal, y el consolidado al EAS
+    (todo solo a los admin mientras dure el modo prueba)."""
+    try:
+        fecha = fecha or date.today()
+        enviados = sin_datos = errores = 0
+        for d in destinatarios_envios(("zonal", "productor")):
+            mensaje = construir_resumen_semanal(fecha, nombre=d.get("nombre"), productor=d.get("productor"))
+            if not mensaje:
+                sin_datos += 1
+                continue
+            if enviar_whatsapp(d["numero"], mensaje):
+                enviados += 1
+            else:
+                errores += 1
+
+        enviados_eas = 0
+        mensaje_eas = construir_resumen_semanal(fecha, para_eas=True)
+        destinatarios_eas = destinatarios_envios(("eas", "admin"))
+        if mensaje_eas:
+            for d in destinatarios_eas:
+                if enviar_whatsapp(d["numero"], mensaje_eas):
+                    enviados_eas += 1
+            if destinatarios_eas:
+                registrar_alerta_enviada("resumen_semanal_eas", mensaje_eas, destinatarios_eas)
+        logger.info(f"Resumen semanal: {enviados} a productores, {enviados_eas} al EAS, {sin_datos} sin datos")
+        return {"enviados_productores": enviados, "enviados_eas": enviados_eas, "sin_datos": sin_datos, "errores": errores}
+    except Exception as e:
+        logger.error(f"Error en job de resumen semanal: {str(e)}")
         return {"error": str(e)}
 
 def construir_alerta_desviaciones():
@@ -2577,17 +2858,20 @@ scheduler = BackgroundScheduler()
 def iniciar_scheduler():
     if scheduler.running:
         return
-    h_am, m_am = _hora_cron(CUESTIONARIO_HORA_AM, (8, 30))
-    h_pm, m_pm = _hora_cron(CUESTIONARIO_HORA_PM, (16, 30))
+    h_am, m_am = _hora_cron(CUESTIONARIO_HORA_AM, (8, 0))
+    h_pm, m_pm = _hora_cron(CUESTIONARIO_HORA_PM, (15, 0))
+    h_sem, m_sem = _hora_cron(RESUMEN_SEMANAL_HORA, (8, 0))
     h_al, m_al = _hora_cron(ALERTA_SEMANAL_HORA, (8, 0))
-    scheduler.add_job(enviar_cuestionarios, "cron", args=["manana"], hour=h_am, minute=m_am, id="cuestionario_am")
-    scheduler.add_job(enviar_cuestionarios, "cron", args=["tarde"], hour=h_pm, minute=m_pm, id="cuestionario_pm")
+    scheduler.add_job(enviar_cuestionarios, "cron", args=["diario_am"], hour=h_am, minute=m_am, id="cuestionario_am")
+    scheduler.add_job(enviar_cuestionarios, "cron", args=["diario_pm"], hour=h_pm, minute=m_pm, id="cuestionario_pm")
+    scheduler.add_job(enviar_resumen_semanal, "cron", day_of_week=RESUMEN_SEMANAL_DIA, hour=h_sem, minute=m_sem, id="resumen_semanal")
     scheduler.add_job(enviar_alerta_desviaciones, "cron", day_of_week=ALERTA_SEMANAL_DIA, hour=h_al, minute=m_al, id="alerta_semanal")
     scheduler.start()
     modo = "PRODUCCIÓN" if ENVIOS_AUTOMATICOS_PRODUCCION else "PRUEBA (solo números admin)"
     logger.info(
-        f"Scheduler iniciado en modo {modo}: cuestionarios {h_am:02d}:{m_am:02d} y {h_pm:02d}:{m_pm:02d}, "
-        f"alerta semanal {ALERTA_SEMANAL_DIA} {h_al:02d}:{m_al:02d}"
+        f"Scheduler iniciado en modo {modo}: cuestionario diario {h_am:02d}:{m_am:02d} y "
+        f"confirmación {h_pm:02d}:{m_pm:02d}, resumen semanal {RESUMEN_SEMANAL_DIA} {h_sem:02d}:{m_sem:02d}, "
+        f"alerta desviaciones {ALERTA_SEMANAL_DIA} {h_al:02d}:{m_al:02d}"
     )
 
 # ============================================================================
@@ -2877,21 +3161,58 @@ async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor:
 def _modo_envios():
     return "produccion" if ENVIOS_AUTOMATICOS_PRODUCCION else "prueba (solo números admin)"
 
+def _parsear_fecha_param(fecha):
+    """Convierte el parámetro ?fecha=YYYY-MM-DD, o None para usar hoy. Lanza ValueError."""
+    if not fecha:
+        return None
+    return datetime.strptime(fecha, "%Y-%m-%d").date()
+
 @app.get("/admin/cuestionario/enviar")
-async def admin_enviar_cuestionario(clave: str, turno: str = "manana", solo_ver: bool = False):
+async def admin_enviar_cuestionario(clave: str, turno: str = "diario_am", solo_ver: bool = False, fecha: str = None):
     """
-    Dispara manualmente el cuestionario de proyección (mismo envío que el job programado,
-    respeta el modo prueba/producción). Con solo_ver=true muestra el texto sin enviar nada.
-    Uso: https://bot-whatsapp-asa.com/admin/cuestionario/enviar?clave=...&turno=manana
+    Dispara manualmente el cuestionario diario (mismo envío que el job programado, respeta el
+    modo prueba/producción). turno: 'diario_am' (lo previsto del día) o 'diario_pm' (confirmar
+    lo informado). Con solo_ver=true muestra el texto sin enviar nada. fecha=YYYY-MM-DD permite
+    probar con un día que sí tenga datos trisemanales (entre temporadas no hay previsto para hoy).
+    Uso: .../admin/cuestionario/enviar?clave=...&turno=diario_am&solo_ver=true&fecha=2026-01-15
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
-    if turno not in ("manana", "tarde"):
-        return JSONResponse({"status": "error", "error": "turno debe ser 'manana' o 'tarde'"}, status_code=400)
+    if turno not in ("diario_am", "diario_pm"):
+        return JSONResponse({"status": "error", "error": "turno debe ser 'diario_am' o 'diario_pm'"}, status_code=400)
+    try:
+        dia = _parsear_fecha_param(fecha)
+    except ValueError:
+        return JSONResponse({"status": "error", "error": "fecha debe ser YYYY-MM-DD"}, status_code=400)
     if solo_ver:
-        texto = construir_cuestionario_proyeccion(turno)
-        return {"status": "ok", "texto": texto or "(sin proyección en el rango: no se enviaría nada)"}
-    return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_cuestionarios(turno)}
+        if turno == "diario_pm":
+            texto = construir_confirmacion_tarde(dia, nombre="Edson")
+        else:
+            texto = construir_cuestionario_diario(dia, nombre="Edson")
+        return {"status": "ok", "texto": texto or "(sin previsto ese día: no se enviaría nada)"}
+    return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_cuestionarios(turno, fecha=dia)}
+
+@app.get("/admin/resumen/semanal")
+async def admin_resumen_semanal(clave: str, solo_ver: bool = False, fecha: str = None):
+    """
+    Dispara manualmente el resumen semanal de precosecha de los lunes (a productores su
+    semana, y el consolidado al EAS). Con solo_ver=true muestra ambos textos sin enviar.
+    fecha=YYYY-MM-DD elige la semana (se usa el lunes de esa semana).
+    Uso: .../admin/resumen/semanal?clave=...&solo_ver=true&fecha=2026-01-15
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        dia = _parsear_fecha_param(fecha)
+    except ValueError:
+        return JSONResponse({"status": "error", "error": "fecha debe ser YYYY-MM-DD"}, status_code=400)
+    if solo_ver:
+        return {
+            "status": "ok",
+            "texto_productor": construir_resumen_semanal(dia, nombre="Edson") or "(sin previsto esa semana)",
+            "texto_eas": construir_resumen_semanal(dia, para_eas=True) or "(sin previsto esa semana)",
+        }
+    return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_resumen_semanal(fecha=dia)}
 
 @app.get("/admin/alerta/desviaciones")
 async def admin_alerta_desviaciones(clave: str, solo_ver: bool = False):
