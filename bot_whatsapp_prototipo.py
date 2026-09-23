@@ -119,6 +119,20 @@ def inicializar_db_local():
             fecha_hora TEXT DEFAULT (datetime('now', 'localtime'))
         )
     """)
+    # Estado real de entrega de cada mensaje que envía el bot. La API de Meta responde 200 y
+    # un id apenas acepta el mensaje; si después NO se entrega, eso solo llega por los
+    # "statuses" del webhook. Sin esta tabla, un mensaje que nunca llegó se veía como enviado.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mensajes_estado (
+            wamid TEXT PRIMARY KEY,
+            numero TEXT,
+            estado TEXT,
+            error_code TEXT,
+            error_detalle TEXT,
+            fecha_envio TEXT DEFAULT (datetime('now', 'localtime')),
+            fecha_estado TEXT
+        )
+    """)
     # Migración Fase 2: rol/perfil por número (admin | eas | zonal | productor) y productor
     # asociado opcional (para acotar el cuestionario de proyección a su campo).
     columnas = [fila[1] for fila in conn.execute("PRAGMA table_info(numeros_permitidos)")]
@@ -2292,12 +2306,64 @@ def _enviar_whatsapp_una_parte(numero_destino, mensaje_texto):
         response = requests.post(url, json=payload, headers=headers)
         if response.status_code != 200:
             logger.error(f"WhatsApp respondió {response.status_code} al enviar a {numero_destino}: {response.text}")
-        else:
-            logger.info(f"WhatsApp enviado a {numero_destino}: {response.status_code}")
-        return response.status_code == 200
+            return False
+        # Un 200 solo significa "Meta aceptó el mensaje", no que se haya entregado: el
+        # resultado real llega después por los statuses del webhook.
+        registrar_mensaje_enviado(response, numero_destino)
+        logger.info(f"WhatsApp aceptado por Meta para {numero_destino}: {response.status_code}")
+        return True
     except Exception as e:
         logger.error(f"Error enviando WhatsApp: {str(e)}")
         return False
+
+def registrar_mensaje_enviado(response, numero_destino):
+    """Guarda el id (wamid) que devuelve Meta, para poder cruzarlo con el estado de entrega."""
+    try:
+        mensajes = (response.json() or {}).get("messages") or []
+        if not mensajes:
+            return
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        for m in mensajes:
+            conn.execute(
+                "INSERT OR REPLACE INTO mensajes_estado (wamid, numero, estado) VALUES (?, ?, 'aceptado')",
+                (m.get("id"), normalizar_numero(numero_destino))
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error registrando mensaje enviado: {str(e)}")
+
+def registrar_estado_entrega(status):
+    """Procesa un 'status' del webhook: sent / delivered / read / failed, con su error."""
+    try:
+        wamid = status.get("id")
+        if not wamid:
+            return
+        estado = status.get("status")
+        errores = status.get("errors") or []
+        error_code = str(errores[0].get("code")) if errores else None
+        if errores:
+            e0 = errores[0]
+            detalle = e0.get("title") or e0.get("message") or ""
+            extra = (e0.get("error_data") or {}).get("details")
+            error_detalle = f"{detalle} — {extra}" if extra else detalle
+            logger.error(f"WhatsApp NO entregado a {status.get('recipient_id')}: [{error_code}] {error_detalle}")
+        else:
+            error_detalle = None
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.execute(
+            "INSERT INTO mensajes_estado (wamid, numero, estado, error_code, error_detalle, fecha_estado) "
+            "VALUES (?, ?, ?, ?, ?, datetime('now','localtime')) "
+            "ON CONFLICT(wamid) DO UPDATE SET estado = excluded.estado, "
+            "error_code = COALESCE(excluded.error_code, mensajes_estado.error_code), "
+            "error_detalle = COALESCE(excluded.error_detalle, mensajes_estado.error_detalle), "
+            "fecha_estado = excluded.fecha_estado",
+            (wamid, normalizar_numero(status.get("recipient_id")), estado, error_code, error_detalle)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error registrando estado de entrega: {str(e)}")
 
 def enviar_whatsapp(numero_destino, mensaje_texto):
     """
@@ -2424,10 +2490,14 @@ def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False):
         else:
             mensaje = f"📝 Ajuste de proyección reportado por {quien} (+{num}):\n\n{detalle}"
         destinatarios = [d for d in destinatarios_envios(("eas", "admin")) if d["numero"] != num]
-        for d in destinatarios:
-            enviar_whatsapp(d["numero"], mensaje)
-        if destinatarios:
-            registrar_alerta_enviada("ajuste_cuestionario", mensaje, destinatarios)
+        # Solo se registran los que Meta aceptó: antes se anotaba el aviso como enviado
+        # aunque el envío hubiera fallado, y el panel mostraba entregas que nunca ocurrieron.
+        aceptados = [d for d in destinatarios if enviar_whatsapp(d["numero"], mensaje)]
+        if aceptados:
+            registrar_alerta_enviada("ajuste_cuestionario", mensaje, aceptados)
+        if len(aceptados) < len(destinatarios):
+            fallidos = [d["numero"] for d in destinatarios if d not in aceptados]
+            logger.error(f"Aviso de ajuste no aceptado para: {', '.join(fallidos)}")
     except Exception as e:
         logger.error(f"Error notificando ajuste de cuestionario: {str(e)}")
 
@@ -2834,11 +2904,10 @@ def enviar_alerta_desviaciones():
         if not destinatarios:
             logger.warning("Alerta de desviaciones: no hay destinatarios")
             return {"enviados": 0, "detalle": "sin destinatarios"}
-        enviados = 0
-        for d in destinatarios:
-            if enviar_whatsapp(d["numero"], mensaje):
-                enviados += 1
-        registrar_alerta_enviada("desviacion_semanal", mensaje, destinatarios)
+        aceptados = [d for d in destinatarios if enviar_whatsapp(d["numero"], mensaje)]
+        enviados = len(aceptados)
+        if aceptados:
+            registrar_alerta_enviada("desviacion_semanal", mensaje, aceptados)
         logger.info(f"Alerta de desviaciones: {enviados} enviados, {num_desviadas} variedades fuera de rango")
         return {"enviados": enviados, "variedades_desviadas": num_desviadas}
     except Exception as e:
@@ -2911,8 +2980,13 @@ async def receive_message(request: Request):
             for entry in data["entry"]:
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
+
+                    # Acuses de entrega de los mensajes que enviamos (sent/delivered/read/failed).
+                    for status in value.get("statuses", []):
+                        registrar_estado_entrega(status)
+
                     messages = value.get("messages", [])
-                    
+
                     for message in messages:
                         numero_sender = message.get("from")
                         msg_id = message.get("id")
@@ -3227,6 +3301,37 @@ async def admin_alerta_desviaciones(clave: str, solo_ver: bool = False):
         resultado = construir_alerta_desviaciones()
         return {"status": "ok", "texto": resultado[0] if resultado else "(sin datos para calcular)"}
     return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_alerta_desviaciones()}
+
+@app.get("/admin/entregas")
+async def admin_entregas(clave: str, limit: int = 40, solo_fallidos: bool = False):
+    """
+    Estado REAL de entrega de los últimos mensajes enviados por el bot. Meta responde 200 al
+    aceptar un mensaje, pero si no se entrega eso solo llega por los statuses del webhook:
+    aquí se ven como 'failed' con el código de error de Meta.
+    Uso: https://bot-whatsapp-asa.com/admin/entregas?clave=...&solo_fallidos=true
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        filtro = "WHERE m.estado = 'failed'" if solo_fallidos else ""
+        cursor = conn.execute(
+            f"SELECT m.wamid, m.numero, n.nombre, m.estado, m.error_code, m.error_detalle, "
+            f"m.fecha_envio, m.fecha_estado "
+            f"FROM mensajes_estado m LEFT JOIN numeros_permitidos n ON n.numero = m.numero "
+            f"{filtro} ORDER BY m.rowid DESC LIMIT ?",
+            (limit,)
+        )
+        filas = [dict(row) for row in cursor.fetchall()]
+        resumen = {}
+        for row in conn.execute("SELECT estado, COUNT(*) c FROM mensajes_estado GROUP BY estado"):
+            resumen[row["estado"]] = row["c"]
+        conn.close()
+        return {"resumen_por_estado": resumen, "total_listado": len(filas), "mensajes": filas}
+    except Exception as e:
+        logger.error(f"Error listando entregas: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/admin/cuestionario/respuestas")
 async def admin_respuestas_cuestionario(clave: str, limit: int = 30):
