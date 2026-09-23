@@ -1680,23 +1680,23 @@ TOOLS = [
     },
 ]
 
-# Herramienta que se agrega a TOOLS SOLO cuando el usuario tiene un cuestionario de
-# proyección vigente (pendiente o respondido hace menos de 24 h, ver procesar_mensaje):
-# registra su confirmación o ajuste, o corrige lo que ya había respondido.
+# Esta herramienta está SIEMPRE disponible (ver procesar_mensaje): el usuario puede reportar
+# un ajuste de proyección cuando ocurre, no solo mientras haya un cuestionario vigente. Si hay
+# cuestionario vigente actualiza esa respuesta; si no, queda como reporte espontáneo.
 TOOL_REGISTRAR_CUESTIONARIO = {
     "name": "registrar_respuesta_cuestionario",
-    "description": "Registra la respuesta del usuario al cuestionario de proyección de cosecha vigente, o CORRIGE la respuesta que ya había dado (la corrección reemplaza por completo lo registrado antes). Usar cuando su mensaje confirma la proyección enviada ('confirmo', 'ok', 'está bien'), indica un ajuste de cifras ('serán unos 10.000 kg menos de tiffany'), o corrige su respuesta anterior ('mejor serán 10 mil más', 'al final déjalo como estaba'). NO usar para consultas normales de datos.",
+    "description": "Registra que el usuario REPORTA un cambio en su proyección de cosecha, para avisar al equipo EAS. Usar SIEMPRE que el usuario informe (no que pregunte) que va a cosechar más o menos de lo proyectado, que algo viene atrasado o adelantado, o cualquier novedad de campo que afecte lo esperado: 'la boreal viene con 2.000 kilos menos', 'serán unos 10.000 kg menos de tiffany', 'la garcica se atrasó una semana', 'es solo una corrección para avisar a los EAS'. También registra la respuesta al cuestionario de proyección cuando hay uno vigente ('confirmo', 'ok') y corrige una respuesta anterior ('mejor serán 10 mil más'), reemplazando por completo lo registrado antes. NO usar cuando el usuario PREGUNTA por datos ('cuánto se cosechó de boreal', 'cuál es el estimado') — eso son consultas, no reportes.",
     "input_schema": {
         "type": "object",
         "properties": {
             "resultado": {
                 "type": "string",
                 "enum": ["confirmado", "ajustado"],
-                "description": "'confirmado' si el usuario está de acuerdo con la proyección tal cual; 'ajustado' si indica cualquier corrección."
+                "description": "'ajustado' siempre que el usuario reporte cualquier cambio o corrección respecto de lo proyectado. 'confirmado' SOLO cuando responde a un cuestionario vigente diciendo que la proyección está bien tal cual."
             },
             "detalle_ajuste": {
                 "type": "string",
-                "description": "Solo si resultado='ajustado': resumen claro y concreto del ajuste que indicó el usuario (variedad, cuánto más o menos, unidad). Ej: 'TIFFANY: ~10.000 kg menos que lo proyectado'."
+                "description": "Obligatorio si resultado='ajustado': resumen claro y concreto de lo que reportó el usuario, con variedad, magnitud y unidad si las dio. Ej: 'BOREAL: ~2.000 kg menos que lo proyectado'. Si no dio cifras, describe el cambio igual: 'GARCICA: cosecha atrasada aprox. una semana'."
             }
         },
         "required": ["resultado"]
@@ -1786,6 +1786,16 @@ herramienta registrar_respuesta_cuestionario para ACTUALIZAR lo registrado: resu
 con el detalle nuevo COMPLETO (reemplaza al anterior, no lo complementa), o "confirmado" si vuelve
 a la proyección original. Si el mensaje es una consulta normal que no tiene relación con el
 cuestionario, atiéndela con las demás herramientas como siempre.
+"""
+    else:
+        nota_cuestionario = """
+REPORTES DE AJUSTE: este usuario no tiene ningún cuestionario de proyección vigente ahora, pero
+IGUAL puede reportar en cualquier momento que su cosecha va a venir distinta de lo proyectado
+(ej. "la boreal viene con 2.000 kilos menos", "la garcica se atrasó una semana", "es solo una
+corrección para avisar a los EAS"). Cuando el usuario INFORME un cambio así —no cuando pregunte
+por datos— usa la herramienta registrar_respuesta_cuestionario con resultado "ajustado" y el
+detalle concreto: queda registrado y se le avisa al equipo EAS. NUNCA le digas que no puedes
+registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con esa herramienta.
 """
 
     return f"""Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
@@ -2072,7 +2082,9 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
         messages.append({"role": "user", "content": texto_mensaje})
 
         cuestionario_activo = obtener_cuestionario_activo(numero_sender) if numero_sender else None
-        tools = (TOOLS + [TOOL_REGISTRAR_CUESTIONARIO]) if cuestionario_activo else TOOLS
+        # La herramienta de reporte va siempre: un ajuste de proyección se avisa cuando pasa,
+        # no solo mientras hay un cuestionario vigente.
+        tools = (TOOLS + [TOOL_REGISTRAR_CUESTIONARIO]) if numero_sender else TOOLS
 
         response = claude_client.messages.create(
             model="claude-sonnet-5",
@@ -2260,25 +2272,42 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
     lo registrado y vuelve a avisar al EAS. La llama Claude vía la herramienta
     registrar_respuesta_cuestionario; lo que retorna se le envía al usuario."""
     if not numero:
-        return "No pude asociar tu respuesta a un cuestionario (falta el número de origen)."
-    activo = obtener_cuestionario_activo(numero)
-    if not activo:
-        return "No tienes ningún cuestionario vigente para responder o corregir."
+        return "No pude asociar tu reporte a un número de origen."
     if resultado not in ("confirmado", "ajustado"):
-        resultado = "confirmado"
-    es_correccion = activo.get("estado") != "pendiente"
+        resultado = "ajustado"
+    activo = obtener_cuestionario_activo(numero)
+    if not activo and resultado == "confirmado":
+        # "confirmo" sin cuestionario que confirmar no tiene qué registrar.
+        return "No tienes ningún cuestionario de proyección vigente para confirmar."
+    es_correccion = bool(activo) and activo.get("estado") != "pendiente"
+    es_espontaneo = not activo
     try:
         conn = sqlite3.connect(DB_LOCAL_PATH)
-        conn.execute(
-            "UPDATE cuestionarios SET estado = ?, respuesta = ?, ajuste = ?, "
-            "fecha_hora_respuesta = datetime('now', 'localtime') WHERE id = ?",
-            (resultado, texto_usuario, detalle_ajuste, activo["id"])
-        )
+        if activo:
+            conn.execute(
+                "UPDATE cuestionarios SET estado = ?, respuesta = ?, ajuste = ?, "
+                "fecha_hora_respuesta = datetime('now', 'localtime') WHERE id = ?",
+                (resultado, texto_usuario, detalle_ajuste, activo["id"])
+            )
+        else:
+            # Reporte fuera de cuestionario: se guarda como una fila propia, con turno
+            # 'espontaneo', para que quede en el mismo historial que el resto.
+            conn.execute(
+                "INSERT INTO cuestionarios (numero, turno, mensaje, estado, respuesta, ajuste, "
+                "fecha_hora_respuesta) VALUES (?, 'espontaneo', ?, ?, ?, ?, datetime('now', 'localtime'))",
+                (
+                    normalizar_numero(numero),
+                    "(reporte espontáneo del usuario, sin cuestionario previo)",
+                    resultado,
+                    texto_usuario,
+                    detalle_ajuste,
+                )
+            )
         conn.commit()
         conn.close()
     except Exception as e:
         logger.error(f"Error registrando respuesta de cuestionario: {str(e)}")
-        return "Tuve un problema registrando tu respuesta. Intenta de nuevo en un momento."
+        return "Tuve un problema registrando tu reporte. Intenta de nuevo en un momento."
 
     if resultado == "ajustado":
         notificar_ajuste_cuestionario(
@@ -2287,6 +2316,8 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         detalle = f":\n{detalle_ajuste}" if detalle_ajuste else "."
         if es_correccion:
             return f"✅ Corrección registrada{detalle}\nGracias, reemplacé lo anterior y le avisamos al equipo EAS."
+        if es_espontaneo:
+            return f"✅ Reporte registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS."
         return f"✅ Ajuste registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS."
     if es_correccion:
         return "✅ Listo, dejé la proyección registrada como confirmada (sin ajustes)."
