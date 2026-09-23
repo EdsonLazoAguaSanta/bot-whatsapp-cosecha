@@ -133,13 +133,30 @@ def inicializar_db_local():
             fecha_estado TEXT
         )
     """)
-    # Migración Fase 2: rol/perfil por número (admin | eas | zonal | productor) y productor
-    # asociado opcional (para acotar el cuestionario de proyección a su campo).
+    # Fundos (productores) que cada número tiene asignados. Zonal y productor solo pueden
+    # consultar y recibir información de los suyos; admin, gerencia y EAS ven todo.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS numeros_fundos (
+            numero TEXT,
+            fundo TEXT,
+            PRIMARY KEY (numero, fundo)
+        )
+    """)
     columnas = [fila[1] for fila in conn.execute("PRAGMA table_info(numeros_permitidos)")]
     if "rol" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN rol TEXT DEFAULT 'productor'")
     if "productor" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN productor TEXT")
+    # Gerencia y EAS solo reciben envíos automáticos si se les activa explícitamente
+    # ("reciben notificaciones sólo si lo necesitan").
+    if "recibe_notificaciones" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN recibe_notificaciones INTEGER DEFAULT 0")
+    # Migración: el productor único que había antes pasa a ser el primer fundo asignado.
+    conn.execute("""
+        INSERT OR IGNORE INTO numeros_fundos (numero, fundo)
+        SELECT numero, productor FROM numeros_permitidos
+        WHERE productor IS NOT NULL AND TRIM(productor) <> ''
+    """)
     conn.commit()
     conn.close()
 
@@ -168,44 +185,145 @@ def numero_esta_permitido(numero):
         logger.error(f"Error verificando número permitido: {str(e)}")
         return False
 
-# Roles: admin gestiona el bot y recibe todos los envíos en modo prueba; eas recibe las
-# alertas de desviación; zonal y productor reciben los cuestionarios de proyección.
-# Todos los números permitidos, sin importar el rol, pueden hacer consultas.
-ROLES_VALIDOS = ("admin", "eas", "zonal", "productor")
+# Perfiles:
+#   admin     - solo Edson: ve y hace todo, y recibe siempre los avisos del EAS.
+#   gerencia  - consulta toda la información; recibe avisos solo si se le activa.
+#   eas       - consulta toda la información de todos los productores; avisos solo si se activa.
+#   zonal     - consulta solo SUS fundos; recibe avisos de ajuste y el resumen semanal.
+#   productor - consulta solo SUS fundos, responde cuestionarios y reporta correcciones.
+ROLES_VALIDOS = ("admin", "gerencia", "eas", "zonal", "productor")
+# Roles sin restricción de fundos (ven la información de todos los productores).
+ROLES_VEN_TODO = ("admin", "gerencia", "eas")
+# Roles cuyo acceso se limita a los fundos que tengan asignados.
+ROLES_ACOTADOS = ("zonal", "productor")
 ROL_POR_DEFECTO = "productor"
 
-def agregar_numero_permitido(numero, nombre=None, rol=None, productor=None):
-    """Inserta o actualiza un número. rol y productor solo se cambian si vienen explícitos,
-    para no pisar el rol existente al re-agregar un número solo para cambiarle el nombre."""
+def agregar_numero_permitido(numero, nombre=None, rol=None, productor=None, recibe_notificaciones=None):
+    """Inserta o actualiza un número. Los campos que vengan en None no se tocan, para no
+    pisar lo existente al re-agregar un número solo para cambiarle el nombre. `productor`
+    se agrega como un fundo más (un número puede tener varios)."""
     conn = sqlite3.connect(DB_LOCAL_PATH)
     num = normalizar_numero(numero)
     existe = conn.execute("SELECT 1 FROM numeros_permitidos WHERE numero = ?", (num,)).fetchone()
     if existe:
         conn.execute(
-            "UPDATE numeros_permitidos SET nombre = COALESCE(?, nombre), "
-            "rol = COALESCE(?, rol), productor = COALESCE(?, productor) WHERE numero = ?",
-            (nombre, rol, productor, num)
+            "UPDATE numeros_permitidos SET nombre = COALESCE(?, nombre), rol = COALESCE(?, rol), "
+            "recibe_notificaciones = COALESCE(?, recibe_notificaciones) WHERE numero = ?",
+            (nombre, rol, recibe_notificaciones, num)
         )
     else:
         conn.execute(
-            "INSERT INTO numeros_permitidos (numero, nombre, rol, productor) VALUES (?, ?, ?, ?)",
-            (num, nombre, rol or ROL_POR_DEFECTO, productor)
+            "INSERT INTO numeros_permitidos (numero, nombre, rol, recibe_notificaciones) "
+            "VALUES (?, ?, ?, ?)",
+            (num, nombre, rol or ROL_POR_DEFECTO, recibe_notificaciones or 0)
         )
     conn.commit()
     conn.close()
+    if productor:
+        asignar_fundos(num, [productor])
 
-def numeros_por_rol(roles):
-    """Números permitidos cuyo rol está en `roles` (tupla/lista de roles)."""
+def rol_de(numero):
+    """Rol del número, o None si no tiene acceso."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT rol FROM numeros_permitidos WHERE numero = ?", (normalizar_numero(numero),)
+        ).fetchone()
+        conn.close()
+        return (fila[0] or ROL_POR_DEFECTO) if fila else None
+    except Exception as e:
+        logger.error(f"Error obteniendo rol: {str(e)}")
+        return None
+
+def fundos_de(numero):
+    """Fundos (productores) asignados a ese número."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        filas = conn.execute(
+            "SELECT fundo FROM numeros_fundos WHERE numero = ? ORDER BY fundo",
+            (normalizar_numero(numero),)
+        ).fetchall()
+        conn.close()
+        return [f[0] for f in filas]
+    except Exception as e:
+        logger.error(f"Error obteniendo fundos: {str(e)}")
+        return []
+
+def asignar_fundos(numero, fundos, reemplazar=False):
+    """Asigna fundos a un número. Con reemplazar=True deja exactamente los indicados."""
+    num = normalizar_numero(numero)
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    if reemplazar:
+        conn.execute("DELETE FROM numeros_fundos WHERE numero = ?", (num,))
+    for fundo in fundos:
+        fundo = (fundo or "").strip()
+        if fundo:
+            conn.execute(
+                "INSERT OR IGNORE INTO numeros_fundos (numero, fundo) VALUES (?, ?)", (num, fundo)
+            )
+    conn.commit()
+    conn.close()
+
+def quitar_fundo(numero, fundo):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    cursor = conn.execute(
+        "DELETE FROM numeros_fundos WHERE numero = ? AND fundo = ?",
+        (normalizar_numero(numero), (fundo or "").strip())
+    )
+    eliminado = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return eliminado
+
+def alcance_de(numero):
+    """Qué fundos puede consultar ese número:
+       None      -> sin restricción (admin, gerencia, eas)
+       []        -> rol acotado SIN fundos asignados: no debe ver nada
+       [fundos]  -> rol acotado, solo esos fundos
+    """
+    rol = rol_de(numero)
+    if rol is None or rol in ROLES_VEN_TODO:
+        return None
+    return fundos_de(numero)
+
+def _sql_alcance(alcance):
+    """Condición SQL que limita una consulta a los fundos permitidos, como (sql, params).
+    Es la barrera que impide que un zonal o productor vea fundos que no son suyos."""
+    if alcance is None:
+        return None, []
+    if not alcance:
+        # Rol acotado sin fundos asignados: no puede ver ninguna fila.
+        return "1 = 0", []
+    ors = " OR ".join(["Productor LIKE ?"] * len(alcance))
+    return f"({ors})", [f"%{f}%" for f in alcance]
+
+MENSAJE_SIN_FUNDOS = (
+    "Todavía no tienes fundos asignados, así que no puedo mostrarte información. "
+    "Pídele a quien administra el asistente que te asigne tus fundos."
+)
+
+def numeros_por_rol(roles, solo_con_notificaciones=False):
+    """Números permitidos cuyo rol está en `roles`, con sus fundos asignados.
+    Con solo_con_notificaciones=True descarta los que tengan el aviso desactivado
+    (gerencia y EAS parten apagados: reciben 'solo si lo necesitan')."""
     conn = sqlite3.connect(DB_LOCAL_PATH)
     conn.row_factory = sqlite3.Row
     marcadores = ",".join("?" for _ in roles)
     cursor = conn.execute(
-        f"SELECT numero, nombre, rol, productor FROM numeros_permitidos WHERE rol IN ({marcadores})",
+        f"SELECT numero, nombre, rol, recibe_notificaciones FROM numeros_permitidos "
+        f"WHERE rol IN ({marcadores})",
         list(roles)
     )
     filas = [dict(row) for row in cursor.fetchall()]
     conn.close()
-    return filas
+    resultado = []
+    for fila in filas:
+        rol = fila["rol"] or ROL_POR_DEFECTO
+        if solo_con_notificaciones and rol in ("gerencia", "eas") and not fila["recibe_notificaciones"]:
+            continue
+        fila["fundos"] = fundos_de(fila["numero"])
+        resultado.append(fila)
+    return resultado
 
 def quitar_numero_permitido(numero):
     conn = sqlite3.connect(DB_LOCAL_PATH)
@@ -218,8 +336,14 @@ def quitar_numero_permitido(numero):
 def listar_numeros_permitidos():
     conn = sqlite3.connect(DB_LOCAL_PATH)
     conn.row_factory = sqlite3.Row
-    cursor = conn.execute("SELECT numero, nombre, rol, productor, fecha_agregado FROM numeros_permitidos ORDER BY fecha_agregado DESC")
+    cursor = conn.execute(
+        "SELECT numero, nombre, rol, recibe_notificaciones, fecha_agregado "
+        "FROM numeros_permitidos ORDER BY fecha_agregado DESC"
+    )
     filas = [dict(row) for row in cursor.fetchall()]
+    for fila in filas:
+        fila["fundos"] = fundos_de(fila["numero"])
+        fila["ve_todo"] = (fila["rol"] or ROL_POR_DEFECTO) in ROLES_VEN_TODO
     conn.close()
     return filas
 
@@ -369,7 +493,7 @@ def formatear_kg(valor):
     """Formatea un entero con separador de miles al estilo chileno (punto)"""
     return f"{int(valor):,}".replace(",", ".")
 
-def obtener_bins_estimados(variedad, fuente_estimado=None, temporada=None):
+def obtener_bins_estimados(variedad, fuente_estimado=None, temporada=None, alcance=None):
     """Consulta: ¿Cuántos kg se estiman cosechar de [variedad] en una temporada? Por defecto usa
     la temporada vigente y Estim Primavera; fuente_estimado puede forzar 'trisemanal' o
     'invierno' explícitamente, y temporada puede pedir una temporada distinta a la vigente
@@ -384,14 +508,16 @@ def obtener_bins_estimados(variedad, fuente_estimado=None, temporada=None):
             return "Error de conexión a base de datos"
 
         cursor = conn.cursor()
-        query = """
+        sql_alc, params_alc = _sql_alcance(alcance)
+        query = f"""
         SELECT SUM(KgsRecepcionados) as total
         FROM [Recepcion_Consolidada]
         WHERE Variedad LIKE ?
         AND [Base Origen] = ?
         AND Temporada = ?
+        {"AND " + sql_alc if sql_alc else ""}
         """
-        cursor.execute(query, (f"%{variedad}%", base, temporada))
+        cursor.execute(query, [f"%{variedad}%", base, temporada] + params_alc)
         resultado = cursor.fetchone()
         conn.close()
 
@@ -404,7 +530,7 @@ def obtener_bins_estimados(variedad, fuente_estimado=None, temporada=None):
         logger.error(f"Error en obtener_bins_estimados: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def obtener_cosecha_actual(variedad, fecha=None):
+def obtener_cosecha_actual(variedad, fecha=None, alcance=None):
     """Consulta: ¿Cuántos kg se cosecharon (real) de [variedad] en una fecha? (default: hoy). fecha en formato YYYY-MM-DD"""
     try:
         conn = conectar_sql()
@@ -412,14 +538,16 @@ def obtener_cosecha_actual(variedad, fecha=None):
             return "Error de conexión a base de datos"
 
         cursor = conn.cursor()
-        query = """
+        sql_alc, params_alc = _sql_alcance(alcance)
+        query = f"""
         SELECT SUM(KgsRecepcionados) as total
         FROM [Recepcion_Consolidada]
         WHERE Variedad LIKE ?
         AND [Base Origen] = ?
         AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE))
+        {"AND " + sql_alc if sql_alc else ""}
         """
-        cursor.execute(query, (f"%{variedad}%", BASE_ORIGEN_REAL, fecha))
+        cursor.execute(query, [f"%{variedad}%", BASE_ORIGEN_REAL, fecha] + params_alc)
         resultado = cursor.fetchone()
         conn.close()
 
@@ -436,7 +564,7 @@ def obtener_calibre_promedio(variedad, ano=2025):
     """Consulta: ¿Cuál fue el calibre promedio de [variedad] el año pasado?"""
     return f"📏 Consulta de calibre para {variedad.upper()} aún no disponible: falta confirmar con Erick en qué tabla vive el dato de calibre."
 
-def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estimado=None):
+def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estimado=None, alcance=None):
     """Consulta: ¿Cómo vamos de [variedad] respecto a lo estimado, en una fecha? (default: hoy).
     fecha en formato YYYY-MM-DD. Por defecto compara contra Estim Primavera; fuente_estimado
     puede forzar 'trisemanal' o 'invierno' explícitamente."""
@@ -448,20 +576,22 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estim
 
         cursor = conn.cursor()
 
+        sql_alc, params_alc = _sql_alcance(alcance)
+        filtro_alc = f" AND {sql_alc}" if sql_alc else ""
         cursor.execute(
-            """SELECT SUM(KgsRecepcionados) FROM [Recepcion_Consolidada]
+            f"""SELECT SUM(KgsRecepcionados) FROM [Recepcion_Consolidada]
                WHERE Variedad LIKE ? AND [Base Origen] = ?
-               AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE))""",
-            (f"%{variedad}%", base, fecha)
+               AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE)){filtro_alc}""",
+            [f"%{variedad}%", base, fecha] + params_alc
         )
         fila = cursor.fetchone()
         estimado = fila[0] if fila and fila[0] else 0
 
         cursor.execute(
-            """SELECT SUM(KgsRecepcionados) FROM [Recepcion_Consolidada]
+            f"""SELECT SUM(KgsRecepcionados) FROM [Recepcion_Consolidada]
                WHERE Variedad LIKE ? AND [Base Origen] = ?
-               AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE))""",
-            (f"%{variedad}%", BASE_ORIGEN_REAL, fecha)
+               AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE)){filtro_alc}""",
+            [f"%{variedad}%", BASE_ORIGEN_REAL, fecha] + params_alc
         )
         fila = cursor.fetchone()
         real = fila[0] if fila and fila[0] else 0
@@ -489,7 +619,7 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estim
         logger.error(f"Error en obtener_comparacion_estimado_vs_cosechado: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def obtener_resumen_por_productor(productor):
+def obtener_resumen_por_productor(productor, alcance=None):
     """Consulta: ¿Cuánto ha cosechado (real) el productor [productor] esta temporada?"""
     try:
         conn = conectar_sql()
@@ -497,14 +627,16 @@ def obtener_resumen_por_productor(productor):
             return "Error de conexión a base de datos"
 
         cursor = conn.cursor()
-        query = """
+        sql_alc, params_alc = _sql_alcance(alcance)
+        query = f"""
         SELECT SUM(KgsRecepcionados) as total, COUNT(DISTINCT Variedad) as variedades
         FROM [Recepcion_Consolidada]
         WHERE Productor LIKE ?
         AND [Base Origen] = ?
         AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+        {"AND " + sql_alc if sql_alc else ""}
         """
-        cursor.execute(query, (f"%{productor}%", BASE_ORIGEN_REAL))
+        cursor.execute(query, [f"%{productor}%", BASE_ORIGEN_REAL] + params_alc)
         resultado = cursor.fetchone()
         conn.close()
 
@@ -516,7 +648,7 @@ def obtener_resumen_por_productor(productor):
         logger.error(f"Error en obtener_resumen_por_productor: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def obtener_resumen_por_packing(packing):
+def obtener_resumen_por_packing(packing, alcance=None):
     """Consulta: ¿Cuánto ha recibido (real) el packing [packing] esta temporada?"""
     try:
         conn = conectar_sql()
@@ -524,14 +656,16 @@ def obtener_resumen_por_packing(packing):
             return "Error de conexión a base de datos"
 
         cursor = conn.cursor()
-        query = """
+        sql_alc, params_alc = _sql_alcance(alcance)
+        query = f"""
         SELECT SUM(KgsRecepcionados) as total, COUNT(DISTINCT Variedad) as variedades
         FROM [Recepcion_Consolidada]
         WHERE Packing LIKE ?
         AND [Base Origen] = ?
         AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+        {"AND " + sql_alc if sql_alc else ""}
         """
-        cursor.execute(query, (f"%{packing}%", BASE_ORIGEN_REAL))
+        cursor.execute(query, [f"%{packing}%", BASE_ORIGEN_REAL] + params_alc)
         resultado = cursor.fetchone()
         conn.close()
 
@@ -622,7 +756,7 @@ def formatear_comparativo_estimaciones(filas, fecha_inicio, fecha_fin, filtro_de
     lineas.append("\n".join(resumen))
     return "\n".join(lineas)
 
-def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None, packing=None, fecha_inicio=None, fecha_fin=None, envase=None, temporada=None):
+def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None, packing=None, fecha_inicio=None, fecha_fin=None, envase=None, temporada=None, alcance=None):
     """
     Comparativo Estim Invierno vs Estim Primavera vs Real (Recepción Planta), agrupado por
     variedad, con diferencias y %. Por defecto usa toda la temporada vigente completa (no solo
@@ -656,6 +790,10 @@ def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None
 
         condiciones = ["[Base Origen] IN (?, ?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
         params = [BASE_ORIGEN_ESTIM_INVIERNO, BASE_ORIGEN_ESTIM_PRIMAVERA, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        sql_alc, params_alc = _sql_alcance(alcance)
+        if sql_alc:
+            condiciones.append(sql_alc)
+            params.extend(params_alc)
         filtro_desc = ""
         if especie:
             condiciones.append("Especie LIKE ?")
@@ -854,7 +992,7 @@ def formatear_cosecha_detalle(filas, fecha_inicio, fecha_fin, filtro_desc="", mo
     )
     return "\n".join(lineas)
 
-def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, grupo=None, forzar_fechas=False, envase=None, temporada=None, fuente_estimado=None):
+def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, variedad=None, productor=None, packing=None, grupo=None, forzar_fechas=False, envase=None, temporada=None, fuente_estimado=None, alcance=None):
     """
     Detalle de cosecha entre fecha_inicio y fecha_fin (o solo fecha_inicio si no hay fecha_fin),
     con columnas de estimado y real (Recepción Planta) por fecha, agrupado por
@@ -901,6 +1039,10 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
 
         condiciones = ["[Base Origen] IN (?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
         params = [base_estimado, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        sql_alc, params_alc = _sql_alcance(alcance)
+        if sql_alc:
+            condiciones.append(sql_alc)
+            params.extend(params_alc)
         filtro_desc = ""
         if especie:
             condiciones.append("Especie LIKE ?")
@@ -1100,7 +1242,7 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
 
 def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, especie=None, variedad=None,
                               productor=None, packing=None, grupo=None, envase=None, temporada=None,
-                              fuente_estimado=None, kg_por_caja_eq=None):
+                              fuente_estimado=None, kg_por_caja_eq=None, alcance=None):
     """
     Consulta genérica: agrupa por las dimensiones exactas que se pidan (cualquier combinación
     de especie/variedad/productor/packing/grupo/fecha, o ninguna si se pide solo el total),
@@ -1138,6 +1280,10 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
 
         condiciones = ["[Base Origen] IN (?, ?)", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
         params = [base_estimado, BASE_ORIGEN_REAL, fecha_inicio, fecha_fin]
+        sql_alc, params_alc = _sql_alcance(alcance)
+        if sql_alc:
+            condiciones.append(sql_alc)
+            params.extend(params_alc)
         filtro_desc = ""
         if especie:
             condiciones.append("Especie LIKE ?")
@@ -1169,7 +1315,8 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
             # convierte con el factor que dé el usuario, porque los kg/caja que se podrían
             # derivar de la base son inconsistentes (de 8 a 254.000 kg/caja por filas dobles).
             if _es_caja_eq(envase) and not hay_datos_caja_eq(
-                conn, fecha_inicio, fecha_fin, especie, variedad, productor, packing, grupo
+                conn, fecha_inicio, fecha_fin, especie, variedad, productor, packing, grupo,
+                alcance=alcance
             ):
                 if not kg_por_caja_eq:
                     conn.close()
@@ -1239,12 +1386,16 @@ def _pregunta_kg_por_caja_eq(que):
     )
 
 def hay_datos_caja_eq(conn, fecha_inicio, fecha_fin, especie=None, variedad=None,
-                      productor=None, packing=None, grupo=None):
+                      productor=None, packing=None, grupo=None, alcance=None):
     """¿Hay filas con envase CAJA EQ para esos filtros y periodo? Si las hay se consulta
     directo la columna Bultos; si no, hay que convertir desde kilos."""
     try:
         condiciones = ["Envase LIKE '%CAJA EQ%'", "CAST(Fecha AS DATE) BETWEEN ? AND ?"]
         params = [fecha_inicio, fecha_fin]
+        sql_alc, params_alc = _sql_alcance(alcance)
+        if sql_alc:
+            condiciones.append(sql_alc)
+            params.extend(params_alc)
         for columna, valor in (
             ("Especie", especie), ("Variedad", variedad), ("Productor", productor),
             ("Packing", packing), ("Grupo", grupo),
@@ -1262,7 +1413,7 @@ def hay_datos_caja_eq(conn, fecha_inicio, fecha_fin, especie=None, variedad=None
         logger.error(f"Error verificando datos de CAJA EQ: {str(e)}")
         return False
 
-def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo):
+def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo, alcance=None):
     """Función compartida: encuentra la primera (MIN) o última (MAX) fecha con cosecha real."""
     try:
         conn = conectar_sql()
@@ -1272,6 +1423,10 @@ def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, u
         cursor = conn.cursor()
         condiciones = ["[Base Origen] = ?", "KgsRecepcionados > 0"]
         params = [BASE_ORIGEN_REAL]
+        sql_alc, params_alc = _sql_alcance(alcance)
+        if sql_alc:
+            condiciones.append(sql_alc)
+            params.extend(params_alc)
         if especie:
             condiciones.append("Especie LIKE ?")
             params.append(f"%{especie}%")
@@ -1306,11 +1461,11 @@ def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, u
         logger.error(f"Error en _obtener_extremo_cosecha: {str(e)}")
         return f"Error al consultar: {str(e)}"
 
-def obtener_ultima_cosecha(especie=None, variedad=None, packing=None, productor=None, temporada=None):
+def obtener_ultima_cosecha(especie=None, variedad=None, packing=None, productor=None, temporada=None, alcance=None):
     """Encuentra la última (más reciente) fecha con cosecha real, y muestra su detalle"""
-    return _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo=True)
+    return _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo=True, alcance=alcance)
 
-def obtener_primera_cosecha(especie=None, variedad=None, packing=None, productor=None, temporada=None):
+def obtener_primera_cosecha(especie=None, variedad=None, packing=None, productor=None, temporada=None, alcance=None):
     """
     Encuentra la primera fecha con cosecha real (cuándo empezó), y muestra su detalle.
     Si no se especifica temporada, se limita a la temporada vigente por defecto (a diferencia
@@ -1318,7 +1473,7 @@ def obtener_primera_cosecha(especie=None, variedad=None, packing=None, productor
     no la primera vez registrada en toda la historia).
     """
     temporada = temporada or TEMPORADA_ACTUAL
-    return _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo=False)
+    return _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, usar_maximo=False, alcance=alcance)
 
 # ============================================================================
 # PROCESAMIENTO DE MENSAJES
@@ -1796,7 +1951,7 @@ TOOL_REGISTRAR_CUESTIONARIO = {
     },
 }
 
-def construir_system_prompt(es_audio=False, cuestionario_activo=None):
+def construir_system_prompt(es_audio=False, cuestionario_activo=None, alcance=None):
     if VARIEDADES_CONOCIDAS:
         lista_variedades = ", ".join(VARIEDADES_CONOCIDAS)
     else:
@@ -1891,8 +2046,20 @@ detalle concreto: queda registrado y se le avisa al equipo EAS. NUNCA le digas q
 registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con esa herramienta.
 """
 
+    nota_alcance = ""
+    if alcance:
+        nota_alcance = f"""
+ALCANCE DE ESTE USUARIO: solo tiene acceso a la información de estos fundos/productores:
+{", ".join(alcance)}.
+Las herramientas ya filtran automáticamente por esos fundos, así que los resultados que
+recibas SIEMPRE corresponden solo a ellos: no necesitas agregar filtros ni advertir nada en
+cada respuesta. Si el usuario pregunta por un productor o fundo que NO está en esa lista,
+explícale con naturalidad que solo puedes darle información de los fundos que tiene
+asignados, y nómbraselos. Nunca inventes ni estimes datos de fundos fuera de su alcance.
+"""
+
     return f"""Eres el asistente de WhatsApp de Agua Santa para consultas de cosecha de fruta.
-{nota_audio}{nota_cuestionario}
+{nota_audio}{nota_cuestionario}{nota_alcance}
 
 Hoy es {hoy}. Usa esta fecha como referencia para calcular fechas relativas que mencione el usuario
 ("ayer", "hoy", "mañana", "el lunes pasado", "el 12 de agosto", "entre el 1 y el 15 de agosto", etc.)
@@ -2071,6 +2238,12 @@ no hay ninguna opción remotamente parecida, ahí sí pide que aclare sin sugeri
 el usuario nunca se quede sin poder avanzar la conversación."""
 
 def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None):
+    # Barrera de alcance: zonal y productor solo ven sus fundos. Se calcula aquí, desde el
+    # número que escribe, y NO desde nada que venga en el mensaje o que decida el modelo.
+    alcance = alcance_de(numero_sender) if numero_sender else None
+    if alcance is not None and not alcance:
+        return MENSAJE_SIN_FUNDOS
+
     if tool_name == "registrar_respuesta_cuestionario":
         return registrar_respuesta_cuestionario(
             numero_sender,
@@ -2080,9 +2253,9 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
         )
 
     if tool_name == "consultar_resumen_productor":
-        return obtener_resumen_por_productor(tool_input.get("productor", ""))
+        return obtener_resumen_por_productor(tool_input.get("productor", ""), alcance=alcance)
     if tool_name == "consultar_resumen_packing":
-        return obtener_resumen_por_packing(tool_input.get("packing", ""))
+        return obtener_resumen_por_packing(tool_input.get("packing", ""), alcance=alcance)
 
     if tool_name == "consultar_ultima_cosecha":
         especie = tool_input.get("especie") or None
@@ -2093,6 +2266,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             packing=tool_input.get("packing") or None,
             productor=tool_input.get("productor") or None,
             temporada=tool_input.get("temporada") or None,
+            alcance=alcance,
         )
 
     if tool_name == "consultar_primera_cosecha":
@@ -2104,6 +2278,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             packing=tool_input.get("packing") or None,
             productor=tool_input.get("productor") or None,
             temporada=tool_input.get("temporada") or None,
+            alcance=alcance,
         )
 
     if tool_name == "consultar_cosecha_detalle":
@@ -2121,6 +2296,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
             fuente_estimado=tool_input.get("fuente_estimado") or None,
+            alcance=alcance,
         )
 
     if tool_name == "consultar_comparativo_estimaciones":
@@ -2135,6 +2311,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             fecha_fin=tool_input.get("fecha_fin") or None,
             envase=tool_input.get("envase") or None,
             temporada=tool_input.get("temporada") or None,
+            alcance=alcance,
         )
 
     if tool_name == "consultar_cosecha_flexible":
@@ -2153,19 +2330,20 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             temporada=tool_input.get("temporada") or None,
             fuente_estimado=tool_input.get("fuente_estimado") or None,
             kg_por_caja_eq=tool_input.get("kg_por_caja_eq") or None,
+            alcance=alcance,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
     fecha = tool_input.get("fecha") or None
     fuente_estimado = tool_input.get("fuente_estimado") or None
     if tool_name == "consultar_bins_estimados":
-        return obtener_bins_estimados(variedad, fuente_estimado=fuente_estimado, temporada=tool_input.get("temporada") or None)
+        return obtener_bins_estimados(variedad, fuente_estimado=fuente_estimado, temporada=tool_input.get("temporada") or None, alcance=alcance)
     elif tool_name == "consultar_cosecha_hoy":
-        return obtener_cosecha_actual(variedad, fecha)
+        return obtener_cosecha_actual(variedad, fecha, alcance=alcance)
     elif tool_name == "consultar_calibre_promedio":
         return obtener_calibre_promedio(variedad)
     elif tool_name == "comparar_estimado_vs_cosechado":
-        return obtener_comparacion_estimado_vs_cosechado(variedad, fecha, fuente_estimado=fuente_estimado)
+        return obtener_comparacion_estimado_vs_cosechado(variedad, fecha, fuente_estimado=fuente_estimado, alcance=alcance)
     return "No supe qué información buscar para esa pregunta."
 
 def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
@@ -2196,7 +2374,11 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
             # presupuesto completo en el bloque de "thinking" antes de terminar el tool_use,
             # devolviendo una respuesta trunca (stop_reason="max_tokens") sin tool_use ni texto.
             max_tokens=1500,
-            system=construir_system_prompt(es_audio, cuestionario_activo=cuestionario_activo),
+            system=construir_system_prompt(
+                es_audio,
+                cuestionario_activo=cuestionario_activo,
+                alcance=alcance_de(numero_sender) if numero_sender else None,
+            ),
             tools=tools,
             messages=messages,
         )
@@ -2383,10 +2565,24 @@ def enviar_whatsapp(numero_destino, mensaje_texto):
 def destinatarios_envios(roles):
     """Destinatarios de un envío automático según rol. En modo prueba
     (ENVIOS_AUTOMATICOS_PRODUCCION != "1") todo envío va SOLO a los admin,
-    sin importar los roles pedidos."""
+    sin importar los roles pedidos. Gerencia y EAS quedan fuera salvo que tengan
+    activadas las notificaciones."""
     if not ENVIOS_AUTOMATICOS_PRODUCCION:
         return numeros_por_rol(("admin",))
-    return numeros_por_rol(roles)
+    return numeros_por_rol(roles, solo_con_notificaciones=True)
+
+def _sin_fundos_asignados(destinatario):
+    """True si es un rol acotado (zonal/productor) sin fundos: NO debe recibir el envío.
+    Sin esta comprobación una lista de fundos vacía no filtra nada y la persona recibiría
+    lo previsto de todos los productores."""
+    rol = (destinatario.get("rol") or ROL_POR_DEFECTO)
+    return rol in ROLES_ACOTADOS and not destinatario.get("fundos")
+
+def _fundo_coincide(fundo_asignado, texto):
+    """¿El fundo asignado aparece en ese texto? (comparación laxa, como los filtros LIKE)."""
+    if not fundo_asignado or not texto:
+        return False
+    return fundo_asignado.strip().upper() in str(texto).upper()
 
 def registrar_cuestionario_enviado(numero, turno, mensaje):
     conn = sqlite3.connect(DB_LOCAL_PATH)
@@ -2480,16 +2676,30 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
     return "✅ Proyección confirmada, quedó registrada. ¡Gracias!"
 
 def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False):
-    """Aviso inmediato al EAS (o solo admin en modo prueba) cuando alguien ajusta su proyección."""
+    """Aviso inmediato cuando alguien ajusta su proyección: siempre al admin, a gerencia y
+    EAS si tienen las notificaciones activadas, y a los zonales que tengan asignado alguno
+    de los fundos de quien reporta (un zonal solo se entera de lo suyo)."""
     try:
         num = normalizar_numero(numero_origen)
         info = next((n for n in listar_numeros_permitidos() if n["numero"] == num), None)
         quien = (info.get("nombre") if info else None) or num
+        fundos_origen = fundos_de(num)
         if es_correccion:
             mensaje = f"📝 CORRECCIÓN de proyección de {quien} (+{num}), reemplaza su reporte anterior:\n\n{detalle}"
         else:
             mensaje = f"📝 Ajuste de proyección reportado por {quien} (+{num}):\n\n{detalle}"
-        destinatarios = [d for d in destinatarios_envios(("eas", "admin")) if d["numero"] != num]
+
+        destinatarios = destinatarios_envios(("eas", "admin", "gerencia"))
+        if ENVIOS_AUTOMATICOS_PRODUCCION:
+            # Zonales: solo los que comparten fundo con quien reporta.
+            for zonal in numeros_por_rol(("zonal",)):
+                comparte = any(
+                    _fundo_coincide(f_zonal, f_origen)
+                    for f_zonal in zonal["fundos"] for f_origen in fundos_origen
+                )
+                if comparte and zonal["numero"] not in {d["numero"] for d in destinatarios}:
+                    destinatarios.append(zonal)
+        destinatarios = [d for d in destinatarios if d["numero"] != num]
         # Solo se registran los que Meta aceptó: antes se anotaba el aviso como enviado
         # aunque el envío hubiera fallado, y el panel mostraba entregas que nunca ocurrieron.
         aceptados = [d for d in destinatarios if enviar_whatsapp(d["numero"], mensaje)]
@@ -2503,7 +2713,7 @@ def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False):
 
 MAX_SECCIONES_CUESTIONARIO = 12
 
-def obtener_previsto(fecha_inicio, fecha_fin, productor=None):
+def obtener_previsto(fecha_inicio, fecha_fin, fundos=None):
     """Filas previstas por la fuente del cuestionario (Trisemanal) entre dos fechas, como
     (productor, especie, envase, kg, bultos). La base trae filas duplicadas del mismo
     registro —una con Bultos y KgsRecepcionados NULL y otra con ambos—, así que se filtran
@@ -2522,9 +2732,11 @@ def obtener_previsto(fecha_inicio, fecha_fin, productor=None):
             fecha_inicio.strftime("%Y-%m-%d"),
             fecha_fin.strftime("%Y-%m-%d"),
         ]
-        if productor:
-            condiciones.append("Productor LIKE ?")
-            params.append(f"%{productor}%")
+        # `fundos` acota a los fundos de esa persona (un número puede tener varios).
+        fundos = [f for f in (fundos or []) if f]
+        if fundos:
+            condiciones.append("(" + " OR ".join(["Productor LIKE ?"] * len(fundos)) + ")")
+            params.extend(f"%{f}%" for f in fundos)
         cursor = conn.cursor()
         cursor.execute(f"""
             SELECT Productor, Especie, Envase,
@@ -2569,12 +2781,12 @@ def _agrupar_por_productor(filas):
         agrupado.setdefault(productor, []).append((especie, envase, kg, bultos))
     return agrupado
 
-def construir_cuestionario_diario(fecha=None, nombre=None, productor=None):
+def construir_cuestionario_diario(fecha=None, nombre=None, fundos=None):
     """Mensaje de las 08:00: lo previsto para ese día por productor, con el formato
     acordado (Especie | Envase | Kilos | Bultos). None si no hay nada previsto ese día."""
     try:
         fecha = fecha or date.today()
-        filas = obtener_previsto(fecha, fecha, productor=productor)
+        filas = obtener_previsto(fecha, fecha, fundos=fundos)
         if not filas:
             return None
         agrupado = _agrupar_por_productor(filas)
@@ -2600,12 +2812,12 @@ def construir_cuestionario_diario(fecha=None, nombre=None, productor=None):
         logger.error(f"Error construyendo cuestionario diario: {str(e)}")
         return None
 
-def construir_confirmacion_tarde(fecha=None, nombre=None, productor=None, ajuste_previo=None):
+def construir_confirmacion_tarde(fecha=None, nombre=None, fundos=None, ajuste_previo=None):
     """Mensaje de las 15:00: repite lo que quedó informado en la mañana (lo previsto, más
     el ajuste que el usuario haya reportado) y pide confirmarlo al cierre del día."""
     try:
         fecha = fecha or date.today()
-        filas = obtener_previsto(fecha, fecha, productor=productor)
+        filas = obtener_previsto(fecha, fecha, fundos=fundos)
         if not filas:
             return None
         agrupado = _agrupar_por_productor(filas)
@@ -2652,22 +2864,29 @@ def enviar_cuestionarios(turno, fecha=None):
         if not destinatarios:
             logger.warning("Cuestionario: no hay destinatarios (¿ningún número con el rol requerido?)")
             return {"enviados": 0, "sin_datos": 0, "errores": 0, "detalle": "sin destinatarios"}
-        enviados = sin_datos = errores = 0
+        enviados = sin_datos = errores = omitidos = 0
         for d in destinatarios:
+            if _sin_fundos_asignados(d):
+                omitidos += 1
+                logger.warning(
+                    f"Cuestionario {turno}: se omite {d['numero']} ({d.get('nombre')}), "
+                    f"rol {d.get('rol')} sin fundos asignados"
+                )
+                continue
             if turno == "diario_pm":
                 mensaje = construir_confirmacion_tarde(
                     fecha,
                     nombre=d.get("nombre"),
-                    productor=d.get("productor"),
+                    fundos=d.get("fundos"),
                     ajuste_previo=_ajuste_registrado_hoy(d["numero"], fecha),
                 )
             else:
                 mensaje = construir_cuestionario_diario(
-                    fecha, nombre=d.get("nombre"), productor=d.get("productor")
+                    fecha, nombre=d.get("nombre"), fundos=d.get("fundos")
                 )
             if not mensaje:
                 sin_datos += 1
-                logger.info(f"Cuestionario {turno}: sin previsto para {d['numero']} (productor={d.get('productor')})")
+                logger.info(f"Cuestionario {turno}: sin previsto para {d['numero']} (fundos={d.get('fundos')})")
                 continue
             if enviar_whatsapp(d["numero"], mensaje):
                 registrar_cuestionario_enviado(d["numero"], turno, mensaje)
@@ -2676,8 +2895,12 @@ def enviar_cuestionarios(turno, fecha=None):
                 # Falla típica: ventana de 24 h cerrada (error 131047). Para producción hay
                 # que aprobar una plantilla de re-enganche en Meta, como la de bienvenida.
                 errores += 1
-        logger.info(f"Cuestionario {turno}: {enviados} enviados, {sin_datos} sin datos, {errores} errores")
-        return {"enviados": enviados, "sin_datos": sin_datos, "errores": errores}
+        logger.info(
+            f"Cuestionario {turno}: {enviados} enviados, {sin_datos} sin datos, "
+            f"{errores} errores, {omitidos} omitidos por no tener fundos"
+        )
+        return {"enviados": enviados, "sin_datos": sin_datos, "errores": errores,
+                "omitidos_sin_fundos": omitidos}
     except Exception as e:
         logger.error(f"Error en job de cuestionarios: {str(e)}")
         return {"error": str(e)}
@@ -2685,14 +2908,14 @@ def enviar_cuestionarios(turno, fecha=None):
 def _lunes_de(fecha):
     return fecha - timedelta(days=fecha.weekday())
 
-def construir_resumen_semanal(fecha=None, nombre=None, productor=None, para_eas=False):
+def construir_resumen_semanal(fecha=None, nombre=None, fundos=None, para_eas=False):
     """Mensaje de los lunes 08:00: total previsto de la semana. Para el productor va su
     propio desglose por especie; para el EAS, el consolidado por productor."""
     try:
         fecha = fecha or date.today()
         inicio = _lunes_de(fecha)
         fin = inicio + timedelta(days=6)
-        filas = obtener_previsto(inicio, fin, productor=productor)
+        filas = obtener_previsto(inicio, fin, fundos=fundos)
         if not filas:
             return None
         rango = f"del {inicio.strftime('%d-%m')} al {fin.strftime('%d-%m')}"
@@ -2750,9 +2973,16 @@ def enviar_resumen_semanal(fecha=None):
     (todo solo a los admin mientras dure el modo prueba)."""
     try:
         fecha = fecha or date.today()
-        enviados = sin_datos = errores = 0
+        enviados = sin_datos = errores = omitidos = 0
         for d in destinatarios_envios(("zonal", "productor")):
-            mensaje = construir_resumen_semanal(fecha, nombre=d.get("nombre"), productor=d.get("productor"))
+            if _sin_fundos_asignados(d):
+                omitidos += 1
+                logger.warning(
+                    f"Resumen semanal: se omite {d['numero']} ({d.get('nombre')}), "
+                    f"rol {d.get('rol')} sin fundos asignados"
+                )
+                continue
+            mensaje = construir_resumen_semanal(fecha, nombre=d.get("nombre"), fundos=d.get("fundos"))
             if not mensaje:
                 sin_datos += 1
                 continue
@@ -2763,15 +2993,19 @@ def enviar_resumen_semanal(fecha=None):
 
         enviados_eas = 0
         mensaje_eas = construir_resumen_semanal(fecha, para_eas=True)
-        destinatarios_eas = destinatarios_envios(("eas", "admin"))
+        destinatarios_eas = destinatarios_envios(("eas", "admin", "gerencia"))
         if mensaje_eas:
             for d in destinatarios_eas:
                 if enviar_whatsapp(d["numero"], mensaje_eas):
                     enviados_eas += 1
             if destinatarios_eas:
                 registrar_alerta_enviada("resumen_semanal_eas", mensaje_eas, destinatarios_eas)
-        logger.info(f"Resumen semanal: {enviados} a productores, {enviados_eas} al EAS, {sin_datos} sin datos")
-        return {"enviados_productores": enviados, "enviados_eas": enviados_eas, "sin_datos": sin_datos, "errores": errores}
+        logger.info(
+            f"Resumen semanal: {enviados} a productores, {enviados_eas} al EAS, "
+            f"{sin_datos} sin datos, {omitidos} omitidos por no tener fundos"
+        )
+        return {"enviados_productores": enviados, "enviados_eas": enviados_eas,
+                "sin_datos": sin_datos, "errores": errores, "omitidos_sin_fundos": omitidos}
     except Exception as e:
         logger.error(f"Error en job de resumen semanal: {str(e)}")
         return {"error": str(e)}
@@ -2900,7 +3134,7 @@ def enviar_alerta_desviaciones():
             logger.warning("Alerta de desviaciones: sin datos para calcular")
             return {"enviados": 0, "detalle": "sin datos"}
         mensaje, num_desviadas = resultado
-        destinatarios = destinatarios_envios(("eas", "admin"))
+        destinatarios = destinatarios_envios(("eas", "admin", "gerencia"))
         if not destinatarios:
             logger.warning("Alerta de desviaciones: no hay destinatarios")
             return {"enviados": 0, "detalle": "sin destinatarios"}
@@ -3173,8 +3407,9 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol:
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
-    rol: admin | eas | zonal | productor (por defecto: productor).
-    productor: nombre del productor asociado, para acotar su cuestionario de proyección.
+    rol: admin | gerencia | eas | zonal | productor (por defecto: productor).
+    productor: fundo asociado (para zonal/productor, que solo ven los suyos). Para asignar
+    varios usa /admin/numeros/fundos o el parámetro fundos de /admin/numeros/rol.
     Uso: https://bot-whatsapp-asa.com/admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias&rol=zonal
     """
     if clave != ADMIN_CLAVE:
@@ -3207,17 +3442,21 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/admin/numeros/rol")
-async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor: str = None):
+async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor: str = None,
+                            fundos: str = None, notificaciones: int = None):
     """
-    Cambia el rol y/o el productor asociado de un número que ya tiene acceso.
-    Roles: admin (gestiona y recibe todos los envíos en modo prueba), eas (recibe alertas de
-    desviación), zonal y productor (reciben los cuestionarios de proyección).
-    Uso: https://bot-whatsapp-asa.com/admin/numeros/rol?clave=...&numero=56912345678&rol=eas
+    Cambia el rol, los fundos asignados y/o si recibe notificaciones.
+    Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
+    notificaciones=1), zonal y productor (solo SUS fundos).
+    Uso: .../admin/numeros/rol?clave=...&numero=56912345678&rol=zonal&fundos=CARMELO|HUIQUE
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
-    if rol is None and productor is None:
-        return JSONResponse({"status": "error", "error": "Indica rol y/o productor"}, status_code=400)
+    if rol is None and productor is None and fundos is None and notificaciones is None:
+        return JSONResponse(
+            {"status": "error", "error": "Indica al menos rol, fundos, productor o notificaciones"},
+            status_code=400,
+        )
     if rol is not None and rol not in ROLES_VALIDOS:
         return JSONResponse(
             {"status": "error", "error": f"Rol inválido: {rol}. Válidos: {', '.join(ROLES_VALIDOS)}"},
@@ -3226,11 +3465,60 @@ async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor:
     try:
         if not numero_esta_permitido(numero):
             return JSONResponse({"status": "error", "error": "Ese número no está en la lista"}, status_code=404)
-        agregar_numero_permitido(numero, rol=rol, productor=productor)
-        return {"status": "ok", "numero": normalizar_numero(numero), "rol": rol, "productor": productor}
+        agregar_numero_permitido(numero, rol=rol, productor=productor, recibe_notificaciones=notificaciones)
+        if fundos is not None:
+            # Lista separada por "|" porque los nombres de fundo llevan comas y puntos.
+            asignar_fundos(numero, [f for f in fundos.split("|")], reemplazar=True)
+        num = normalizar_numero(numero)
+        return {
+            "status": "ok",
+            "numero": num,
+            "rol": rol_de(num),
+            "fundos": fundos_de(num),
+            "ve_todo": rol_de(num) in ROLES_VEN_TODO,
+        }
     except Exception as e:
         logger.error(f"Error cambiando rol de número: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/admin/numeros/fundos")
+async def admin_fundos(clave: str, numero: str, agregar: str = None, quitar: str = None):
+    """
+    Agrega o quita fundos de un número sin tocar el resto (varios separados por "|").
+    Solo afecta a zonal y productor: admin, gerencia y EAS ven todo igual.
+    Uso: .../admin/numeros/fundos?clave=...&numero=56912345678&agregar=SANTA ANA DE HUIQUE
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if not agregar and not quitar:
+        return JSONResponse({"status": "error", "error": "Indica agregar y/o quitar"}, status_code=400)
+    try:
+        if not numero_esta_permitido(numero):
+            return JSONResponse({"status": "error", "error": "Ese número no está en la lista"}, status_code=404)
+        if agregar:
+            asignar_fundos(numero, agregar.split("|"))
+        if quitar:
+            for f in quitar.split("|"):
+                quitar_fundo(numero, f)
+        num = normalizar_numero(numero)
+        return {"status": "ok", "numero": num, "rol": rol_de(num), "fundos": fundos_de(num)}
+    except Exception as e:
+        logger.error(f"Error cambiando fundos: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+@app.get("/admin/fundos/disponibles")
+async def admin_fundos_disponibles(clave: str, buscar: str = None):
+    """
+    Lista los nombres de productor/fundo tal como están en la base, para asignarlos sin
+    errores de tipeo. Con buscar=texto filtra la lista.
+    Uso: .../admin/fundos/disponibles?clave=...&buscar=carmelo
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    fundos = PRODUCTORES_CONOCIDOS
+    if buscar:
+        fundos = [f for f in fundos if buscar.strip().upper() in f.upper()]
+    return {"total": len(fundos), "fundos": fundos}
 
 def _modo_envios():
     return "produccion" if ENVIOS_AUTOMATICOS_PRODUCCION else "prueba (solo números admin)"
