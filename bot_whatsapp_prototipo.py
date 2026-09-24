@@ -151,6 +151,11 @@ def inicializar_db_local():
     # ("reciben notificaciones sólo si lo necesitan").
     if "recibe_notificaciones" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN recibe_notificaciones INTEGER DEFAULT 0")
+    # Permiso explícito para que un zonal o productor vea TODOS los fundos sin dejar de
+    # tener su rol. Es deliberado y se quita por número; distinto de "no tiene fundos
+    # asignados", que significa que no debe ver nada.
+    if "acceso_total" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN acceso_total INTEGER DEFAULT 0")
     # Migración: el productor único que había antes pasa a ser el primer fundo asignado.
     conn.execute("""
         INSERT OR IGNORE INTO numeros_fundos (numero, fundo)
@@ -198,7 +203,8 @@ ROLES_VEN_TODO = ("admin", "gerencia", "eas")
 ROLES_ACOTADOS = ("zonal", "productor")
 ROL_POR_DEFECTO = "productor"
 
-def agregar_numero_permitido(numero, nombre=None, rol=None, productor=None, recibe_notificaciones=None):
+def agregar_numero_permitido(numero, nombre=None, rol=None, productor=None, recibe_notificaciones=None,
+                             acceso_total=None):
     """Inserta o actualiza un número. Los campos que vengan en None no se tocan, para no
     pisar lo existente al re-agregar un número solo para cambiarle el nombre. `productor`
     se agrega como un fundo más (un número puede tener varios)."""
@@ -208,14 +214,15 @@ def agregar_numero_permitido(numero, nombre=None, rol=None, productor=None, reci
     if existe:
         conn.execute(
             "UPDATE numeros_permitidos SET nombre = COALESCE(?, nombre), rol = COALESCE(?, rol), "
-            "recibe_notificaciones = COALESCE(?, recibe_notificaciones) WHERE numero = ?",
-            (nombre, rol, recibe_notificaciones, num)
+            "recibe_notificaciones = COALESCE(?, recibe_notificaciones), "
+            "acceso_total = COALESCE(?, acceso_total) WHERE numero = ?",
+            (nombre, rol, recibe_notificaciones, acceso_total, num)
         )
     else:
         conn.execute(
-            "INSERT INTO numeros_permitidos (numero, nombre, rol, recibe_notificaciones) "
-            "VALUES (?, ?, ?, ?)",
-            (num, nombre, rol or ROL_POR_DEFECTO, recibe_notificaciones or 0)
+            "INSERT INTO numeros_permitidos (numero, nombre, rol, recibe_notificaciones, acceso_total) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (num, nombre, rol or ROL_POR_DEFECTO, recibe_notificaciones or 0, acceso_total or 0)
         )
     conn.commit()
     conn.close()
@@ -275,14 +282,30 @@ def quitar_fundo(numero, fundo):
     conn.close()
     return eliminado
 
+def tiene_acceso_total(numero):
+    """¿Se le dio permiso explícito de ver todos los fundos pese a tener un rol acotado?"""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT acceso_total FROM numeros_permitidos WHERE numero = ?",
+            (normalizar_numero(numero),)
+        ).fetchone()
+        conn.close()
+        return bool(fila and fila[0])
+    except Exception as e:
+        logger.error(f"Error verificando acceso total: {str(e)}")
+        return False
+
 def alcance_de(numero):
     """Qué fundos puede consultar ese número:
-       None      -> sin restricción (admin, gerencia, eas)
+       None      -> sin restricción (admin, gerencia, eas, o acceso_total explícito)
        []        -> rol acotado SIN fundos asignados: no debe ver nada
        [fundos]  -> rol acotado, solo esos fundos
     """
     rol = rol_de(numero)
     if rol is None or rol in ROLES_VEN_TODO:
+        return None
+    if tiene_acceso_total(numero):
         return None
     return fundos_de(numero)
 
@@ -310,7 +333,7 @@ def numeros_por_rol(roles, solo_con_notificaciones=False):
     conn.row_factory = sqlite3.Row
     marcadores = ",".join("?" for _ in roles)
     cursor = conn.execute(
-        f"SELECT numero, nombre, rol, recibe_notificaciones FROM numeros_permitidos "
+        f"SELECT numero, nombre, rol, recibe_notificaciones, acceso_total FROM numeros_permitidos "
         f"WHERE rol IN ({marcadores})",
         list(roles)
     )
@@ -322,6 +345,7 @@ def numeros_por_rol(roles, solo_con_notificaciones=False):
         if solo_con_notificaciones and rol in ("gerencia", "eas") and not fila["recibe_notificaciones"]:
             continue
         fila["fundos"] = fundos_de(fila["numero"])
+        fila["acceso_total"] = bool(fila["acceso_total"])
         resultado.append(fila)
     return resultado
 
@@ -337,13 +361,13 @@ def listar_numeros_permitidos():
     conn = sqlite3.connect(DB_LOCAL_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
-        "SELECT numero, nombre, rol, recibe_notificaciones, fecha_agregado "
+        "SELECT numero, nombre, rol, recibe_notificaciones, acceso_total, fecha_agregado "
         "FROM numeros_permitidos ORDER BY fecha_agregado DESC"
     )
     filas = [dict(row) for row in cursor.fetchall()]
     for fila in filas:
         fila["fundos"] = fundos_de(fila["numero"])
-        fila["ve_todo"] = (fila["rol"] or ROL_POR_DEFECTO) in ROLES_VEN_TODO
+        fila["ve_todo"] = (fila["rol"] or ROL_POR_DEFECTO) in ROLES_VEN_TODO or bool(fila["acceso_total"])
     conn.close()
     return filas
 
@@ -2572,11 +2596,23 @@ def destinatarios_envios(roles):
     return numeros_por_rol(roles, solo_con_notificaciones=True)
 
 def _sin_fundos_asignados(destinatario):
-    """True si es un rol acotado (zonal/productor) sin fundos: NO debe recibir el envío.
-    Sin esta comprobación una lista de fundos vacía no filtra nada y la persona recibiría
-    lo previsto de todos los productores."""
+    """True si es un rol acotado (zonal/productor) sin fundos NI acceso total: no debe
+    recibir el envío. Sin esta comprobación una lista de fundos vacía no filtra nada y la
+    persona recibiría lo previsto de todos los productores sin que nadie lo haya decidido."""
     rol = (destinatario.get("rol") or ROL_POR_DEFECTO)
-    return rol in ROLES_ACOTADOS and not destinatario.get("fundos")
+    if rol not in ROLES_ACOTADOS:
+        return False
+    if destinatario.get("acceso_total"):
+        return False  # se le dio acceso a todo a propósito
+    return not destinatario.get("fundos")
+
+def _fundos_para_envio(destinatario):
+    """Fundos a usar al armar el mensaje de esa persona. Con acceso total se manda None
+    (sin filtro) aunque tenga algunos asignados, para que el envío coincida con lo que
+    puede consultar."""
+    if destinatario.get("acceso_total") or (destinatario.get("rol") or ROL_POR_DEFECTO) in ROLES_VEN_TODO:
+        return None
+    return destinatario.get("fundos")
 
 def _fundo_coincide(fundo_asignado, texto):
     """¿El fundo asignado aparece en ese texto? (comparación laxa, como los filtros LIKE)."""
@@ -2918,12 +2954,12 @@ def enviar_cuestionarios(turno, fecha=None):
                 mensaje = construir_confirmacion_tarde(
                     fecha,
                     nombre=d.get("nombre"),
-                    fundos=d.get("fundos"),
+                    fundos=_fundos_para_envio(d),
                     ajuste_previo=_ajuste_registrado_hoy(d["numero"], fecha),
                 )
             else:
                 mensaje = construir_cuestionario_diario(
-                    fecha, nombre=d.get("nombre"), fundos=d.get("fundos")
+                    fecha, nombre=d.get("nombre"), fundos=_fundos_para_envio(d)
                 )
             if not mensaje:
                 sin_datos += 1
@@ -2942,7 +2978,7 @@ def enviar_cuestionarios(turno, fecha=None):
             # Ventana cerrada: el texto libre sería rechazado (131047). Se manda la plantilla
             # con las cifras en una línea y la tabla queda guardada para entregarla apenas
             # la persona responda (ver entregar_cuestionario_pendiente).
-            kg, bultos = _totales_previstos(fecha, d.get("fundos"))
+            kg, bultos = _totales_previstos(fecha, _fundos_para_envio(d))
             if enviar_plantilla_cuestionario(d["numero"], d.get("nombre"), kg, bultos):
                 registrar_cuestionario_enviado(d["numero"], turno, mensaje, estado="pendiente_plantilla")
                 por_plantilla += 1
@@ -3035,7 +3071,7 @@ def enviar_resumen_semanal(fecha=None):
                     f"rol {d.get('rol')} sin fundos asignados"
                 )
                 continue
-            mensaje = construir_resumen_semanal(fecha, nombre=d.get("nombre"), fundos=d.get("fundos"))
+            mensaje = construir_resumen_semanal(fecha, nombre=d.get("nombre"), fundos=_fundos_para_envio(d))
             if not mensaje:
                 sin_datos += 1
                 continue
@@ -3532,6 +3568,9 @@ ALIAS_PARAMETROS = {
     "notificacines": "notificaciones",
     "notif": "notificaciones",
     "fundo": "fundos",
+    "acceso": "acceso_total",
+    "accesototal": "acceso_total",
+    "todos_los_fundos": "acceso_total",
 }
 
 def _con_alias(request, valores):
@@ -3575,10 +3614,21 @@ def _estado_numero(numero):
         detalle_notif = "sí" if notif else "no (actívalas con notificaciones=1)"
     else:
         detalle_notif = "sí, según su rol"
+    acceso_total = tiene_acceso_total(num)
+    ve_todo = rol in ROLES_VEN_TODO or acceso_total
+    if rol in ROLES_VEN_TODO:
+        detalle_alcance = f"todos los fundos (por su perfil {rol})"
+    elif acceso_total:
+        detalle_alcance = "todos los fundos (acceso total activado)"
+    else:
+        asignados = fundos_de(num)
+        detalle_alcance = f"{len(asignados)} fundo(s) asignados" if asignados else "ninguno (sin fundos asignados)"
     return {
         "rol": rol,
         "fundos": fundos_de(num),
-        "ve_todo": rol in ROLES_VEN_TODO,
+        "ve_todo": ve_todo,
+        "acceso_total": acceso_total,
+        "alcance": detalle_alcance,
         "recibe_notificaciones": notif,
         "notificaciones": detalle_notif,
     }
@@ -3586,7 +3636,7 @@ def _estado_numero(numero):
 @app.get("/admin/numeros/agregar")
 async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre: str = None,
                                rol: str = None, productor: str = None, fundos: str = None,
-                               notificaciones: str = None):
+                               notificaciones: str = None, acceso_total: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
@@ -3597,11 +3647,13 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
-    valores = _con_alias(request, {"fundos": fundos, "notificaciones": notificaciones})
-    fundos, notificaciones = valores["fundos"], valores["notificaciones"]
+    valores = _con_alias(request, {"fundos": fundos, "notificaciones": notificaciones,
+                                   "acceso_total": acceso_total})
+    fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones"} | set(ALIAS_PARAMETROS),
+        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total"}
+        | set(ALIAS_PARAMETROS),
     )
     if error:
         return error
@@ -3612,11 +3664,13 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
         )
     try:
         notif = _parsear_si_no(notificaciones)
+        acceso = _parsear_si_no(acceso_total)
     except ValueError:
         return JSONResponse({"status": "error", "error": ERROR_SI_NO}, status_code=400)
     try:
         es_nuevo = not numero_esta_permitido(numero)
-        agregar_numero_permitido(numero, nombre, rol=rol, productor=productor, recibe_notificaciones=notif)
+        agregar_numero_permitido(numero, nombre, rol=rol, productor=productor,
+                                 recibe_notificaciones=notif, acceso_total=acceso)
         numero_normalizado = normalizar_numero(numero)
         if fundos is not None:
             asignar_fundos(numero_normalizado, fundos.split("|"), reemplazar=True)
@@ -3639,7 +3693,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
 
 @app.get("/admin/numeros/rol")
 async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str = None,
-                            productor: str = None, fundos: str = None, notificaciones: str = None):
+                            productor: str = None, fundos: str = None, notificaciones: str = None,
+                            acceso_total: str = None):
     """
     Cambia el rol, los fundos asignados y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
@@ -3648,17 +3703,20 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
-    valores = _con_alias(request, {"fundos": fundos, "notificaciones": notificaciones})
-    fundos, notificaciones = valores["fundos"], valores["notificaciones"]
+    valores = _con_alias(request, {"fundos": fundos, "notificaciones": notificaciones,
+                                   "acceso_total": acceso_total})
+    fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "rol", "productor", "fundos", "notificaciones"} | set(ALIAS_PARAMETROS),
+        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total"}
+        | set(ALIAS_PARAMETROS),
     )
     if error:
         return error
-    if rol is None and productor is None and fundos is None and notificaciones is None:
+    if rol is None and productor is None and fundos is None and notificaciones is None and acceso_total is None:
         return JSONResponse(
-            {"status": "error", "error": "Indica al menos rol, fundos, productor o notificaciones"},
+            {"status": "error",
+             "error": "Indica al menos rol, fundos, productor, notificaciones o acceso_total"},
             status_code=400,
         )
     if rol is not None and rol not in ROLES_VALIDOS:
@@ -3668,12 +3726,14 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
         )
     try:
         notif = _parsear_si_no(notificaciones)
+        acceso = _parsear_si_no(acceso_total)
     except ValueError:
         return JSONResponse({"status": "error", "error": ERROR_SI_NO}, status_code=400)
     try:
         if not numero_esta_permitido(numero):
             return JSONResponse({"status": "error", "error": "Ese número no está en la lista"}, status_code=404)
-        agregar_numero_permitido(numero, rol=rol, productor=productor, recibe_notificaciones=notif)
+        agregar_numero_permitido(numero, rol=rol, productor=productor, recibe_notificaciones=notif,
+                                 acceso_total=acceso)
         if fundos is not None:
             # Lista separada por "|" porque los nombres de fundo llevan comas y puntos.
             asignar_fundos(numero, [f for f in fundos.split("|")], reemplazar=True)
@@ -3817,9 +3877,13 @@ async def admin_estado(clave: str):
         entregas = {r["estado"]: r["n"] for r in conn.execute(
             "SELECT estado, COUNT(*) n FROM mensajes_estado GROUP BY estado"
         )}
+        con_acceso_total = conn.execute(
+            "SELECT COUNT(*) FROM numeros_permitidos WHERE acceso_total = 1"
+        ).fetchone()[0]
         sin_fundos = conn.execute(
             f"SELECT COUNT(*) FROM numeros_permitidos WHERE rol IN ({','.join('?' * len(ROLES_ACOTADOS))}) "
-            "AND numero NOT IN (SELECT numero FROM numeros_fundos)", list(ROLES_ACOTADOS)
+            "AND acceso_total = 0 AND numero NOT IN (SELECT numero FROM numeros_fundos)",
+            list(ROLES_ACOTADOS)
         ).fetchone()[0]
         conn.close()
 
@@ -3840,6 +3904,7 @@ async def admin_estado(clave: str):
             "fuente_cuestionario": BASE_ORIGEN_CUESTIONARIO,
             "perfiles": perfiles,
             "acotados_sin_fundos": sin_fundos,
+            "con_acceso_total": con_acceso_total,
             "entregas_por_estado": entregas,
         }
     except Exception as e:
