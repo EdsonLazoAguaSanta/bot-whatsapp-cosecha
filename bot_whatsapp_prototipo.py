@@ -3792,6 +3792,60 @@ async def admin_alerta_desviaciones(clave: str, solo_ver: bool = False):
         return {"status": "ok", "texto": resultado[0] if resultado else "(sin datos para calcular)"}
     return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_alerta_desviaciones()}
 
+@app.get("/admin/estado")
+async def admin_estado(clave: str):
+    """
+    Resumen de cómo quedó el bot tras un reinicio: modo de envíos, tareas programadas con su
+    próxima ejecución, plantillas configuradas, perfiles y entregas recientes.
+    Uso: https://bot-whatsapp-asa.com/admin/estado?clave=...
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        tareas = []
+        for j in (scheduler.get_jobs() if scheduler.running else []):
+            tareas.append({
+                "tarea": j.id,
+                "proxima_ejecucion": j.next_run_time.strftime("%Y-%m-%d %H:%M") if j.next_run_time else None,
+            })
+
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        perfiles = {r["rol"] or ROL_POR_DEFECTO: r["n"] for r in conn.execute(
+            "SELECT rol, COUNT(*) n FROM numeros_permitidos GROUP BY rol"
+        )}
+        entregas = {r["estado"]: r["n"] for r in conn.execute(
+            "SELECT estado, COUNT(*) n FROM mensajes_estado GROUP BY estado"
+        )}
+        sin_fundos = conn.execute(
+            f"SELECT COUNT(*) FROM numeros_permitidos WHERE rol IN ({','.join('?' * len(ROLES_ACOTADOS))}) "
+            "AND numero NOT IN (SELECT numero FROM numeros_fundos)", list(ROLES_ACOTADOS)
+        ).fetchone()[0]
+        conn.close()
+
+        return {
+            "modo_envios": _modo_envios(),
+            "scheduler_activo": scheduler.running,
+            "tareas_programadas": tareas,
+            "horarios": {
+                "cuestionario_manana": CUESTIONARIO_HORA_AM,
+                "cuestionario_tarde": CUESTIONARIO_HORA_PM,
+                "resumen_semanal": f"{RESUMEN_SEMANAL_DIA} {RESUMEN_SEMANAL_HORA}",
+                "alerta_desviaciones": f"{ALERTA_SEMANAL_DIA} {ALERTA_SEMANAL_HORA}",
+            },
+            "plantillas": {
+                "cuestionario": f"{PLANTILLA_CUESTIONARIO_NOMBRE} ({PLANTILLA_CUESTIONARIO_IDIOMA})",
+                "bienvenida": f"{PLANTILLA_BIENVENIDA_NOMBRE} ({PLANTILLA_BIENVENIDA_IDIOMA})",
+            },
+            "fuente_cuestionario": BASE_ORIGEN_CUESTIONARIO,
+            "perfiles": perfiles,
+            "acotados_sin_fundos": sin_fundos,
+            "entregas_por_estado": entregas,
+        }
+    except Exception as e:
+        logger.error(f"Error en /admin/estado: {str(e)}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
 @app.get("/admin/entregas")
 async def admin_entregas(clave: str, limit: int = 40, solo_fallidos: bool = False):
     """
