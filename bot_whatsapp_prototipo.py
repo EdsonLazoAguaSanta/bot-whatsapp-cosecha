@@ -256,20 +256,37 @@ def fundos_de(numero):
         logger.error(f"Error obteniendo fundos: {str(e)}")
         return []
 
-def asignar_fundos(numero, fundos, reemplazar=False):
-    """Asigna fundos a un número. Con reemplazar=True deja exactamente los indicados."""
+def asignar_fundos(numero, fundos, reemplazar=False, revocar_acceso_total=True):
+    """Asigna fundos a un número. Con reemplazar=True deja exactamente los indicados.
+
+    Asignarle fundos a alguien significa acotarlo a esos fundos, así que se le retira el
+    acceso total: si no, seguiría viendo todo y quien lo asignó creería que quedó
+    restringido. Con revocar_acceso_total=False se conserva (para cuando en la misma
+    llamada se pidió acceso_total explícitamente)."""
     num = normalizar_numero(numero)
     conn = sqlite3.connect(DB_LOCAL_PATH)
     if reemplazar:
         conn.execute("DELETE FROM numeros_fundos WHERE numero = ?", (num,))
+    asignados = 0
     for fundo in fundos:
         fundo = (fundo or "").strip()
         if fundo:
             conn.execute(
                 "INSERT OR IGNORE INTO numeros_fundos (numero, fundo) VALUES (?, ?)", (num, fundo)
             )
+            asignados += 1
+    revocado = False
+    if asignados and revocar_acceso_total:
+        cursor = conn.execute(
+            "UPDATE numeros_permitidos SET acceso_total = 0 WHERE numero = ? AND acceso_total = 1",
+            (num,)
+        )
+        revocado = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    if revocado:
+        logger.info(f"{num}: se le retiró el acceso total al asignarle {asignados} fundo(s)")
+    return revocado
 
 def quitar_fundo(numero, fundo):
     conn = sqlite3.connect(DB_LOCAL_PATH)
@@ -3673,7 +3690,10 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
                                  recibe_notificaciones=notif, acceso_total=acceso)
         numero_normalizado = normalizar_numero(numero)
         if fundos is not None:
-            asignar_fundos(numero_normalizado, fundos.split("|"), reemplazar=True)
+            # Si en la misma llamada se pidió acceso_total, ese gana sobre la regla de
+            # "asignar fundos acota".
+            asignar_fundos(numero_normalizado, fundos.split("|"), reemplazar=True,
+                           revocar_acceso_total=(acceso is None))
 
         bienvenida_enviada = False
         if es_nuevo:
@@ -3736,7 +3756,8 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
                                  acceso_total=acceso)
         if fundos is not None:
             # Lista separada por "|" porque los nombres de fundo llevan comas y puntos.
-            asignar_fundos(numero, [f for f in fundos.split("|")], reemplazar=True)
+            asignar_fundos(numero, [f for f in fundos.split("|")], reemplazar=True,
+                           revocar_acceso_total=(acceso is None))
         num = normalizar_numero(numero)
         return {"status": "ok", "numero": num, **_estado_numero(num)}
     except Exception as e:
@@ -3744,7 +3765,7 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/admin/numeros/fundos")
-async def admin_fundos(clave: str, numero: str, agregar: str = None, quitar: str = None):
+async def admin_fundos(request: Request, clave: str, numero: str, agregar: str = None, quitar: str = None):
     """
     Agrega o quita fundos de un número sin tocar el resto (varios separados por "|").
     Solo afecta a zonal y productor: admin, gerencia y EAS ven todo igual.
@@ -3752,13 +3773,16 @@ async def admin_fundos(clave: str, numero: str, agregar: str = None, quitar: str
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    error = _revisar_parametros(request, {"clave", "numero", "agregar", "quitar"})
+    if error:
+        return error
     if not agregar and not quitar:
         return JSONResponse({"status": "error", "error": "Indica agregar y/o quitar"}, status_code=400)
     try:
         if not numero_esta_permitido(numero):
             return JSONResponse({"status": "error", "error": "Ese número no está en la lista"}, status_code=404)
         if agregar:
-            asignar_fundos(numero, agregar.split("|"))
+            asignar_fundos(numero, agregar.split("|"))  # acotar implica quitar el acceso total
         if quitar:
             for f in quitar.split("|"):
                 quitar_fundo(numero, f)

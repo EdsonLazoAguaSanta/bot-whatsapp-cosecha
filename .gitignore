@@ -6,3 +6,4 @@ tools/
 conversaciones.db
 *.log
 caddy.exe
+.env.bak*
