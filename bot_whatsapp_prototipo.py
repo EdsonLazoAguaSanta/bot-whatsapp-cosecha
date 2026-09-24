@@ -3402,6 +3402,38 @@ def enviar_plantilla_bienvenida(numero_destino, nombre=None):
         logger.error(f"Error enviando plantilla de bienvenida: {str(e)}")
         return False
 
+def _revisar_parametros(request, permitidos):
+    """Devuelve un error si la URL trae parámetros que el endpoint no conoce. Sin esto, un
+    nombre mal escrito (ej. 'notificacion' por 'notificaciones') se ignora en silencio y la
+    llamada responde 'ok' sin haber hecho el cambio pedido."""
+    desconocidos = [p for p in request.query_params if p not in permitidos]
+    if not desconocidos:
+        return None
+    return JSONResponse(
+        {
+            "status": "error",
+            "error": f"No conozco este parámetro: {', '.join(desconocidos)}. "
+                     f"No se hizo ningún cambio.",
+            "parametros_validos": sorted(permitidos),
+        },
+        status_code=400,
+    )
+
+# Alias para los nombres que es fácil escribir distinto al teclear la URL a mano.
+ALIAS_PARAMETROS = {
+    "notificacion": "notificaciones",
+    "notificacines": "notificaciones",
+    "notif": "notificaciones",
+    "fundo": "fundos",
+}
+
+def _con_alias(request, valores):
+    """Aplica los alias de parámetros sobre los valores ya recibidos."""
+    for alias, real in ALIAS_PARAMETROS.items():
+        if alias in request.query_params and not valores.get(real):
+            valores[real] = request.query_params[alias]
+    return valores
+
 def _parsear_si_no(valor):
     """Acepta las formas que uno escribe a mano en la URL (1/0, si/no, true/false, on/off).
     Devuelve 1, 0, o None si no vino el parámetro. Lanza ValueError si no se entiende."""
@@ -3445,8 +3477,9 @@ def _estado_numero(numero):
     }
 
 @app.get("/admin/numeros/agregar")
-async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol: str = None,
-                               productor: str = None, fundos: str = None, notificaciones: str = None):
+async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre: str = None,
+                               rol: str = None, productor: str = None, fundos: str = None,
+                               notificaciones: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
@@ -3457,6 +3490,14 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol:
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    valores = _con_alias(request, {"fundos": fundos, "notificaciones": notificaciones})
+    fundos, notificaciones = valores["fundos"], valores["notificaciones"]
+    error = _revisar_parametros(
+        request,
+        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones"} | set(ALIAS_PARAMETROS),
+    )
+    if error:
+        return error
     if rol is not None and rol not in ROLES_VALIDOS:
         return JSONResponse(
             {"status": "error", "error": f"Rol inválido: {rol}. Válidos: {', '.join(ROLES_VALIDOS)}"},
@@ -3490,8 +3531,8 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol:
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/admin/numeros/rol")
-async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor: str = None,
-                            fundos: str = None, notificaciones: str = None):
+async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str = None,
+                            productor: str = None, fundos: str = None, notificaciones: str = None):
     """
     Cambia el rol, los fundos asignados y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
@@ -3500,6 +3541,14 @@ async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor:
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    valores = _con_alias(request, {"fundos": fundos, "notificaciones": notificaciones})
+    fundos, notificaciones = valores["fundos"], valores["notificaciones"]
+    error = _revisar_parametros(
+        request,
+        {"clave", "numero", "rol", "productor", "fundos", "notificaciones"} | set(ALIAS_PARAMETROS),
+    )
+    if error:
+        return error
     if rol is None and productor is None and fundos is None and notificaciones is None:
         return JSONResponse(
             {"status": "error", "error": "Indica al menos rol, fundos, productor o notificaciones"},
