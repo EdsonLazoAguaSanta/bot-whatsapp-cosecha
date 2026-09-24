@@ -3402,15 +3402,58 @@ def enviar_plantilla_bienvenida(numero_destino, nombre=None):
         logger.error(f"Error enviando plantilla de bienvenida: {str(e)}")
         return False
 
+def _parsear_si_no(valor):
+    """Acepta las formas que uno escribe a mano en la URL (1/0, si/no, true/false, on/off).
+    Devuelve 1, 0, o None si no vino el parámetro. Lanza ValueError si no se entiende."""
+    if valor is None or str(valor).strip() == "":
+        return None
+    texto = str(valor).strip().lower()
+    if texto in ("1", "si", "sí", "true", "on", "activar", "activo", "yes"):
+        return 1
+    if texto in ("0", "no", "false", "off", "desactivar", "inactivo"):
+        return 0
+    raise ValueError(valor)
+
+ERROR_SI_NO = "Valor inválido para 'notificaciones'. Usa 1/si/true para activar, o 0/no/false para desactivar."
+
+def _estado_numero(numero):
+    """Cómo quedó el número después de un cambio, para que la respuesta lo confirme en vez
+    de solo decir 'ok' (antes no se veía si las notificaciones habían quedado activas)."""
+    num = normalizar_numero(numero)
+    rol = rol_de(num)
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT recibe_notificaciones FROM numeros_permitidos WHERE numero = ?", (num,)
+        ).fetchone()
+        conn.close()
+        notif = bool(fila[0]) if fila else False
+    except Exception:
+        notif = False
+    if rol == "admin":
+        detalle_notif = "sí (los admin reciben siempre)"
+    elif rol in ("gerencia", "eas"):
+        detalle_notif = "sí" if notif else "no (actívalas con notificaciones=1)"
+    else:
+        detalle_notif = "sí, según su rol"
+    return {
+        "rol": rol,
+        "fundos": fundos_de(num),
+        "ve_todo": rol in ROLES_VEN_TODO,
+        "recibe_notificaciones": notif,
+        "notificaciones": detalle_notif,
+    }
+
 @app.get("/admin/numeros/agregar")
-async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol: str = None, productor: str = None):
+async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol: str = None,
+                               productor: str = None, fundos: str = None, notificaciones: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
     rol: admin | gerencia | eas | zonal | productor (por defecto: productor).
-    productor: fundo asociado (para zonal/productor, que solo ven los suyos). Para asignar
-    varios usa /admin/numeros/fundos o el parámetro fundos de /admin/numeros/rol.
-    Uso: https://bot-whatsapp-asa.com/admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias&rol=zonal
+    fundos: fundos asignados separados por "|" (para zonal/productor, que solo ven los suyos).
+    notificaciones: 1/si para que gerencia o eas reciba los avisos automáticos.
+    Uso: .../admin/numeros/agregar?clave=...&numero=56912345678&nombre=Matias&rol=zonal&fundos=LA TORINA
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
@@ -3420,9 +3463,15 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol:
             status_code=400,
         )
     try:
+        notif = _parsear_si_no(notificaciones)
+    except ValueError:
+        return JSONResponse({"status": "error", "error": ERROR_SI_NO}, status_code=400)
+    try:
         es_nuevo = not numero_esta_permitido(numero)
-        agregar_numero_permitido(numero, nombre, rol=rol, productor=productor)
+        agregar_numero_permitido(numero, nombre, rol=rol, productor=productor, recibe_notificaciones=notif)
         numero_normalizado = normalizar_numero(numero)
+        if fundos is not None:
+            asignar_fundos(numero_normalizado, fundos.split("|"), reemplazar=True)
 
         bienvenida_enviada = False
         if es_nuevo:
@@ -3432,10 +3481,9 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol:
             "status": "ok",
             "numero": numero_normalizado,
             "nombre": nombre,
-            "rol": rol or (ROL_POR_DEFECTO if es_nuevo else "(sin cambio)"),
-            "productor": productor,
             "nuevo": es_nuevo,
             "bienvenida_enviada": bienvenida_enviada,
+            **_estado_numero(numero_normalizado),
         }
     except Exception as e:
         logger.error(f"Error agregando número permitido: {str(e)}")
@@ -3443,7 +3491,7 @@ async def admin_agregar_numero(clave: str, numero: str, nombre: str = None, rol:
 
 @app.get("/admin/numeros/rol")
 async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor: str = None,
-                            fundos: str = None, notificaciones: int = None):
+                            fundos: str = None, notificaciones: str = None):
     """
     Cambia el rol, los fundos asignados y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
@@ -3463,20 +3511,18 @@ async def admin_cambiar_rol(clave: str, numero: str, rol: str = None, productor:
             status_code=400,
         )
     try:
+        notif = _parsear_si_no(notificaciones)
+    except ValueError:
+        return JSONResponse({"status": "error", "error": ERROR_SI_NO}, status_code=400)
+    try:
         if not numero_esta_permitido(numero):
             return JSONResponse({"status": "error", "error": "Ese número no está en la lista"}, status_code=404)
-        agregar_numero_permitido(numero, rol=rol, productor=productor, recibe_notificaciones=notificaciones)
+        agregar_numero_permitido(numero, rol=rol, productor=productor, recibe_notificaciones=notif)
         if fundos is not None:
             # Lista separada por "|" porque los nombres de fundo llevan comas y puntos.
             asignar_fundos(numero, [f for f in fundos.split("|")], reemplazar=True)
         num = normalizar_numero(numero)
-        return {
-            "status": "ok",
-            "numero": num,
-            "rol": rol_de(num),
-            "fundos": fundos_de(num),
-            "ve_todo": rol_de(num) in ROLES_VEN_TODO,
-        }
+        return {"status": "ok", "numero": num, **_estado_numero(num)}
     except Exception as e:
         logger.error(f"Error cambiando rol de número: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
