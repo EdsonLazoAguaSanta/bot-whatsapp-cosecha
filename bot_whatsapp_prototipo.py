@@ -2584,16 +2584,20 @@ def _fundo_coincide(fundo_asignado, texto):
         return False
     return fundo_asignado.strip().upper() in str(texto).upper()
 
-def registrar_cuestionario_enviado(numero, turno, mensaje):
+def registrar_cuestionario_enviado(numero, turno, mensaje, estado="pendiente"):
+    """estado 'pendiente' = la tabla ya se entregó y esperamos su respuesta.
+    estado 'pendiente_plantilla' = se mandó la plantilla y la tabla queda guardada aquí
+    para entregarla apenas la persona responda y se abra la ventana de 24 h."""
     conn = sqlite3.connect(DB_LOCAL_PATH)
     # Un cuestionario nuevo deja obsoleto cualquier pendiente anterior del mismo número
     conn.execute(
-        "UPDATE cuestionarios SET estado = 'vencido' WHERE numero = ? AND estado = 'pendiente'",
+        "UPDATE cuestionarios SET estado = 'vencido' WHERE numero = ? "
+        "AND estado IN ('pendiente', 'pendiente_plantilla')",
         (normalizar_numero(numero),)
     )
     conn.execute(
-        "INSERT INTO cuestionarios (numero, turno, mensaje) VALUES (?, ?, ?)",
-        (normalizar_numero(numero), turno, mensaje)
+        "INSERT INTO cuestionarios (numero, turno, mensaje, estado) VALUES (?, ?, ?, ?)",
+        (normalizar_numero(numero), turno, mensaje, estado)
     )
     conn.commit()
     conn.close()
@@ -2607,7 +2611,9 @@ def obtener_cuestionario_activo(numero):
         conn.row_factory = sqlite3.Row
         fila = conn.execute(
             "SELECT id, turno, mensaje, estado, respuesta, ajuste, fecha_hora_envio FROM cuestionarios "
-            "WHERE numero = ? AND estado != 'vencido' "
+            # 'pendiente_plantilla' queda fuera: esa tabla todavía no se le entregó a la
+            # persona, así que no hay nada que pueda estar respondiendo.
+            "WHERE numero = ? AND estado NOT IN ('vencido', 'pendiente_plantilla') "
             "AND fecha_hora_envio >= datetime('now', 'localtime', '-1 day') "
             "ORDER BY id DESC LIMIT 1",
             (normalizar_numero(numero),)
@@ -2837,6 +2843,41 @@ def construir_confirmacion_tarde(fecha=None, nombre=None, fundos=None, ajuste_pr
         logger.error(f"Error construyendo confirmación de tarde: {str(e)}")
         return None
 
+def _totales_previstos(fecha, fundos):
+    """Total de kilos y bultos previstos ese día, para las cifras de la plantilla."""
+    filas = obtener_previsto(fecha, fecha, fundos=fundos) or []
+    total_kg = sum((f[3] or 0) for f in filas)
+    total_bultos = sum((f[4] or 0) for f in filas)
+    return total_kg, total_bultos
+
+def entregar_cuestionario_pendiente(numero):
+    """Si a esta persona se le mandó la plantilla y ahora nos escribió, la ventana de 24 h
+    quedó abierta: se le entrega la tabla completa que había quedado guardada. Devuelve True
+    si se entregó algo."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        fila = conn.execute(
+            "SELECT id, mensaje FROM cuestionarios WHERE numero = ? AND estado = 'pendiente_plantilla' "
+            "AND fecha_hora_envio >= datetime('now', 'localtime', '-1 day') ORDER BY id DESC LIMIT 1",
+            (normalizar_numero(numero),)
+        ).fetchone()
+        conn.close()
+        if not fila:
+            return False
+        if not enviar_whatsapp(numero, fila["mensaje"]):
+            logger.error(f"No pude entregar el cuestionario guardado a {numero}")
+            return False
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.execute("UPDATE cuestionarios SET estado = 'pendiente' WHERE id = ?", (fila["id"],))
+        conn.commit()
+        conn.close()
+        logger.info(f"Cuestionario guardado entregado a {numero} tras su respuesta a la plantilla")
+        return True
+    except Exception as e:
+        logger.error(f"Error entregando cuestionario pendiente: {str(e)}")
+        return False
+
 def _ajuste_registrado_hoy(numero, fecha=None):
     """Ajuste que el número reportó hoy (para repetirlo en el mensaje de las 15:00)."""
     try:
@@ -2864,7 +2905,7 @@ def enviar_cuestionarios(turno, fecha=None):
         if not destinatarios:
             logger.warning("Cuestionario: no hay destinatarios (¿ningún número con el rol requerido?)")
             return {"enviados": 0, "sin_datos": 0, "errores": 0, "detalle": "sin destinatarios"}
-        enviados = sin_datos = errores = omitidos = 0
+        enviados = sin_datos = errores = omitidos = por_plantilla = 0
         for d in destinatarios:
             if _sin_fundos_asignados(d):
                 omitidos += 1
@@ -2888,19 +2929,31 @@ def enviar_cuestionarios(turno, fecha=None):
                 sin_datos += 1
                 logger.info(f"Cuestionario {turno}: sin previsto para {d['numero']} (fundos={d.get('fundos')})")
                 continue
-            if enviar_whatsapp(d["numero"], mensaje):
-                registrar_cuestionario_enviado(d["numero"], turno, mensaje)
-                enviados += 1
+
+            if ventana_24h_abierta(d["numero"]):
+                # Escribió hace poco: se le puede mandar la tabla directamente.
+                if enviar_whatsapp(d["numero"], mensaje):
+                    registrar_cuestionario_enviado(d["numero"], turno, mensaje)
+                    enviados += 1
+                else:
+                    errores += 1
+                continue
+
+            # Ventana cerrada: el texto libre sería rechazado (131047). Se manda la plantilla
+            # con las cifras en una línea y la tabla queda guardada para entregarla apenas
+            # la persona responda (ver entregar_cuestionario_pendiente).
+            kg, bultos = _totales_previstos(fecha, d.get("fundos"))
+            if enviar_plantilla_cuestionario(d["numero"], d.get("nombre"), kg, bultos):
+                registrar_cuestionario_enviado(d["numero"], turno, mensaje, estado="pendiente_plantilla")
+                por_plantilla += 1
             else:
-                # Falla típica: ventana de 24 h cerrada (error 131047). Para producción hay
-                # que aprobar una plantilla de re-enganche en Meta, como la de bienvenida.
                 errores += 1
         logger.info(
-            f"Cuestionario {turno}: {enviados} enviados, {sin_datos} sin datos, "
-            f"{errores} errores, {omitidos} omitidos por no tener fundos"
+            f"Cuestionario {turno}: {enviados} directos, {por_plantilla} por plantilla, "
+            f"{sin_datos} sin datos, {errores} errores, {omitidos} omitidos por no tener fundos"
         )
-        return {"enviados": enviados, "sin_datos": sin_datos, "errores": errores,
-                "omitidos_sin_fundos": omitidos}
+        return {"enviados": enviados, "por_plantilla": por_plantilla, "sin_datos": sin_datos,
+                "errores": errores, "omitidos_sin_fundos": omitidos}
     except Exception as e:
         logger.error(f"Error en job de cuestionarios: {str(e)}")
         return {"error": str(e)}
@@ -3259,6 +3312,11 @@ async def receive_message(request: Request):
 
                         logger.info(f"Mensaje de {numero_sender}: {msg_text}")
 
+                        # Si tenía un cuestionario esperando (se le mandó la plantilla porque
+                        # la ventana de 24 h estaba cerrada), su mensaje la reabre: primero se
+                        # le entrega la tabla y recién después se atiende lo que escribió.
+                        entregar_cuestionario_pendiente(numero_sender)
+
                         # Procesar mensaje
                         respuesta = procesar_mensaje(msg_text, numero_sender, es_audio=(msg_type == "audio"))
 
@@ -3352,8 +3410,15 @@ async def admin_listar_numeros(clave: str):
         logger.error(f"Error listando números permitidos: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
-PLANTILLA_BIENVENIDA_NOMBRE = "bienvenida_asistente_cosecha"
-PLANTILLA_BIENVENIDA_IDIOMA = "en"  # idioma real aprobado en Meta (aunque el contenido esté en español)
+# Plantillas aprobadas en Meta (WhatsApp Manager > Plantillas de mensajes). El nombre y el
+# idioma deben calzar EXACTO con lo aprobado ahí: si no, Meta responde 132001 y no entrega.
+# Verificado contra la API el 24-09-2026 sondeando la respuesta de validación.
+PLANTILLA_BIENVENIDA_NOMBRE = os.getenv("PLANTILLA_BIENVENIDA_NOMBRE", "bienvenida")
+PLANTILLA_BIENVENIDA_IDIOMA = os.getenv("PLANTILLA_BIENVENIDA_IDIOMA", "es_CL")
+# La de bienvenida usa una variable CON NOMBRE ({{nombre}}); la de cuestionario usa
+# variables posicionales ({{1}}, {{2}}, {{3}}).
+PLANTILLA_CUESTIONARIO_NOMBRE = os.getenv("PLANTILLA_CUESTIONARIO_NOMBRE", "cuestionario")
+PLANTILLA_CUESTIONARIO_IDIOMA = os.getenv("PLANTILLA_CUESTIONARIO_IDIOMA", "es_CL")
 
 def enviar_plantilla_bienvenida(numero_destino, nombre=None):
     """
@@ -3365,41 +3430,83 @@ def enviar_plantilla_bienvenida(numero_destino, nombre=None):
     id 1059735476635950) — cambiarlo aquí no tiene ningún efecto; hay que editarlo y
     volver a aprobarlo ahí.
     """
+    return enviar_plantilla(
+        numero_destino,
+        PLANTILLA_BIENVENIDA_NOMBRE,
+        PLANTILLA_BIENVENIDA_IDIOMA,
+        [{"type": "text", "parameter_name": "nombre", "text": (nombre or "").strip() or "equipo"}],
+        etiqueta="bienvenida",
+    )
+
+def enviar_plantilla(numero_destino, nombre_plantilla, idioma, parametros, etiqueta=""):
+    """Envía una plantilla aprobada. A diferencia del texto libre, una plantilla SÍ llega
+    fuera de la ventana de 24 h de WhatsApp (error 131047). OJO: los parámetros no pueden
+    llevar saltos de línea, tabulaciones ni más de 4 espacios seguidos — Meta los rechaza con
+    132018, por eso las tablas nunca pueden ir dentro de una plantilla."""
     try:
-        url = f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages"
-        headers = {
-            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-            "Content-Type": "application/json",
-        }
         payload = {
             "messaging_product": "whatsapp",
             "to": numero_destino,
             "type": "template",
             "template": {
-                "name": PLANTILLA_BIENVENIDA_NOMBRE,
-                "language": {"code": PLANTILLA_BIENVENIDA_IDIOMA},
-                "components": [
-                    {
-                        "type": "body",
-                        "parameters": [
-                            {
-                                "type": "text",
-                                "parameter_name": "nombre",
-                                "text": (nombre or "").strip() or "equipo",
-                            }
-                        ],
-                    }
-                ],
+                "name": nombre_plantilla,
+                "language": {"code": idioma},
+                "components": [{"type": "body", "parameters": parametros}],
             },
         }
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(
+            f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages",
+            json=payload,
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"},
+        )
         if response.status_code != 200:
-            logger.error(f"Plantilla de bienvenida respondió {response.status_code} al enviar a {numero_destino}: {response.text}")
-        else:
-            logger.info(f"Plantilla de bienvenida enviada a {numero_destino}: {response.status_code}")
-        return response.status_code == 200
+            logger.error(
+                f"Plantilla '{nombre_plantilla}' ({etiqueta}) rechazada para {numero_destino}: "
+                f"{response.status_code} {response.text}"
+            )
+            return False
+        registrar_mensaje_enviado(response, numero_destino)
+        logger.info(f"Plantilla '{nombre_plantilla}' ({etiqueta}) aceptada para {numero_destino}")
+        return True
     except Exception as e:
-        logger.error(f"Error enviando plantilla de bienvenida: {str(e)}")
+        logger.error(f"Error enviando plantilla '{nombre_plantilla}': {str(e)}")
+        return False
+
+def _texto_plantilla(valor):
+    """Deja un valor apto para un parámetro de plantilla: sin saltos de línea, sin tabs y
+    sin rachas de espacios, que Meta rechaza (132018)."""
+    texto = " ".join(str(valor or "").split())
+    return texto or "-"
+
+def enviar_plantilla_cuestionario(numero_destino, nombre, kg, bultos):
+    """Plantilla de re-enganche del cuestionario diario: avisa con las cifras en una línea
+    para que la persona responda y se abra la ventana; recién ahí se le manda la tabla."""
+    return enviar_plantilla(
+        numero_destino,
+        PLANTILLA_CUESTIONARIO_NOMBRE,
+        PLANTILLA_CUESTIONARIO_IDIOMA,
+        [
+            {"type": "text", "text": _texto_plantilla(nombre or "equipo")},
+            {"type": "text", "text": _texto_plantilla(formatear_kg(kg))},
+            {"type": "text", "text": _texto_plantilla(formatear_kg(bultos))},
+        ],
+        etiqueta="cuestionario",
+    )
+
+def ventana_24h_abierta(numero):
+    """¿La persona escribió al bot en las últimas 24 h? Si sí, se le puede mandar texto libre
+    (con la tabla); si no, hay que usar una plantilla o Meta rechaza el envío con 131047."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT 1 FROM conversaciones WHERE numero_sender = ? "
+            "AND fecha_hora >= datetime('now', 'localtime', '-1 day') LIMIT 1",
+            (normalizar_numero(numero),)
+        ).fetchone()
+        conn.close()
+        return fila is not None
+    except Exception as e:
+        logger.error(f"Error verificando ventana de 24 h: {str(e)}")
         return False
 
 def _revisar_parametros(request, permitidos):
