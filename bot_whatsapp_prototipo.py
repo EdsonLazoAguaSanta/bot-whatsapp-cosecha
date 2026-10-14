@@ -196,8 +196,13 @@ def numero_esta_permitido(numero):
 #   admin     - solo Edson: ve y hace todo, y recibe siempre los avisos del EAS.
 #   gerencia  - consulta toda la información; recibe avisos solo si se le activa.
 #   eas       - consulta toda la información de todos los productores; avisos solo si se activa.
-#   zonal     - consulta solo SUS fundos; recibe avisos de ajuste y el resumen semanal.
-#   productor - consulta solo SUS fundos, responde cuestionarios y reporta correcciones.
+#   zonal     - responsable de sus fundos: consulta solo los suyos, responde los cuestionarios
+#               y AUTORIZA los ajustes que piden sus productores.
+#   productor - consulta solo sus fundos y PIDE ajustes de cosecha; su solicitud pasa por el
+#               zonal antes de darse por buena.
+# PENDIENTE: el circuito de autorización (el productor pide y el zonal aprueba) todavía no
+# está implementado. Hoy cualquier ajuste reportado se registra directo y se avisa al EAS.
+# Mientras tanto no hay números con perfil productor, así que no se usa esa ruta.
 ROLES_VALIDOS = ("admin", "gerencia", "eas", "zonal", "productor")
 # Roles sin restricción de fundos (ven la información de todos los productores).
 ROLES_VEN_TODO = ("admin", "gerencia", "eas")
