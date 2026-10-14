@@ -2997,8 +2997,9 @@ def enviar_cuestionarios(turno, fecha=None):
             # Ventana cerrada: el texto libre sería rechazado (131047). Se manda la plantilla
             # con las cifras en una línea y la tabla queda guardada para entregarla apenas
             # la persona responda (ver entregar_cuestionario_pendiente).
-            kg, bultos = _totales_previstos(fecha, _fundos_para_envio(d))
-            if enviar_plantilla_cuestionario(d["numero"], d.get("nombre"), kg, bultos):
+            kg, _bultos = _totales_previstos(fecha, _fundos_para_envio(d))
+            if enviar_plantilla_cuestionario(d["numero"], d.get("nombre"), kg,
+                                             fundos=_fundos_para_envio(d)):
                 registrar_cuestionario_enviado(d["numero"], turno, mensaje, estado="pendiente_plantilla")
                 por_plantilla += 1
             else:
@@ -3621,9 +3622,19 @@ def _texto_plantilla(valor):
     texto = " ".join(str(valor or "").split())
     return texto or "-"
 
-def enviar_plantilla_cuestionario(numero_destino, nombre, kg, bultos):
-    """Plantilla de re-enganche del cuestionario diario: avisa con las cifras en una línea
-    para que la persona responda y se abra la ventana; recién ahí se le manda la tabla."""
+def _descripcion_fundos(fundos):
+    """Cómo nombrar el alcance de la persona dentro de la plantilla, en una sola línea.
+    None = ve todos los fundos; una lista = sus fundos asignados."""
+    if not fundos:
+        return "todos los fundos"
+    if len(fundos) == 1:
+        return str(fundos[0])
+    return f"sus {len(fundos)} fundos"
+
+def enviar_plantilla_cuestionario(numero_destino, nombre, kg, fundos=None):
+    """Plantilla de re-enganche del cuestionario diario. Los tres parámetros van en el orden
+    del texto aprobado en Meta: "Hola {{1}}, tienes tu cuestionario de cosecha de hoy:
+    {{2}} kg previstos en {{3}}." — o sea nombre, kilos y FUNDO (no bultos)."""
     return enviar_plantilla(
         numero_destino,
         PLANTILLA_CUESTIONARIO_NOMBRE,
@@ -3631,7 +3642,7 @@ def enviar_plantilla_cuestionario(numero_destino, nombre, kg, bultos):
         [
             {"type": "text", "text": _texto_plantilla(nombre or "equipo")},
             {"type": "text", "text": _texto_plantilla(formatear_kg(kg))},
-            {"type": "text", "text": _texto_plantilla(formatear_kg(bultos))},
+            {"type": "text", "text": _texto_plantilla(_descripcion_fundos(fundos))},
         ],
         etiqueta="cuestionario",
     )
