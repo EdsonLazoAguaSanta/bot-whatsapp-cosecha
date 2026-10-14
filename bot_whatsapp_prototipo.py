@@ -57,6 +57,8 @@ CUESTIONARIO_HORA_PM = os.getenv("CUESTIONARIO_HORA_PM", "15:00")
 # Resumen semanal informativo de precosecha (lunes), separado de la alerta de desviaciones.
 RESUMEN_SEMANAL_DIA = os.getenv("RESUMEN_SEMANAL_DIA", "mon")
 RESUMEN_SEMANAL_HORA = os.getenv("RESUMEN_SEMANAL_HORA", "08:00")
+# Cuántas semanas hacia adelante cubre el resumen de los lunes.
+RESUMEN_SEMANAS = int(os.getenv("RESUMEN_SEMANAS", "3"))
 ALERTA_SEMANAL_DIA = os.getenv("ALERTA_SEMANAL_DIA", "mon")  # día en formato cron: mon, tue, ...
 ALERTA_SEMANAL_HORA = os.getenv("ALERTA_SEMANAL_HORA", "08:00")
 UMBRAL_DESVIACION_PCT = float(os.getenv("UMBRAL_DESVIACION_PCT", "15"))
@@ -3014,60 +3016,148 @@ def enviar_cuestionarios(turno, fecha=None):
 def _lunes_de(fecha):
     return fecha - timedelta(days=fecha.weekday())
 
+FUENTES_RESUMEN = (BASE_ORIGEN_ESTIM_PRIMAVERA, BASE_ORIGEN_TRISEMANAL)
+
+def obtener_previsto_por_fuente(fecha_inicio, fecha_fin, fundos=None):
+    """Previsto por semana, productor y especie, SEPARADO por fuente (Precosecha y
+    Trisemanal), para poder mostrar las dos en la misma tabla. Se filtran las filas con
+    kg NULL porque son duplicados exactos que doblarían los bultos."""
+    conn = conectar_sql()
+    if not conn:
+        return None
+    try:
+        condiciones = [
+            "[Base Origen] IN (?, ?)",
+            "CAST(Fecha AS DATE) BETWEEN ? AND ?",
+            "KgsRecepcionados IS NOT NULL",
+        ]
+        params = [
+            FUENTES_RESUMEN[0], FUENTES_RESUMEN[1],
+            fecha_inicio.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"),
+        ]
+        fundos = [f for f in (fundos or []) if f]
+        if fundos:
+            condiciones.append("(" + " OR ".join(["Productor LIKE ?"] * len(fundos)) + ")")
+            params.extend(f"%{f}%" for f in fundos)
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT Productor, Especie, CAST(Semana AS INT) AS semana, [Base Origen],
+                   MIN(CAST(Fecha AS DATE)) AS desde,
+                   SUM(KgsRecepcionados) AS kg
+            FROM [Recepcion_Consolidada]
+            WHERE {" AND ".join(condiciones)}
+            GROUP BY Productor, Especie, CAST(Semana AS INT), [Base Origen]
+            HAVING SUM(KgsRecepcionados) > 0
+        """, params)
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+def _tabla_dos_fuentes(datos, titulo, ancho_clave, orden=None):
+    """Tabla de dos columnas de kilos (Precosecha y Trisemanal) sobre una misma clave.
+    `datos` es {clave: [kg_precosecha, kg_trisemanal]}. Un guion marca la fuente que
+    todavía no tiene datos cargados, que es lo normal al principio de la temporada."""
+    etiqueta_p = ETIQUETA_FUENTE[BASE_ORIGEN_ESTIM_PRIMAVERA]
+    etiqueta_t = ETIQUETA_FUENTE[BASE_ORIGEN_TRISEMANAL]
+    # 11 y no 10: "Precosecha" mide 10, y sin ese espacio los dos encabezados se pegan.
+    ancho_num = 11
+    filas = [f"{titulo:<{ancho_clave}}{etiqueta_p:>{ancho_num}}{etiqueta_t:>{ancho_num}}"]
+    claves = orden if orden is not None else sorted(datos, key=lambda k: datos[k][0], reverse=True)
+    tot_p = tot_t = 0
+    for clave in claves:
+        kg_p, kg_t = datos[clave]
+        tot_p += kg_p
+        tot_t += kg_t
+        filas.append(
+            f"{_truncar(str(clave), ancho_clave):<{ancho_clave}}"
+            f"{(formatear_kg(kg_p) if kg_p else '-'):>{ancho_num}}"
+            f"{(formatear_kg(kg_t) if kg_t else '-'):>{ancho_num}}"
+        )
+    filas.append(
+        f"{'TOTAL':<{ancho_clave}}"
+        f"{(formatear_kg(tot_p) if tot_p else '-'):>{ancho_num}}"
+        f"{(formatear_kg(tot_t) if tot_t else '-'):>{ancho_num}}"
+    )
+    return "\n".join(filas), tot_p, tot_t
+
 def construir_resumen_semanal(fecha=None, nombre=None, fundos=None, para_eas=False):
-    """Mensaje de los lunes 08:00: total previsto de la semana. Para el productor va su
-    propio desglose por especie; para el EAS, el consolidado por productor."""
+    """Mensaje de los lunes 08:00: lo previsto para las próximas RESUMEN_SEMANAS semanas,
+    mostrando Precosecha y Trisemanal lado a lado (la trisemanal recién aparece cuando la
+    temporada avanza). Para el productor va su desglose por semana y especie; para el EAS,
+    el consolidado por semana y por productor."""
     try:
         fecha = fecha or date.today()
         inicio = _lunes_de(fecha)
-        fin = inicio + timedelta(days=6)
-        filas = obtener_previsto(inicio, fin, fundos=fundos)
+        fin = inicio + timedelta(days=RESUMEN_SEMANAS * 7 - 1)
+        filas = obtener_previsto_por_fuente(inicio, fin, fundos=fundos)
         if not filas:
             return None
+
+        # Acumuladores: [kg Precosecha, kg Trisemanal]
+        por_semana, por_especie, por_productor = {}, {}, {}
+        etiqueta_semana_txt = {}
+        por_productor_semana = {}
+        for productor, especie, semana, origen, desde, kg in filas:
+            i = 0 if origen == BASE_ORIGEN_ESTIM_PRIMAVERA else 1
+            kg = kg or 0
+            por_semana.setdefault(semana, [0, 0])[i] += kg
+            por_especie.setdefault(traducir_especie(especie), [0, 0])[i] += kg
+            por_productor.setdefault(productor, [0, 0])[i] += kg
+            por_productor_semana.setdefault(productor, {}).setdefault(semana, [0, 0])[i] += kg
+            # Se etiqueta cada semana con el lunes de esa semana, no con la primera fecha
+            # con datos, para que el rótulo no cambie según qué días traigan registros.
+            if semana not in etiqueta_semana_txt and desde:
+                lunes = _lunes_de(desde)
+                etiqueta_semana_txt[semana] = f"S{etiqueta_semana(semana)} {lunes.strftime('%d-%m')}"
+
+        semanas_ordenadas = sorted(por_semana, key=orden_semana)
+        claves_semana = [etiqueta_semana_txt.get(s, f"S{etiqueta_semana(s)}") for s in semanas_ordenadas]
+        datos_semana = {etiqueta_semana_txt.get(s, f"S{etiqueta_semana(s)}"): por_semana[s]
+                        for s in semanas_ordenadas}
         rango = f"del {inicio.strftime('%d-%m')} al {fin.strftime('%d-%m')}"
-        etiqueta = ETIQUETA_FUENTE[BASE_ORIGEN_CUESTIONARIO].lower()
 
         if para_eas:
-            por_productor = {}
-            for prod, _especie, _envase, kg, bultos in filas:
-                acum = por_productor.setdefault(prod, [0, 0])
-                acum[0] += kg or 0
-                acum[1] += bultos or 0
-            anchos = {"prod": 22, "kg": 11, "bultos": 8}
-            tabla = [
-                f"{'Productor':<{anchos['prod']}}{'Kilos':>{anchos['kg']}}{'Bultos':>{anchos['bultos']}}"
-            ]
-            tot_kg = tot_bultos = 0
-            for prod, (kg, bultos) in sorted(por_productor.items(), key=lambda x: x[1][0], reverse=True):
-                tot_kg += kg
-                tot_bultos += bultos
-                tabla.append(
-                    f"{_truncar(str(prod), anchos['prod']):<{anchos['prod']}}"
-                    f"{formatear_kg(kg):>{anchos['kg']}}{formatear_kg(bultos):>{anchos['bultos']}}"
-                )
-            tabla.append(
-                f"{'TOTAL':<{anchos['prod']}}{formatear_kg(tot_kg):>{anchos['kg']}}"
-                f"{formatear_kg(tot_bultos):>{anchos['bultos']}}"
-            )
+            tabla_sem, tot_p, tot_t = _tabla_dos_fuentes(datos_semana, "Semana", 12, orden=claves_semana)
+            tabla_prod, _, _ = _tabla_dos_fuentes(por_productor, "Productor", 20)
             return "\n".join([
-                f"📅 Precosecha ({etiqueta}) prevista para la semana {rango}",
+                f"📅 Previsto para las próximas {RESUMEN_SEMANAS} semanas ({rango})",
                 "",
-                f"```{chr(10).join(tabla)}```",
+                f"```{tabla_sem}```",
                 "",
-                f"{len(por_productor)} productores. Mensaje informativo, no requiere respuesta.",
+                f"Por productor (total {RESUMEN_SEMANAS} semanas):",
+                f"```{tabla_prod}```",
+                "",
+                f"{len(por_productor)} productores. "
+                + ("La trisemanal aún no tiene datos cargados para este periodo. "
+                   if not tot_t else "")
+                + "Mensaje informativo, no requiere respuesta.",
             ])
 
-        agrupado = _agrupar_por_productor(filas)
         saludo = f"Hola {nombre.strip()}" if nombre and nombre.strip() else "Hola"
+        tabla_sem, tot_p, tot_t = _tabla_dos_fuentes(datos_semana, "Semana", 12, orden=claves_semana)
         lineas = [
-            f"{saludo}, esta es tu Precosecha ({etiqueta}) prevista para la semana {rango}:",
+            f"{saludo}, esta es tu cosecha prevista para las próximas {RESUMEN_SEMANAS} "
+            f"semanas ({rango}):",
+            "",
+            f"```{tabla_sem}```",
             "",
         ]
-        for prod in list(agrupado)[:MAX_SECCIONES_CUESTIONARIO]:
-            tabla, _, _ = _tabla_previsto(agrupado[prod])
-            lineas.append(f"Productor {prod}:")
-            lineas.append(f"```{tabla}```")
-            lineas.append("")
+        if len(por_productor) > 1:
+            # Si tiene varios fundos, se detalla cada uno por semana.
+            for productor in list(por_productor)[:MAX_SECCIONES_CUESTIONARIO]:
+                datos_p = {etiqueta_semana_txt.get(s, f"S{etiqueta_semana(s)}"): v
+                           for s, v in por_productor_semana[productor].items()}
+                orden_p = [c for c in claves_semana if c in datos_p]
+                tabla_p, _, _ = _tabla_dos_fuentes(datos_p, "Semana", 12, orden=orden_p)
+                lineas.append(f"Productor {productor}:")
+                lineas.append(f"```{tabla_p}```")
+                lineas.append("")
+        tabla_esp, _, _ = _tabla_dos_fuentes(por_especie, "Especie", 12)
+        lineas.append(f"Por especie (total {RESUMEN_SEMANAS} semanas):")
+        lineas.append(f"```{tabla_esp}```")
+        lineas.append("")
+        if not tot_t:
+            lineas.append("La trisemanal aún no tiene datos cargados para este periodo.")
         lineas.append("Mensaje informativo, no requiere respuesta.")
         return "\n".join(lineas)
     except Exception as e:
