@@ -7,3 +7,4 @@ conversaciones.db
 *.log
 caddy.exe
 .env.bak*
+numeros_eliminados.json
