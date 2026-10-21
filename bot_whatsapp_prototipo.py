@@ -121,6 +121,22 @@ def inicializar_db_local():
             fecha_hora TEXT DEFAULT (datetime('now', 'localtime'))
         )
     """)
+    # Cola de mensajes que no se pudieron mandar porque la ventana de 24 h estaba cerrada.
+    # Se le envía una plantilla a la persona y su texto queda aquí hasta que responda; su
+    # respuesta reabre la ventana y recién ahí se le entrega. Sirve para cualquier envío
+    # automático (cuestionario, resumen semanal, alerta), no solo el cuestionario.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mensajes_pendientes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero TEXT,
+            tipo TEXT,
+            mensaje TEXT,
+            cuestionario_id INTEGER,
+            entregado INTEGER DEFAULT 0,
+            fecha_hora TEXT DEFAULT (datetime('now', 'localtime')),
+            fecha_entrega TEXT
+        )
+    """)
     # Estado real de entrega de cada mensaje que envía el bot. La API de Meta responde 200 y
     # un id apenas acepta el mensaje; si después NO se entrega, eso solo llega por los
     # "statuses" del webhook. Sin esta tabla, un mensaje que nunca llegó se veía como enviado.
@@ -1633,17 +1649,23 @@ def cargar_grupos_conocidos():
 
 GRUPOS_CONOCIDOS = cargar_grupos_conocidos()
 
+def temporada_de(fecha):
+    """Temporada a la que pertenece una fecha, según la definición del negocio: la temporada
+    N va de la semana ISO 44 del año N-1 a la 43 del año N. Es la inversa de rango_temporada.
+    Se usa el año ISO y no el del calendario: a principios de enero la semana ISO todavía
+    puede ser del año anterior (ej. 2027-01-01 es la semana 53 de 2026), y mezclarlos
+    adelantaba la temporada un año entero."""
+    anio_iso, semana_iso, _ = fecha.isocalendar()
+    return anio_iso + 1 if semana_iso >= 44 else anio_iso
+
 def obtener_temporada_actual():
-    """Devuelve el número de temporada vigente (la de la fecha de hoy)"""
+    """Temporada vigente hoy. Se calcula con la definición del negocio y NO con el MAX de la
+    columna Temporada: la base etiqueta como temporada siguiente filas cuya fecha todavía no
+    llega al inicio de esa temporada, y eso dejaba un rango invertido en los días previos
+    (verificado el 21-10-2026: devolvía 2027, cuyo rango parte el 26-10, y las consultas de
+    'esta temporada' quedaban vacías)."""
     try:
-        conn = conectar_sql()
-        if not conn:
-            return None
-        cursor = conn.cursor()
-        cursor.execute("SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE()")
-        fila = cursor.fetchone()
-        conn.close()
-        return int(fila[0]) if fila and fila[0] is not None else None
+        return temporada_de(date.today())
     except Exception as e:
         logger.error(f"Error obteniendo temporada actual: {str(e)}")
         return None
@@ -2655,12 +2677,14 @@ def registrar_cuestionario_enviado(numero, turno, mensaje, estado="pendiente"):
         "AND estado IN ('pendiente', 'pendiente_plantilla')",
         (normalizar_numero(numero),)
     )
-    conn.execute(
+    cursor = conn.execute(
         "INSERT INTO cuestionarios (numero, turno, mensaje, estado) VALUES (?, ?, ?, ?)",
         (normalizar_numero(numero), turno, mensaje, estado)
     )
+    nuevo_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    return nuevo_id
 
 def obtener_cuestionario_activo(numero):
     """Último cuestionario de las últimas 24 h para ese número, esté pendiente O ya
@@ -2903,6 +2927,18 @@ def construir_confirmacion_tarde(fecha=None, nombre=None, fundos=None, ajuste_pr
         logger.error(f"Error construyendo confirmación de tarde: {str(e)}")
         return None
 
+def _totales_semana(fecha, fundos):
+    """Kilos y bultos previstos en el periodo del resumen semanal, para las cifras que van
+    en la plantilla de reenganche."""
+    inicio = _lunes_de(fecha or date.today())
+    fin = inicio + timedelta(days=RESUMEN_SEMANAS * 7 - 1)
+    filas = obtener_previsto_por_fuente(inicio, fin, fundos=fundos) or []
+    # columna 5 = kg; se suman ambas fuentes por separado y se usa la mayor, que es la
+    # cifra que la persona reconoce como "lo previsto".
+    kg_p = sum((f[5] or 0) for f in filas if f[3] == BASE_ORIGEN_ESTIM_PRIMAVERA)
+    kg_t = sum((f[5] or 0) for f in filas if f[3] == BASE_ORIGEN_TRISEMANAL)
+    return max(kg_p, kg_t), 0
+
 def _totales_previstos(fecha, fundos):
     """Total de kilos y bultos previstos ese día, para las cifras de la plantilla."""
     filas = obtener_previsto(fecha, fecha, fundos=fundos) or []
@@ -2910,33 +2946,78 @@ def _totales_previstos(fecha, fundos):
     total_bultos = sum((f[4] or 0) for f in filas)
     return total_kg, total_bultos
 
-def entregar_cuestionario_pendiente(numero):
-    """Si a esta persona se le mandó la plantilla y ahora nos escribió, la ventana de 24 h
-    quedó abierta: se le entrega la tabla completa que había quedado guardada. Devuelve True
-    si se entregó algo."""
+def encolar_mensaje_pendiente(numero, tipo, mensaje, cuestionario_id=None):
+    """Guarda un mensaje que no se pudo enviar por la ventana de 24 h, para entregarlo
+    apenas la persona responda a la plantilla."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.execute(
+            "INSERT INTO mensajes_pendientes (numero, tipo, mensaje, cuestionario_id) "
+            "VALUES (?, ?, ?, ?)",
+            (normalizar_numero(numero), tipo, mensaje, cuestionario_id)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error encolando mensaje pendiente: {str(e)}")
+        return False
+
+def entregar_mensajes_pendientes(numero):
+    """La persona nos escribió, así que la ventana de 24 h está abierta: se le entregan los
+    mensajes que habían quedado en cola (del más antiguo al más nuevo). Devuelve cuántos."""
     try:
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.row_factory = sqlite3.Row
-        fila = conn.execute(
-            "SELECT id, mensaje FROM cuestionarios WHERE numero = ? AND estado = 'pendiente_plantilla' "
-            "AND fecha_hora_envio >= datetime('now', 'localtime', '-1 day') ORDER BY id DESC LIMIT 1",
+        filas = conn.execute(
+            "SELECT id, tipo, mensaje, cuestionario_id FROM mensajes_pendientes "
+            "WHERE numero = ? AND entregado = 0 "
+            "AND fecha_hora >= datetime('now', 'localtime', '-3 days') ORDER BY id",
             (normalizar_numero(numero),)
-        ).fetchone()
+        ).fetchall()
         conn.close()
-        if not fila:
-            return False
-        if not enviar_whatsapp(numero, fila["mensaje"]):
-            logger.error(f"No pude entregar el cuestionario guardado a {numero}")
-            return False
-        conn = sqlite3.connect(DB_LOCAL_PATH)
-        conn.execute("UPDATE cuestionarios SET estado = 'pendiente' WHERE id = ?", (fila["id"],))
-        conn.commit()
-        conn.close()
-        logger.info(f"Cuestionario guardado entregado a {numero} tras su respuesta a la plantilla")
-        return True
+        if not filas:
+            return 0
+        entregados = 0
+        for fila in filas:
+            if not enviar_whatsapp(numero, fila["mensaje"]):
+                logger.error(f"No pude entregar el mensaje en cola {fila['id']} a {numero}")
+                continue
+            conn = sqlite3.connect(DB_LOCAL_PATH)
+            conn.execute(
+                "UPDATE mensajes_pendientes SET entregado = 1, "
+                "fecha_entrega = datetime('now','localtime') WHERE id = ?",
+                (fila["id"],)
+            )
+            # Un cuestionario recién queda a la espera de respuesta cuando su tabla llegó.
+            if fila["cuestionario_id"]:
+                conn.execute(
+                    "UPDATE cuestionarios SET estado = 'pendiente' WHERE id = ?",
+                    (fila["cuestionario_id"],)
+                )
+            conn.commit()
+            conn.close()
+            entregados += 1
+            logger.info(f"Entregado a {numero} el mensaje en cola de tipo '{fila['tipo']}'")
+        return entregados
     except Exception as e:
-        logger.error(f"Error entregando cuestionario pendiente: {str(e)}")
-        return False
+        logger.error(f"Error entregando mensajes pendientes: {str(e)}")
+        return 0
+
+def enviar_o_encolar(destinatario, mensaje, tipo, kg_plantilla=0, cuestionario_id=None):
+    """Envía el mensaje si la ventana de 24 h está abierta; si no, manda la plantilla de
+    reenganche y lo deja en cola. Devuelve 'directo', 'plantilla' o 'error'."""
+    numero = destinatario["numero"]
+    if ventana_24h_abierta(numero):
+        return "directo" if enviar_whatsapp(numero, mensaje) else "error"
+    ok = enviar_plantilla_cuestionario(
+        numero, destinatario.get("nombre"), kg_plantilla,
+        fundos=_fundos_para_envio(destinatario),
+    )
+    if not ok:
+        return "error"
+    encolar_mensaje_pendiente(numero, tipo, mensaje, cuestionario_id=cuestionario_id)
+    return "plantilla"
 
 def _ajuste_registrado_hoy(numero, fecha=None):
     """Ajuste que el número reportó hoy (para repetirlo en el mensaje de las 15:00)."""
@@ -2990,22 +3071,21 @@ def enviar_cuestionarios(turno, fecha=None):
                 logger.info(f"Cuestionario {turno}: sin previsto para {d['numero']} (fundos={d.get('fundos')})")
                 continue
 
-            if ventana_24h_abierta(d["numero"]):
-                # Escribió hace poco: se le puede mandar la tabla directamente.
-                if enviar_whatsapp(d["numero"], mensaje):
-                    registrar_cuestionario_enviado(d["numero"], turno, mensaje)
-                    enviados += 1
-                else:
-                    errores += 1
-                continue
-
-            # Ventana cerrada: el texto libre sería rechazado (131047). Se manda la plantilla
-            # con las cifras en una línea y la tabla queda guardada para entregarla apenas
-            # la persona responda (ver entregar_cuestionario_pendiente).
             kg, _bultos = _totales_previstos(fecha, _fundos_para_envio(d))
-            if enviar_plantilla_cuestionario(d["numero"], d.get("nombre"), kg,
-                                             fundos=_fundos_para_envio(d)):
-                registrar_cuestionario_enviado(d["numero"], turno, mensaje, estado="pendiente_plantilla")
+            abierta = ventana_24h_abierta(d["numero"])
+            # El cuestionario se registra en los dos casos; si va por plantilla queda como
+            # 'pendiente_plantilla' y pasa a 'pendiente' cuando la tabla se entrega.
+            cid = registrar_cuestionario_enviado(
+                d["numero"], turno, mensaje,
+                estado="pendiente" if abierta else "pendiente_plantilla",
+            )
+            resultado = enviar_o_encolar(
+                d, mensaje, f"cuestionario_{turno}", kg_plantilla=kg,
+                cuestionario_id=None if abierta else cid,
+            )
+            if resultado == "directo":
+                enviados += 1
+            elif resultado == "plantilla":
                 por_plantilla += 1
             else:
                 errores += 1
@@ -3175,7 +3255,7 @@ def enviar_resumen_semanal(fecha=None):
     (todo solo a los admin mientras dure el modo prueba)."""
     try:
         fecha = fecha or date.today()
-        enviados = sin_datos = errores = omitidos = 0
+        enviados = sin_datos = errores = omitidos = por_plantilla = 0
         for d in destinatarios_envios(("zonal", "productor")):
             if _sin_fundos_asignados(d):
                 omitidos += 1
@@ -3188,8 +3268,12 @@ def enviar_resumen_semanal(fecha=None):
             if not mensaje:
                 sin_datos += 1
                 continue
-            if enviar_whatsapp(d["numero"], mensaje):
+            kg, _b = _totales_semana(fecha, _fundos_para_envio(d))
+            resultado = enviar_o_encolar(d, mensaje, "resumen_semanal", kg_plantilla=kg)
+            if resultado == "directo":
                 enviados += 1
+            elif resultado == "plantilla":
+                por_plantilla += 1
             else:
                 errores += 1
 
@@ -3197,17 +3281,25 @@ def enviar_resumen_semanal(fecha=None):
         mensaje_eas = construir_resumen_semanal(fecha, para_eas=True)
         destinatarios_eas = destinatarios_envios(("eas", "admin", "gerencia"))
         if mensaje_eas:
+            kg_eas, _b = _totales_semana(fecha, None)
+            aceptados_eas = []
             for d in destinatarios_eas:
-                if enviar_whatsapp(d["numero"], mensaje_eas):
+                resultado = enviar_o_encolar(d, mensaje_eas, "resumen_semanal", kg_plantilla=kg_eas)
+                if resultado == "directo":
                     enviados_eas += 1
-            if destinatarios_eas:
-                registrar_alerta_enviada("resumen_semanal_eas", mensaje_eas, destinatarios_eas)
+                    aceptados_eas.append(d)
+                elif resultado == "plantilla":
+                    por_plantilla += 1
+                    aceptados_eas.append(d)
+            if aceptados_eas:
+                registrar_alerta_enviada("resumen_semanal_eas", mensaje_eas, aceptados_eas)
         logger.info(
-            f"Resumen semanal: {enviados} a productores, {enviados_eas} al EAS, "
-            f"{sin_datos} sin datos, {omitidos} omitidos por no tener fundos"
+            f"Resumen semanal: {enviados} directos a zonales, {enviados_eas} directos al EAS, "
+            f"{por_plantilla} por plantilla, {sin_datos} sin datos, {omitidos} sin fundos"
         )
         return {"enviados_productores": enviados, "enviados_eas": enviados_eas,
-                "sin_datos": sin_datos, "errores": errores, "omitidos_sin_fundos": omitidos}
+                "por_plantilla": por_plantilla, "sin_datos": sin_datos,
+                "errores": errores, "omitidos_sin_fundos": omitidos}
     except Exception as e:
         logger.error(f"Error en job de resumen semanal: {str(e)}")
         return {"error": str(e)}
@@ -3340,12 +3432,23 @@ def enviar_alerta_desviaciones():
         if not destinatarios:
             logger.warning("Alerta de desviaciones: no hay destinatarios")
             return {"enviados": 0, "detalle": "sin destinatarios"}
-        aceptados = [d for d in destinatarios if enviar_whatsapp(d["numero"], mensaje)]
-        enviados = len(aceptados)
+        aceptados, enviados, por_plantilla = [], 0, 0
+        for d in destinatarios:
+            resultado = enviar_o_encolar(d, mensaje, "alerta_desviaciones")
+            if resultado == "directo":
+                enviados += 1
+                aceptados.append(d)
+            elif resultado == "plantilla":
+                por_plantilla += 1
+                aceptados.append(d)
         if aceptados:
             registrar_alerta_enviada("desviacion_semanal", mensaje, aceptados)
-        logger.info(f"Alerta de desviaciones: {enviados} enviados, {num_desviadas} variedades fuera de rango")
-        return {"enviados": enviados, "variedades_desviadas": num_desviadas}
+        logger.info(
+            f"Alerta de desviaciones: {enviados} directos, {por_plantilla} por plantilla, "
+            f"{num_desviadas} variedades fuera de rango"
+        )
+        return {"enviados": enviados, "por_plantilla": por_plantilla,
+                "variedades_desviadas": num_desviadas}
     except Exception as e:
         logger.error(f"Error en job de alerta de desviaciones: {str(e)}")
         return {"error": str(e)}
@@ -3464,7 +3567,7 @@ async def receive_message(request: Request):
                         # Si tenía un cuestionario esperando (se le mandó la plantilla porque
                         # la ventana de 24 h estaba cerrada), su mensaje la reabre: primero se
                         # le entrega la tabla y recién después se atiende lo que escribió.
-                        entregar_cuestionario_pendiente(numero_sender)
+                        entregar_mensajes_pendientes(numero_sender)
 
                         # Procesar mensaje
                         respuesta = procesar_mensaje(msg_text, numero_sender, es_audio=(msg_type == "audio"))
