@@ -1297,7 +1297,10 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
 
     lineas.append(f"```{chr(10).join(filas_tabla)}```")
     if truncado:
-        lineas.append(f"\n(mostrando {MAX_FILAS_FLEXIBLE} de {len(claves_ordenadas)} filas — acota la consulta para ver el resto; los totales sí incluyen todo)")
+        lineas.append(
+            f"\n(mostrando {MAX_FILAS_FLEXIBLE} de {len(claves_ordenadas)} filas; los totales "
+            f"sí incluyen todo. Si lo quieres completo, pídemelo en Excel o PDF)"
+        )
 
     lineas.append(
         f"\n📦 Total general: {etiqueta_estimado} {formatear_kg(tot_est)} {unidad}, real {formatear_kg(tot_real)} {unidad}"
@@ -1306,7 +1309,8 @@ def formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filt
 
 def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, especie=None, variedad=None,
                               productor=None, packing=None, grupo=None, envase=None, temporada=None,
-                              fuente_estimado=None, kg_por_caja_eq=None, alcance=None):
+                              fuente_estimado=None, kg_por_caja_eq=None, alcance=None,
+                              formato_archivo=None, numero_destino=None):
     """
     Consulta genérica: agrupa por las dimensiones exactas que se pidan (cualquier combinación
     de especie/variedad/productor/packing/grupo/fecha, o ninguna si se pide solo el total),
@@ -1425,6 +1429,18 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
                 for fila in filas
             ]
 
+        if formato_archivo:
+            # El archivo lleva TODAS las filas: no tiene el tope de la tabla del chat.
+            titulo = (
+                f"Cosecha{filtro_desc} {fecha_inicio} a {fecha_fin}".replace("  ", " ")
+            )
+            encabezados, filas_archivo = _filas_para_archivo(
+                filas, dimensiones, unidad, base_estimado
+            )
+            return construir_y_enviar_archivo(
+                numero_destino, formato_archivo, titulo, encabezados, filas_archivo
+            )
+
         resultado = formatear_cosecha_flexible(filas, dimensiones, fecha_inicio, fecha_fin, filtro_desc, unidad, base_estimado)
         if not resultado:
             return f"No hay datos registrados{filtro_desc} entre {fecha_inicio} y {fecha_fin}"
@@ -1432,6 +1448,47 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
     except Exception as e:
         logger.error(f"Error en obtener_cosecha_flexible: {str(e)}")
         return f"Error al consultar: {str(e)}"
+
+def _filas_para_archivo(filas, dimensiones, unidad, base_estimado):
+    """Convierte el resultado crudo de la consulta flexible en encabezados + filas planas,
+    una fila por combinación, con una columna por fuente. Sin topes: el archivo lleva todo."""
+    etiqueta_est = ETIQUETA_FUENTE.get(base_estimado, "Estimado")
+    datos = {}
+    for fila in filas:
+        clave = tuple(fila[:len(dimensiones)])
+        origen = fila[len(dimensiones)]
+        total = fila[-1] or 0
+        acum = datos.setdefault(clave, {"est": 0, "real": 0})
+        acum["real" if origen == BASE_ORIGEN_REAL else "est"] += total
+
+    encabezados = [DIMENSIONES_ETIQUETA.get(d, d.title()) for d in dimensiones]
+    encabezados += [f"{etiqueta_est} ({unidad})", f"Real ({unidad})",
+                    f"Diferencia ({unidad})", "Desviación %"]
+
+    def ordenar(clave):
+        return [orden_semana(v) if d == "semana" and v is not None else str(v)
+                for v, d in zip(clave, dimensiones)]
+
+    filas_salida = []
+    for clave in sorted(datos, key=ordenar):
+        est = datos[clave]["est"]
+        real = datos[clave]["real"]
+        valores = []
+        for v, d in zip(clave, dimensiones):
+            if d == "fecha":
+                valores.append(_fecha_str(v))
+            elif d == "semana":
+                valores.append(etiqueta_semana(v) if v is not None else "-")
+            elif d == "especie":
+                valores.append(traducir_especie(v))
+            elif d == "grupo":
+                valores.append(_formatear_grupo(v))
+            else:
+                valores.append(str(v).strip() if v is not None else "-")
+        desviacion = round((real - est) / est * 100, 1) if est else None
+        filas_salida.append(valores + [round(est), round(real), round(real - est),
+                                       desviacion if desviacion is not None else ""])
+    return encabezados, filas_salida
 
 def _es_caja_eq(envase):
     """True si el envase pedido es la unidad 'Caja Eq' (tolera 'cajas eq', 'CAJA EQ', etc.)."""
@@ -1988,6 +2045,11 @@ TOOLS = [
                     "enum": ["trisemanal", "invierno"],
                     "description": "Omitir SIEMPRE por defecto (se usa Estim Primavera automáticamente). Solo pasar 'trisemanal' o 'invierno' si el usuario pide explícitamente esa fuente por su nombre."
                 },
+                "formato_archivo": {
+                    "type": "string",
+                    "enum": ["excel", "pdf"],
+                    "description": "Pasar SOLO si el usuario pide el resultado como archivo ('mándamelo en Excel', 'en PDF', 'un archivo con el detalle completo'). El archivo lleva TODAS las filas, sin el tope de la tabla del chat. Si no pide archivo, omitir."
+                },
                 "kg_por_caja_eq": {
                     "type": "number",
                     "description": "Cuántos kilos equivalen a una Caja Eq para la variedad consultada. Pasarlo SOLO cuando el usuario ya respondió esa cifra, después de que la herramienta la haya pedido. No inventarlo ni asumir un valor típico."
@@ -2283,6 +2345,14 @@ la cantidad REAL de unidades registradas de ese envase, no una conversión calcu
 kilos por unidad varían según la fruta y no son un factor fijo confiable). Si el usuario pregunta por
 kilos/kg, no uses este parámetro.
 
+ARCHIVOS (Excel y PDF): si el usuario pide el resultado como archivo —"mándamelo en Excel",
+"en PDF", "un archivo con el detalle completo", "para abrirlo en la planilla"— usa
+consultar_cosecha_flexible con formato_archivo="excel" o "pdf" y los filtros y agrupación que
+corresponda. El archivo se le envía solo, con TODAS las filas (sin el tope de la tabla del chat),
+así que no intentes además pegarle la tabla en el mensaje. Si no especifica formato, usa "excel".
+Cuando una respuesta te salga recortada por tamaño, ofrécele el archivo en vez de pedirle que
+acote la consulta.
+
 CAJAS EQ (caso especial): "Caja Eq" es una unidad que solo algunas especies/variedades manejan en el
 sistema (principalmente uva). Cuando el usuario pregunte por cajas eq / cajas equivalentes, usa
 SIEMPRE consultar_cosecha_flexible con envase="CAJA EQ" (esa herramienta es la única que sabe
@@ -2401,6 +2471,8 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             fuente_estimado=tool_input.get("fuente_estimado") or None,
             kg_por_caja_eq=tool_input.get("kg_por_caja_eq") or None,
             alcance=alcance,
+            formato_archivo=tool_input.get("formato_archivo") or None,
+            numero_destino=numero_sender,
         )
 
     variedad = normalizar_variedad(tool_input.get("variedad", ""))
@@ -3216,7 +3288,7 @@ def construir_resumen_semanal(fecha=None, nombre=None, fundos=None, para_eas=Fal
                 f"{len(por_productor)} productores. "
                 + ("La trisemanal aún no tiene datos cargados para este periodo. "
                    if not tot_t else "")
-                + "Mensaje informativo, no requiere respuesta.",
+                + "Si lo necesitas en Excel o PDF, pídemelo y te lo mando como archivo.",
             ])
 
         saludo = f"Hola {nombre.strip()}" if nombre and nombre.strip() else "Hola"
@@ -3244,7 +3316,7 @@ def construir_resumen_semanal(fecha=None, nombre=None, fundos=None, para_eas=Fal
         lineas.append("")
         if not tot_t:
             lineas.append("La trisemanal aún no tiene datos cargados para este periodo.")
-        lineas.append("Mensaje informativo, no requiere respuesta.")
+        lineas.append("Si lo necesitas en Excel o PDF, pídemelo y te lo mando como archivo.")
         return "\n".join(lineas)
     except Exception as e:
         logger.error(f"Error construyendo resumen semanal: {str(e)}")
@@ -3754,6 +3826,146 @@ def enviar_plantilla_cuestionario(numero_destino, nombre, kg, fundos=None):
         ],
         etiqueta="cuestionario",
     )
+
+# ============================================================================
+# ARCHIVOS (Excel y PDF) PARA RESULTADOS QUE NO CABEN EN UN MENSAJE
+# ============================================================================
+
+FORMATOS_ARCHIVO = {
+    "excel": ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+    "pdf": ("pdf", "application/pdf"),
+}
+
+def generar_excel(titulo, encabezados, filas):
+    """Planilla .xlsx con encabezado en negrita, anchos ajustados y números como números
+    (no texto), para que el EAS pueda filtrar y sumar sin reformatear nada."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
+
+    libro = Workbook()
+    hoja = libro.active
+    hoja.title = "Datos"
+    hoja.append([titulo])
+    hoja["A1"].font = Font(bold=True, size=13)
+    hoja.append([])
+    hoja.append(list(encabezados))
+    for celda in hoja[3]:
+        celda.font = Font(bold=True)
+        celda.alignment = Alignment(horizontal="center")
+    for fila in filas:
+        hoja.append(list(fila))
+    for i, encabezado in enumerate(encabezados, start=1):
+        ancho = max([len(str(encabezado))] + [len(str(f[i - 1])) for f in filas] or [0])
+        hoja.column_dimensions[get_column_letter(i)].width = min(max(ancho + 3, 11), 45)
+    for fila in hoja.iter_rows(min_row=4):
+        for celda in fila:
+            if isinstance(celda.value, (int, float)):
+                celda.number_format = "#,##0"
+    hoja.freeze_panes = "A4"
+    buffer = io.BytesIO()
+    libro.save(buffer)
+    return buffer.getvalue()
+
+def generar_pdf(titulo, encabezados, filas):
+    """PDF en tabla, pensado para leer o imprimir. Se parte en páginas automáticamente."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter, landscape
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=landscape(letter) if len(encabezados) > 4 else letter,
+        leftMargin=14 * mm, rightMargin=14 * mm, topMargin=14 * mm, bottomMargin=14 * mm,
+        title=titulo,
+    )
+    estilos = getSampleStyleSheet()
+    elementos = [Paragraph(titulo, estilos["Heading2"]), Spacer(1, 7 * mm)]
+    datos = [list(encabezados)] + [[_celda_pdf(v) for v in f] for f in filas]
+    tabla = Table(datos, repeatRows=1)
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3f7d4f")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f4ee")]),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d8ddd2")),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    elementos.append(tabla)
+    doc.build(elementos)
+    return buffer.getvalue()
+
+def _celda_pdf(valor):
+    if isinstance(valor, (int, float)):
+        return formatear_kg(valor)
+    return str(valor if valor is not None else "")
+
+def enviar_documento(numero_destino, contenido, nombre_archivo, mime, descripcion=""):
+    """Sube el archivo a Meta y lo manda como documento. Igual que el texto libre, necesita
+    la ventana de 24 h abierta: los archivos no se pueden mandar dentro de una plantilla."""
+    try:
+        subida = requests.post(
+            f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/media",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            files={"file": (nombre_archivo, contenido, mime)},
+            data={"messaging_product": "whatsapp", "type": mime},
+        )
+        if subida.status_code != 200:
+            logger.error(f"No pude subir {nombre_archivo} a Meta: {subida.status_code} {subida.text[:300]}")
+            return False
+        media_id = subida.json().get("id")
+        envio = requests.post(
+            f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": numero_destino,
+                "type": "document",
+                "document": {"id": media_id, "filename": nombre_archivo, "caption": descripcion[:1024]},
+            },
+        )
+        if envio.status_code != 200:
+            logger.error(f"No pude enviar {nombre_archivo} a {numero_destino}: {envio.status_code} {envio.text[:300]}")
+            return False
+        registrar_mensaje_enviado(envio, numero_destino)
+        logger.info(f"Documento {nombre_archivo} aceptado para {numero_destino}")
+        return True
+    except Exception as e:
+        logger.error(f"Error enviando documento: {str(e)}")
+        return False
+
+def _nombre_archivo(base, extension):
+    limpio = "".join(c if c.isalnum() or c in " -_" else "" for c in base).strip()
+    limpio = "_".join(limpio.split())[:60] or "consulta"
+    return f"{limpio}_{datetime.now().strftime('%Y%m%d_%H%M')}.{extension}"
+
+def construir_y_enviar_archivo(numero_destino, formato, titulo, encabezados, filas):
+    """Genera el archivo en el formato pedido y lo envía. Devuelve el texto de respuesta
+    para el usuario."""
+    formato = (formato or "excel").strip().lower()
+    if formato in ("xlsx", "planilla"):
+        formato = "excel"
+    if formato not in FORMATOS_ARCHIVO:
+        formato = "excel"
+    if not filas:
+        return "No hay datos para armar el archivo con esos filtros."
+    extension, mime = FORMATOS_ARCHIVO[formato]
+    try:
+        contenido = generar_excel(titulo, encabezados, filas) if formato == "excel" \
+            else generar_pdf(titulo, encabezados, filas)
+    except Exception as e:
+        logger.error(f"Error generando {formato}: {str(e)}")
+        return "Tuve un problema armando el archivo. ¿Lo intentamos de nuevo?"
+    nombre = _nombre_archivo(titulo, extension)
+    if not enviar_documento(numero_destino, contenido, nombre, mime, descripcion=titulo):
+        return "No pude enviarte el archivo. Escríbeme de nuevo y lo reintento."
+    return f"📎 Te envié *{nombre}* con {len(filas)} filas: {titulo}."
 
 def ventana_24h_abierta(numero):
     """¿La persona escribió al bot en las últimas 24 h? Si sí, se le puede mandar texto libre
