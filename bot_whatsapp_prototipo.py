@@ -1490,6 +1490,146 @@ def _filas_para_archivo(filas, dimensiones, unidad, base_estimado):
                                        desviacion if desviacion is not None else ""])
     return encabezados, filas_salida
 
+FUENTES_PROYECCION = {
+    "precosecha": (BASE_ORIGEN_ESTIM_PRIMAVERA, "Precosecha", "Prec."),
+    "trisemanal": (BASE_ORIGEN_TRISEMANAL, "Trisemanal", "Tri."),
+    "real": (BASE_ORIGEN_REAL, "Real", "Real"),
+    "invierno": (BASE_ORIGEN_ESTIM_INVIERNO, "Estim. Inv", "Inv."),
+}
+DIMENSIONES_PROYECCION_POR_DEFECTO = ["productor", "especie", "variedad", "packing"]
+
+def obtener_proyeccion(fecha_inicio, fecha_fin, dimensiones, fuentes, filtros=None, alcance=None):
+    """Filas de la proyección: una por combinación de dimensiones, semana y fuente.
+    Devuelve (clave_dimensiones, semana, origen, kg)."""
+    conn = conectar_sql()
+    if not conn:
+        return None
+    try:
+        origenes = [FUENTES_PROYECCION[f][0] for f in fuentes]
+        condiciones = [
+            "[Base Origen] IN ({})".format(",".join("?" * len(origenes))),
+            "CAST(Fecha AS DATE) BETWEEN ? AND ?",
+            "KgsRecepcionados IS NOT NULL",
+        ]
+        params = list(origenes) + [fecha_inicio.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d")]
+        for columna, valor in (filtros or {}).items():
+            if valor:
+                condiciones.append(f"{columna} LIKE ?")
+                params.append(f"%{valor}%")
+        sql_alc, params_alc = _sql_alcance(alcance)
+        if sql_alc:
+            condiciones.append(sql_alc)
+            params.extend(params_alc)
+        columnas = ", ".join(DIMENSIONES_SQL[d] for d in dimensiones)
+        select_dim = f"{columnas}, " if columnas else ""
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT {select_dim}CAST(Semana AS INT) AS semana, [Base Origen],
+                   SUM(KgsRecepcionados) AS kg
+            FROM [Recepcion_Consolidada]
+            WHERE {" AND ".join(condiciones)}
+            GROUP BY {select_dim}CAST(Semana AS INT), [Base Origen]
+            HAVING SUM(KgsRecepcionados) > 0
+        """, params)
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+def armar_tabla_proyeccion(filas, dimensiones, fuentes):
+    """Tabla cruzada: las dimensiones como filas y las SEMANAS como columnas, con una
+    columna por fuente dentro de cada semana cuando se pide más de una. Agrega la columna
+    Total por fila y la fila TOTAL al pie."""
+    n_dim = len(dimensiones)
+    datos, semanas = {}, set()
+    for fila in filas:
+        clave = tuple(str(v).strip() if v is not None else "-" for v in fila[:n_dim])
+        semana, origen, kg = fila[n_dim], fila[n_dim + 1], fila[n_dim + 2] or 0
+        semanas.add(semana)
+        datos.setdefault(clave, {})[(semana, origen)] = \
+            datos.setdefault(clave, {}).get((semana, origen), 0) + kg
+
+    semanas = sorted(semanas, key=orden_semana)
+    varias = len(fuentes) > 1
+    encabezados = [DIMENSIONES_ETIQUETA.get(d, d.title()) for d in dimensiones]
+    columnas = []  # (semana, origen) en el orden de las columnas
+    for semana in semanas:
+        for f in fuentes:
+            origen, largo, corto = FUENTES_PROYECCION[f]
+            columnas.append((semana, origen))
+            encabezados.append(f"S{etiqueta_semana(semana)} {corto}" if varias else f"S{etiqueta_semana(semana)}")
+    encabezados.append("Total")
+
+    def ordenar(clave):
+        return [v.upper() for v in clave]
+
+    filas_salida, totales = [], [0] * (len(columnas) + 1)
+    for clave in sorted(datos, key=ordenar):
+        valores, suma = [], 0
+        for i, col in enumerate(columnas):
+            kg = round(datos[clave].get(col, 0))
+            valores.append(kg if kg else "")
+            suma += kg
+            totales[i] += kg
+        totales[-1] += suma
+        etiquetas = []
+        for v, d in zip(clave, dimensiones):
+            etiquetas.append(traducir_especie(v) if d == "especie"
+                             else _formatear_grupo(v) if d == "grupo" else v)
+        filas_salida.append(etiquetas + valores + [suma])
+    if filas_salida:
+        filas_salida.append(["TOTAL"] + [""] * (n_dim - 1) +
+                            [t if t else "" for t in totales])
+    return encabezados, filas_salida
+
+def _enumerar(valores):
+    """Une una lista en castellano: 'a', 'a y b', 'a, b y c'."""
+    items = [str(v) for v in valores]
+    if len(items) <= 1:
+        return items[0] if items else ""
+    return f"{', '.join(items[:-1])} y {items[-1]}"
+
+def generar_informe_proyeccion(numero_destino=None, semanas=None, fecha_inicio=None,
+                               fuentes=None, agrupar_por=None, formato="pdf",
+                               especie=None, variedad=None, productor=None, packing=None,
+                               grupo=None, alcance=None):
+    """Informe de proyección de cosecha: filas por fundo/especie/variedad/planta y las
+    semanas como columnas. Por defecto, las próximas 3 semanas en kilos de Precosecha."""
+    try:
+        semanas = int(semanas or RESUMEN_SEMANAS)
+        if semanas < 1 or semanas > 12:
+            return "¿Cuántas semanas necesitas? Puedo armarlo de 1 a 12."
+        if fecha_inicio:
+            try:
+                inicio = _lunes_de(datetime.strptime(fecha_inicio, "%Y-%m-%d").date())
+            except (ValueError, TypeError):
+                return "No entendí la fecha de inicio. Indícala como DD-MM-YYYY."
+        else:
+            inicio = _lunes_de(date.today())
+        fin = inicio + timedelta(days=semanas * 7 - 1)
+
+        fuentes = [f for f in (fuentes or ["precosecha"]) if f in FUENTES_PROYECCION] or ["precosecha"]
+        dimensiones = [d for d in (agrupar_por or DIMENSIONES_PROYECCION_POR_DEFECTO)
+                       if d in DIMENSIONES_SQL] or DIMENSIONES_PROYECCION_POR_DEFECTO
+
+        filtros = {"Especie": especie, "Variedad": variedad, "Productor": productor,
+                   "Packing": packing, "Grupo": grupo}
+        filas = obtener_proyeccion(inicio, fin, dimensiones, fuentes, filtros, alcance)
+        if not filas:
+            return (f"No hay datos de {_enumerar(FUENTES_PROYECCION[f][1] for f in fuentes)} "
+                    f"entre el {inicio.strftime('%d-%m-%Y')} y el "
+                    f"{fin.strftime('%d-%m-%Y')} con esos filtros.")
+
+        encabezados, filas_tabla = armar_tabla_proyeccion(filas, dimensiones, fuentes)
+        etiquetas_fuentes = _enumerar(FUENTES_PROYECCION[f][1] for f in fuentes)
+        titulo = (f"Proyección de cosecha — kilos {etiquetas_fuentes} — "
+                  f"{inicio.strftime('%d-%m-%Y')} al {fin.strftime('%d-%m-%Y')}")
+        if not numero_destino:
+            return titulo, encabezados, filas_tabla
+        return construir_y_enviar_archivo(numero_destino, formato, titulo, encabezados, filas_tabla)
+    except Exception as e:
+        logger.error(f"Error generando informe de proyección: {str(e)}")
+        return "Tuve un problema armando el informe. ¿Lo intentamos de nuevo?"
+
 def _es_caja_eq(envase):
     """True si el envase pedido es la unidad 'Caja Eq' (tolera 'cajas eq', 'CAJA EQ', etc.)."""
     if not envase:
@@ -2060,6 +2200,44 @@ TOOLS = [
     },
 ]
 
+TOOL_PROYECCION = {
+    "name": "generar_informe_proyeccion",
+    "description": "Genera un INFORME DE PROYECCIÓN DE COSECHA como archivo PDF o Excel: las filas son fundo/especie/variedad/planta y las SEMANAS van como columnas, con totales. Usar cuando el usuario pida una proyección, un informe o un PDF de lo que viene ('mándame la proyección de cosecha', 'el informe de las próximas semanas en PDF', 'proyección por variedad'). Por defecto son las próximas 3 semanas en kilos de Precosecha. ANTES de llamarla, si el usuario no fue específico, PREGÚNTALE cómo lo quiere: cuántas semanas, qué fuentes (precosecha, trisemanal, real) y qué columnas quiere como filas; ofrécele el formato por defecto para que solo tenga que confirmar.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "formato": {
+                "type": "string",
+                "enum": ["pdf", "excel"],
+                "description": "Formato del archivo. 'pdf' por defecto; 'excel' si el usuario lo pide para trabajar los datos."
+            },
+            "semanas": {
+                "type": "integer",
+                "description": "Cuántas semanas hacia adelante cubrir (1 a 12). Por defecto 3."
+            },
+            "fecha_inicio": {
+                "type": "string",
+                "description": "YYYY-MM-DD. Solo si el usuario pide un periodo distinto al que viene; se usa el lunes de esa semana. Si no, omitir y parte de esta semana."
+            },
+            "fuentes": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["precosecha", "trisemanal", "real"]},
+                "description": "Qué columnas de cifras incluir en cada semana. Por defecto ['precosecha']. Agregar 'trisemanal' y/o 'real' solo si el usuario los pide."
+            },
+            "agrupar_por": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["productor", "especie", "variedad", "packing", "grupo"]},
+                "description": "Qué columnas forman las filas, en orden. Por defecto ['productor','especie','variedad','packing'] (fundo, especie, variedad, planta). Usar menos si el usuario quiere algo más resumido."
+            },
+            "especie": {"type": "string", "description": "Filtro opcional de especie, nombre EXACTO de la lista conocida."},
+            "variedad": {"type": "string", "description": "Filtro opcional de variedad, nombre EXACTO de la lista conocida."},
+            "productor": {"type": "string", "description": "Filtro opcional de productor/fundo, nombre EXACTO de la lista conocida."},
+            "packing": {"type": "string", "description": "Filtro opcional de planta/packing, nombre EXACTO de la lista conocida."},
+            "grupo": {"type": "string", "description": "Filtro opcional de grupo, nombre EXACTO de la lista conocida."}
+        }
+    },
+}
+
 # Esta herramienta está SIEMPRE disponible (ver procesar_mensaje): el usuario puede reportar
 # un ajuste de proyección cuando ocurre, no solo mientras haya un cuestionario vigente. Si hay
 # cuestionario vigente actualiza esa respuesta; si no, queda como reporte espontáneo.
@@ -2345,6 +2523,15 @@ la cantidad REAL de unidades registradas de ese envase, no una conversión calcu
 kilos por unidad varían según la fruta y no son un factor fijo confiable). Si el usuario pregunta por
 kilos/kg, no uses este parámetro.
 
+INFORME DE PROYECCIÓN: cuando el usuario pida una "proyección de cosecha", un "informe de lo
+que viene" o un PDF de las próximas semanas, usa generar_informe_proyeccion. ANTES de llamarla,
+si no fue específico, PREGÚNTALE cómo lo quiere, ofreciéndole lo que trae por defecto para que
+solo confirme. Por ejemplo: "Te lo armo en PDF con las próximas 3 semanas, en kilos de
+Precosecha, con una fila por fundo, especie, variedad y planta. ¿Lo dejamos así, o prefieres
+otro periodo, agregar la trisemanal o el real, o agrupar distinto?". Si el usuario ya dijo lo
+que quiere (ej. "la proyección de 4 semanas con trisemanal en Excel"), no preguntes nada y
+genera el archivo directamente.
+
 ARCHIVOS (Excel y PDF): si el usuario pide el resultado como archivo —"mándamelo en Excel",
 "en PDF", "un archivo con el detalle completo", "para abrirlo en la planilla"— usa
 consultar_cosecha_flexible con formato_archivo="excel" o "pdf" y los filtros y agrupación que
@@ -2390,6 +2577,22 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             tool_input.get("resultado", "confirmado"),
             detalle_ajuste=tool_input.get("detalle_ajuste"),
             texto_usuario=texto_usuario,
+        )
+
+    if tool_name == "generar_informe_proyeccion":
+        return generar_informe_proyeccion(
+            numero_destino=numero_sender,
+            semanas=tool_input.get("semanas"),
+            fecha_inicio=tool_input.get("fecha_inicio") or None,
+            fuentes=tool_input.get("fuentes") or None,
+            agrupar_por=tool_input.get("agrupar_por") or None,
+            formato=tool_input.get("formato") or "pdf",
+            especie=tool_input.get("especie") or None,
+            variedad=normalizar_variedad(tool_input["variedad"]) if tool_input.get("variedad") else None,
+            productor=tool_input.get("productor") or None,
+            packing=tool_input.get("packing") or None,
+            grupo=tool_input.get("grupo") or None,
+            alcance=alcance,
         )
 
     if tool_name == "consultar_resumen_productor":
@@ -2508,7 +2711,7 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False):
         cuestionario_activo = obtener_cuestionario_activo(numero_sender) if numero_sender else None
         # La herramienta de reporte va siempre: un ajuste de proyección se avisa cuando pasa,
         # no solo mientras hay un cuestionario vigente.
-        tools = (TOOLS + [TOOL_REGISTRAR_CUESTIONARIO]) if numero_sender else TOOLS
+        tools = (TOOLS + [TOOL_PROYECCION] + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender else []))
 
         response = claude_client.messages.create(
             model="claude-sonnet-5",
