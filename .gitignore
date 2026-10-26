@@ -8,3 +8,5 @@ conversaciones.db
 caddy.exe
 .env.bak*
 numeros_eliminados.json
+conversaciones.db-wal
+conversaciones.db-shm
