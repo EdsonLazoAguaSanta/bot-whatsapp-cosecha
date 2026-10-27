@@ -2146,9 +2146,20 @@ def _revisar_origenes(tokens, ctes):
         return "La consulta termina sin indicar de dónde leer."
     return None
 
-def validar_consulta_sql(sql):
-    """Devuelve (consulta, None) si es un SELECT de solo lectura sobre "datos", o
-    (None, motivo) si no."""
+# Embarques (vistas Reporte_Embarque_PBI y Embarque-Liquidacion-PBI): información comercial
+# (clientes, naves, valores FOB) que Agua Santa decidió mostrar solo a estos perfiles. No
+# depende de acceso_total: un zonal con acceso a todos los fundos igual no la ve.
+ROLES_EMBARQUES = ("admin", "eas", "gerencia")
+TABLAS_EMBARQUES = ("embarques", "embarques_fob")
+NOMBRES_RESERVADOS_SQL = {"datos", *TABLAS_EMBARQUES}
+
+def puede_ver_embarques(numero):
+    """Sin número es una prueba local de administración (ver /test/mensaje)."""
+    return numero is None or rol_de(numero) in ROLES_EMBARQUES
+
+def validar_consulta_sql(sql, tablas_extra=()):
+    """Devuelve (consulta, None) si es un SELECT de solo lectura sobre "datos" (y las
+    tablas_extra permitidas a este usuario), o (None, motivo) si no."""
     texto = (sql or "").strip()
     while texto.endswith(";"):
         texto = texto[:-1].rstrip()
@@ -2173,9 +2184,15 @@ def validar_consulta_sql(sql):
             return None, f"La consulta usa '{token}', que no está permitido (solo lectura de 'datos')."
     ctes = {re.sub(r"[\[\]\"]", "", m).lower() for m in re.findall(
         r"(?:\bwith|,)\s*(\[[^\]]+\]|[A-Za-z_]\w*)\s*(?:\([^()]*\))?\s+as\s*\(", sin_literales, re.I)}
-    if "datos" in ctes:
-        return None, "No definas un WITH llamado 'datos': ese nombre ya es la tabla."
-    error = _revisar_origenes(tokens, ctes | {"datos"})
+    reservados = ctes & NOMBRES_RESERVADOS_SQL
+    if reservados:
+        return None, f"No definas un WITH llamado '{sorted(reservados)[0]}': ese nombre ya es una tabla."
+    permitidas = {"datos", *tablas_extra}
+    vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
+    if vedadas:
+        return None, ("Las tablas de embarques (embarques, embarques_fob) son solo para los perfiles "
+                      "EAS y gerencia.")
+    error = _revisar_origenes(tokens, ctes | permitidas)
     if error:
         return None, error
     return texto, None
@@ -2195,23 +2212,58 @@ def _sql_expr_temporada(columna_fecha="rc.Fecha"):
                      f"{columna_fecha} < '{(fin + timedelta(days=1)).strftime('%Y%m%d')}' THEN {temporada}")
     return f"(CASE {' '.join(casos)} ELSE rc.Temporada END)"
 
-def _consulta_con_datos(consulta, alcance):
+def _sql_via(columna):
+    return (f"CASE {columna} WHEN 'Sea' THEN N'Marítima' WHEN 'Air' THEN N'Aérea' "
+            f"WHEN 'Earth' THEN N'Terrestre' ELSE {columna} END")
+
+def _ctes_embarques():
+    """Las dos vistas de embarques con nombres de columna en castellano. Tienen las mismas
+    filas (una por pallet o parte de pallet embarcado): la segunda agrega productor, planta y
+    valores FOB, pero no trae contenedor ni pallets."""
+    embarques = (
+        "embarques AS (SELECT CAST(e.Temporada AS INT) AS Temporada, e.[Commodity Name] AS Especie, "
+        "e.[Variety Name] AS Variedad, e.Variedad_tipo AS TipoVariedad, e.Cases AS Cajas, "
+        "e.Cases_Eq AS CajasEq, e.Pallets, e.[Pallet Total] AS CajasPorPallet, "
+        "NULLIF(e.Container, '') AS Contenedor, e.[Receiver name] AS Recibidor, e.[Vessel name] AS Nave, "
+        f"{_sql_via('e.[Vessel type]')} AS Via, e.[Departure date] AS FechaZarpe, "
+        "CAST(e.WeekOnly AS INT) AS SemanaZarpe, e.[Arrival port] AS Puerto, e.ETA, "
+        "e.Market AS Mercado, NULLIF(e.SaleMarket, '') AS PaisVenta "
+        "FROM [Reporte_Embarque_PBI] e)"
+    )
+    embarques_fob = (
+        "embarques_fob AS (SELECT CAST(l.Temporada AS INT) AS Temporada, l.[Grower Name] AS Productor, "
+        f"l.growerFamily__name AS Grupo, {_sql_expr_zonal('l.[Grower Name]')} AS Zonal, "
+        "l.[PackingSite Name] AS Planta, l.[Commodity Name] AS Especie, l.Variedad_Agronomica AS Variedad, "
+        "l.Variedad_tipo AS TipoVariedad, l.EqSerie AS Serie, l.Cases AS Cajas, l.Cases_Eq AS CajasEq, "
+        "l.[FOB (usd)] AS FOB, l.[Pool FOB (usd)] AS FOBPool, l.Estatus AS Estado, l.Arribado, "
+        "l.[Receiver name] AS Recibidor, l.[Receiver code] AS CodigoRecibidor, l.[Vessel name] AS Nave, "
+        f"{_sql_via('l.[Vessel type]')} AS Via, l.[Departure date] AS FechaZarpe, "
+        "CAST(l.WeekOnly AS INT) AS SemanaZarpe, l.[Arrival port] AS Puerto, "
+        "l.[Arrival country] AS PaisLlegada, l.ETA, l.[Arrival date] AS FechaLlegada, l.Market AS Mercado "
+        "FROM [Embarque-Liquidacion-PBI] l)"
+    )
+    return [embarques, embarques_fob]
+
+def _consulta_con_datos(consulta, alcance, embarques=False):
     """Antepone el WITH "datos": la tabla real + Zonal, con la temporada oficial por fecha,
     sin las filas duplicadas sin kilos (las mismas que excluyen todas las consultas del bot)
-    y acotada al alcance del usuario."""
+    y acotada al alcance del usuario. Con embarques=True agrega también las tablas de
+    embarques (solo para los perfiles de ROLES_EMBARQUES)."""
     condiciones = ["rc.KgsRecepcionados IS NOT NULL"]
     if alcance is not None:
         sql_fundos, _ = _sql_fundos(alcance, columna="rc.Productor", literales=True) if alcance else ("1 = 0", [])
         condiciones.append(sql_fundos)
-    cte = (f"datos AS (SELECT {_sql_expr_temporada()} AS Temporada, rc.Temporada AS TemporadaBase, "
-           f"rc.[Base Origen], rc.Especie, rc.Variedad, rc.[Variedad Agronomica], rc.Productor, "
-           f"rc.Grupo, {_sql_expr_zonal('rc.Productor')} AS Zonal, rc.Packing, rc.Fecha, rc.Semana, "
-           f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho "
-           f"FROM [Recepcion_Consolidada] rc WHERE {' AND '.join(condiciones)})")
+    ctes = [(f"datos AS (SELECT {_sql_expr_temporada()} AS Temporada, rc.Temporada AS TemporadaBase, "
+             f"rc.[Base Origen], rc.Especie, rc.Variedad, rc.[Variedad Agronomica], rc.Productor, "
+             f"rc.Grupo, {_sql_expr_zonal('rc.Productor')} AS Zonal, rc.Packing, rc.Fecha, rc.Semana, "
+             f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho "
+             f"FROM [Recepcion_Consolidada] rc WHERE {' AND '.join(condiciones)})")]
+    if embarques:
+        ctes += _ctes_embarques()
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
     if resto != consulta:
-        return f"WITH {cte}, {resto}"
-    return f"WITH {cte} {consulta}"
+        return f"WITH {', '.join(ctes)}, {resto}"
+    return f"WITH {', '.join(ctes)} {consulta}"
 
 def _mensaje_error_sql(error):
     """Deja solo el mensaje útil de SQL Server (sin los prefijos [Microsoft][ODBC...])."""
@@ -2220,9 +2272,10 @@ def _mensaje_error_sql(error):
     texto = re.sub(r"\(\d+\)\s*\(SQL\w+\)", "", texto)
     return " ".join(texto.split())[:400]
 
-def ejecutar_consulta_sql(sql, alcance, max_filas=MAX_FILAS_SQL):
-    """({"columnas", "filas", "truncado"}, None) o (None, error)."""
-    consulta, error = validar_consulta_sql(sql)
+def ejecutar_consulta_sql(sql, alcance, max_filas=MAX_FILAS_SQL, embarques=False):
+    """({"columnas", "filas", "truncado"}, None) o (None, error). embarques=True permite
+    además las tablas de embarques (quien llama ya verificó el perfil)."""
+    consulta, error = validar_consulta_sql(sql, TABLAS_EMBARQUES if embarques else ())
     if error:
         return None, error
     conn = conectar_sql()
@@ -2231,7 +2284,7 @@ def ejecutar_consulta_sql(sql, alcance, max_filas=MAX_FILAS_SQL):
     try:
         conn.timeout = TIEMPO_MAX_SQL
         cursor = conn.cursor()
-        cursor.execute(_consulta_con_datos(consulta, alcance))
+        cursor.execute(_consulta_con_datos(consulta, alcance, embarques=embarques))
         if not cursor.description:
             return None, "La consulta no devolvió una tabla."
         columnas = [d[0] or f"columna_{i + 1}" for i, d in enumerate(cursor.description)]
@@ -2257,9 +2310,9 @@ def _texto_crudo(valor):
         return valor.isoformat()
     return str(valor)
 
-def consultar_sql(sql, alcance):
+def consultar_sql(sql, alcance, embarques=False):
     """Resultado de una consulta libre como texto para Claude."""
-    resultado, error = ejecutar_consulta_sql(sql, alcance)
+    resultado, error = ejecutar_consulta_sql(sql, alcance, embarques=embarques)
     if error:
         return f"ERROR: {error}"
     if not resultado["filas"]:
@@ -2843,7 +2896,11 @@ TOOL_GENERAR_INFORME = {
         "específico, cifras clave a elección, un comentario o análisis, etc. Cada sección es una consulta SQL sobre "
         "`datos` (mismas columnas y reglas que consultar_sql) que se ejecuta al armar el archivo, así las cifras "
         "salen siempre de la base. Por defecto la primera sección lleva un gráfico pequeño de totales; la fila "
-        "TOTAL se agrega sola. Antes de llamarla conviene probar las consultas con consultar_sql si no estás seguro "
+        "TOTAL se agrega sola y suma solo las cantidades (no los %, ni las columnas por unidad como USD/caja eq o "
+        "promedios, que no se pueden sumar). Si necesitas un total correcto para esas columnas, haz que la "
+        "consulta traiga su propia fila con 'TOTAL' en la primera columna de texto (UNION ALL): el informe la usa "
+        "como fila de total y la deja fuera del gráfico, así que NO hace falta quitar el gráfico por eso. "
+        "Antes de llamarla conviene probar las consultas con consultar_sql si no estás seguro "
         "de que funcionen."
     ),
     "input_schema": {
@@ -2878,7 +2935,7 @@ TOOL_GENERAR_INFORME = {
                             "properties": {
                                 "tipo": {"type": "string", "enum": ["barras", "barras_horizontales", "lineas", "torta", "ninguno"]},
                                 "categoria": {"type": "string", "description": "Columna para el eje (por defecto la primera de texto)."},
-                                "valores": {"type": "array", "items": {"type": "string"}, "description": "Columnas numéricas a graficar (máx. 3; por defecto las numéricas)."},
+                                "valores": {"type": "array", "items": {"type": "string"}, "description": "Columnas numéricas a graficar (máx. 3, todas de la MISMA unidad: kilos con kilos, USD con USD; el gráfico tiene un solo eje). Por defecto, la primera columna de cantidades y las de su misma unidad."},
                                 "titulo": {"type": "string"},
                             },
                         },
@@ -2891,6 +2948,50 @@ TOOL_GENERAR_INFORME = {
         },
         "required": ["formato", "titulo", "secciones"],
     },
+}
+
+# Lo que se agrega a las herramientas de SQL para los perfiles que ven embarques
+# (ROLES_EMBARQUES). Para el resto esas tablas no existen: ni se describen ni se pueden leer.
+DESCRIPCION_EMBARQUES = (
+    " ADEMÁS, este usuario puede consultar dos tablas de EMBARQUES (exportación), con TODOS los productores "
+    "(no tienen filtro de fundos). Cada fila es un pallet o parte de un pallet embarcado. "
+    "`embarques` (vista Reporte_Embarque_PBI): Temporada (int, temporada de embarque), Especie (inglés), Variedad, "
+    "TipoVariedad, Cajas (cajas físicas), CajasEq (cajas equivalentes), Pallets (fracción de pallet; suma para "
+    "contar pallets), CajasPorPallet, Contenedor (NULL en aéreos, terrestres y naves convencionales), Recibidor "
+    "(cliente), Nave, Via ('Marítima', 'Aérea', 'Terrestre'), FechaZarpe (date), SemanaZarpe (int, ISO), Puerto "
+    "(de llegada), ETA (date), Mercado (región: LEJANO ORIENTE, USA EAST COAST, USA WEST COAST, EUROPA, "
+    "SUDAMERICA, CENTROAMERICA, NORTEAMERICA, CHILE...), PaisVenta (casi siempre NULL). "
+    "`embarques_fob` (vista Embarque-Liquidacion-PBI, las MISMAS filas con datos comerciales; no trae "
+    "contenedor ni pallets): Temporada, Productor, Grupo, Zonal (calculada, igual que en datos), Planta, Especie, "
+    "Variedad, TipoVariedad, Serie (calibre/serie equivalente), Cajas, CajasEq, FOB (USD, monto total de la "
+    "fila), FOBPool (USD, FOB del pool), Estado ('Liquidación' = liquidado, 'Factura' = solo facturado, valor "
+    "provisorio), Arribado ('Sí'/'No'), Recibidor, CodigoRecibidor, Nave, Via, FechaZarpe, SemanaZarpe, Puerto, "
+    "PaisLlegada (siempre informado), ETA, FechaLlegada, Mercado. "
+    "REGLAS DE AGUA SANTA para embarques: (1) 'cajas' sin más = cajas FÍSICAS (Cajas); las equivalentes solo si "
+    "las piden. (2) Cuando hables de FOB, precio o retorno muestra SIEMPRE los dos: FOB y FOB pool. (3) USD por "
+    "caja = SUM(FOB)/SUM(CajasEq), es decir por caja EQUIVALENTE (y lo mismo con FOBPool); dilo así: 'USD/caja "
+    "eq'. (4) Los totales de FOB incluyen lo facturado sin liquidar, pero di siempre cuánto corresponde a "
+    "Estado = 'Factura' (es provisorio). (5) 'Destino' o 'mercado' = Mercado (región) y Puerto; el país sale de "
+    "PaisLlegada en embarques_fob. (6) Hay filas con FOB negativo (notas de crédito y ajustes): se suman igual. "
+    "(7) Para cruzar embarques con cosecha usa Especie/Variedad/Temporada; no hay kilos embarcados, así que no "
+    "compares kilos cosechados con cajas embarcadas como si fueran la misma unidad."
+)
+
+TOOL_CONSULTAR_SQL_EMBARQUES = {
+    **TOOL_CONSULTAR_SQL,
+    "description": TOOL_CONSULTAR_SQL["description"] + DESCRIPCION_EMBARQUES,
+    "input_schema": {
+        **TOOL_CONSULTAR_SQL["input_schema"],
+        "properties": {
+            **TOOL_CONSULTAR_SQL["input_schema"]["properties"],
+            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos`, `embarques` y/o `embarques_fob`."},
+        },
+    },
+}
+TOOL_GENERAR_INFORME_EMBARQUES = {
+    **TOOL_GENERAR_INFORME,
+    "description": (TOOL_GENERAR_INFORME["description"]
+                    + " Las secciones también pueden leer `embarques` y `embarques_fob` (ver consultar_sql)."),
 }
 
 # Esta herramienta está SIEMPRE disponible (ver procesar_mensaje): el usuario puede reportar
@@ -2968,8 +3069,9 @@ CÓMO TRABAJAS
 - Toda cifra que entregues tiene que salir de una herramienta ejecutada en esta conversación. Nunca
   inventes, estimes "a ojo" ni completes datos que no consultaste. Si algo no está en la base, dilo.
 - No hagas cuentas de cabeza con muchas cifras: si necesitas un total, un promedio o un porcentaje que
-  no viene en el resultado, pídelo en la misma consulta (consultar_sql, con WITH ROLLUP o una fila de
-  total) y copia el número que te devuelve. Si notas que una cifra que diste antes estaba mal, dilo y
+  no viene en el resultado, pídelo en la misma consulta (consultar_sql, con GROUP BY ... WITH ROLLUP
+  o un UNION ALL con la fila de total; la forma GROUP BY ROLLUP(...) no funciona en este servidor) y
+  copia el número que te devuelve. Si notas que una cifra que diste antes estaba mal, dilo y
   corrígela.
 - Cuando te pidan un dato, consúltalo de nuevo aunque ya lo hayas respondido antes en la conversación:
   los datos cambian durante el día y se corrigen. El historial te sirve para entender a qué se refiere
@@ -3279,6 +3381,21 @@ por datos— usa la herramienta registrar_respuesta_cuestionario con resultado "
 detalle concreto: queda registrado y se le avisa al equipo EAS. NUNCA le digas que no puedes
 registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con esa herramienta.""")
 
+    if puede_ver_embarques(numero_sender):
+        partes.append(
+            "EMBARQUES: este usuario puede consultar los embarques de exportación (cajas, pallets, "
+            "clientes, naves, puertos, mercados y valores FOB) con las tablas `embarques` y "
+            "`embarques_fob` de consultar_sql y generar_informe. Sigue las reglas de Agua Santa que "
+            "vienen en la descripción de consultar_sql (cajas físicas por defecto, FOB y FOB pool "
+            "juntos, USD por caja equivalente, avisar lo facturado sin liquidar)."
+        )
+    else:
+        partes.append(
+            "EMBARQUES: la información de embarques y exportación (cajas embarcadas, clientes, naves, "
+            "puertos, mercados, FOB, precios o liquidaciones) es solo para los perfiles EAS y gerencia. "
+            "Si este usuario la pide, explícale con amabilidad que no está disponible para su perfil."
+        )
+
     if alcance:
         partes.append(f"""ALCANCE DE ESTE USUARIO: solo tiene acceso a la información de estos fundos/productores:
 {", ".join(alcance)}.
@@ -3314,7 +3431,8 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
         )
 
     if tool_name == "consultar_sql":
-        return consultar_sql(tool_input.get("consulta"), alcance)
+        return consultar_sql(tool_input.get("consulta"), alcance,
+                             embarques=puede_ver_embarques(numero_sender))
 
     if tool_name == "generar_informe":
         return generar_informe_personalizado(
@@ -3326,6 +3444,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             resumen=tool_input.get("resumen") or None,
             consulta_kpis=tool_input.get("consulta_kpis") or None,
             alcance=alcance,
+            embarques=puede_ver_embarques(numero_sender),
         )
 
     if tool_name == "generar_informe_proyeccion":
@@ -3453,7 +3572,11 @@ LIMITE_RESULTADO_HISTORIAL = 1500
 def herramientas_disponibles(numero_sender=None):
     # La herramienta de reporte va siempre que haya número: un ajuste de proyección se avisa
     # cuando pasa, no solo mientras hay un cuestionario vigente.
-    return (TOOLS + [TOOL_PROYECCION, TOOL_CONSULTAR_SQL, TOOL_GENERAR_INFORME]
+    if puede_ver_embarques(numero_sender):
+        sql = [TOOL_CONSULTAR_SQL_EMBARQUES, TOOL_GENERAR_INFORME_EMBARQUES]
+    else:
+        sql = [TOOL_CONSULTAR_SQL, TOOL_GENERAR_INFORME]
+    return (TOOLS + [TOOL_PROYECCION] + sql
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender else []))
 
 def _historial_como_mensajes(numero_sender, nombres_herramientas):
@@ -5058,9 +5181,20 @@ def _palabras(texto):
 def _es_numero(valor):
     return isinstance(valor, (int, float)) and not isinstance(valor, bool)
 
+_PREFIJOS_RAZON = ("prom", "precio", "tarifa", "ratio", "rendimiento")
+
+def _es_razon(encabezado):
+    """Columnas por unidad (USD/caja eq, kg por bin, precio, promedio): no se suman en el
+    TOTAL, porque la suma de promedios no significa nada."""
+    texto = str(encabezado).lower()
+    palabras = _palabras(texto)
+    return ("/" in texto or "_caja" in texto or "por" in palabras
+            or any(p.startswith(_PREFIJOS_RAZON) for p in palabras))
+
 def _tipo_columna(encabezado, valores):
-    """texto | numero | porcentaje | categoria (números que no se suman: semana, temporada,
-    CSG) | fecha. Decide cómo se muestra, si entra al TOTAL y si puede ir al gráfico."""
+    """texto | numero | porcentaje | razon (por unidad: USD/caja, promedios; no se suma) |
+    categoria (números que no se suman: semana, temporada, CSG) | fecha. Decide cómo se
+    muestra, si entra al TOTAL y si puede ir al gráfico."""
     presentes = [v for v in valores if v not in ("", None)]
     if presentes and all(isinstance(v, (date, datetime)) for v in presentes):
         return "fecha"
@@ -5071,6 +5205,8 @@ def _tipo_columna(encabezado, valores):
         return "categoria"
     if "%" in str(encabezado) or any(p.startswith(_PREFIJOS_PORCENTAJE) for p in palabras):
         return "porcentaje"
+    if _es_razon(encabezado):
+        return "razon"
     return "numero"
 
 def _tipos_columnas(encabezados, filas):
@@ -5106,7 +5242,7 @@ def _texto_kpi(kpi):
         return str(valor if valor is not None else "-")
     if kpi.get("tipo") == "porcentaje":
         return _fmt_porcentaje(valor, kpi.get("signo", False))
-    texto = _fmt_numero(valor, _decimales_columna([valor]))
+    texto = _fmt_numero(valor, kpi.get("decimales", _decimales_columna([valor])))
     if kpi.get("signo") and valor > 0:
         texto = "+" + texto
     unidad = kpi.get("unidad")
@@ -5155,6 +5291,17 @@ def _es_cronologica(encabezado, tipo):
         set(_palabras(encabezado)) & {"semana", "fecha", "mes", "dia", "día"}
     )
 
+def _unidad_columna(encabezado):
+    """Unidad que se deduce del nombre de la columna, para no mezclar unidades en un gráfico."""
+    texto = str(encabezado).lower()
+    if "usd" in texto or "fob" in texto:
+        return "usd"
+    if "kg" in texto or "kilo" in texto:
+        return "kg"
+    if any(p in texto for p in ("caja", "cases", "bulto", "bins", "pallet")):
+        return "cajas"
+    return None
+
 def grafico_desde_tabla(encabezados, filas, tipos, por=None, valores=None, tipo=None, titulo=None):
     """Gráfico de totales a partir de una tabla: suma las columnas numéricas por la
     categoría elegida (la primera columna de texto si no se indica). Las categorías que no
@@ -5168,13 +5315,18 @@ def grafico_desde_tabla(encabezados, filas, tipos, por=None, valores=None, tipo=
         return None
     if valores:
         idx_val = [i for i in (_buscar_columna(encabezados, v) for v in valores)
-                   if i is not None and i != idx_cat and tipos[i] in ("numero", "porcentaje")]
+                   if i is not None and i != idx_cat and tipos[i] in ("numero", "porcentaje", "razon")]
     else:
         numericas = [i for i, t in enumerate(tipos) if t == "numero" and i != idx_cat]
         # La diferencia y el total de la fila repiten información de las otras columnas.
         preferidas = [i for i in numericas
                       if not set(_palabras(encabezados[i])) & {"diferencia", "dif", "total", "saldo"}]
-        idx_val = (preferidas or numericas)[:3]
+        candidatas = preferidas or numericas
+        # Un solo eje: por defecto van juntas solo columnas de la misma unidad que la primera
+        # (kilos con kilos, USD con USD); mezclar cajas y dólares en un eje engaña.
+        unidad = _unidad_columna(encabezados[candidatas[0]]) if candidatas else None
+        idx_val = ([i for i in candidatas if _unidad_columna(encabezados[i]) == unidad][:3]
+                   if unidad else candidatas[:1])
     if not idx_val:
         return None
 
@@ -5234,7 +5386,8 @@ def _preparar_informe(informe):
         encabezados = [str(h) for h in seccion["encabezados"]]
         seccion["encabezados"] = encabezados
         seccion["tipos"] = _tipos_columnas(encabezados, seccion["filas"])
-        seccion["decimales"] = [_decimales_columna([f[i] for f in seccion["filas"]])
+        seccion["decimales"] = [2 if seccion["tipos"][i] == "razon"
+                                else _decimales_columna([f[i] for f in seccion["filas"]])
                                 for i in range(len(encabezados))]
         seccion["signos"] = [_lleva_signo(h) for h in encabezados]
         grafico = seccion.get("grafico")
@@ -5520,7 +5673,7 @@ def _tabla_pdf(seccion, disponible):
     textos, total = _textos_seccion(seccion)
     tamano = _tamano_letra_tabla(len(encabezados))
     anchos = _anchos_columnas(encabezados, textos + ([total] if total else []), tipos, tamano, disponible)
-    numericas = {i for i, t in enumerate(tipos) if t in ("numero", "porcentaje")}
+    numericas = {i for i, t in enumerate(tipos) if t in ("numero", "porcentaje", "razon")}
     estilo_celda = ParagraphStyle("celda", fontName="Helvetica", fontSize=tamano,
                                   leading=tamano + 1.6, textColor=_color(COLOR_TINTA))
     estilo_total = ParagraphStyle("celda_total", parent=estilo_celda, fontName="Helvetica-Bold")
@@ -5724,7 +5877,9 @@ def _formato_excel(tipo, decimales, signo):
         return "0"
     if tipo == "fecha":
         return "dd-mm-yyyy"
-    return "#,##0.0" if decimales else "#,##0"
+    if decimales:
+        return "#,##0." + "0" * decimales
+    return "#,##0"
 
 def _grafico_excel(hoja_datos, fila_inicio, grafico):
     """Gráfico nativo de Excel. Sus datos quedan en la hoja "Datos gráfico" (Excel necesita
@@ -5856,7 +6011,8 @@ def generar_excel_informe(informe):
             valor.font = Font(size=13, bold=True, color=COLOR_TINTA[1:])
             if _es_numero(kpi["valor"]):
                 tipo_kpi = kpi.get("tipo") if kpi.get("tipo") in ("porcentaje",) else "numero"
-                formato = _formato_excel(tipo_kpi, _decimales_columna([kpi["valor"]]), kpi.get("signo"))
+                formato = _formato_excel(tipo_kpi, kpi.get("decimales", _decimales_columna([kpi["valor"]])),
+                                         kpi.get("signo"))
                 if tipo_kpi == "numero":
                     unidad = f'" {kpi["unidad"]}"' if kpi.get("unidad") else ""
                     formato = (f"+{formato}{unidad};-{formato}{unidad};0{unidad}" if kpi.get("signo")
@@ -6127,32 +6283,51 @@ def _pivotear(encabezados, filas, pivote):
         nuevas_filas.append(list(clave) + valores + [sum(x for x in valores if _es_numero(x))])
     return nuevos_encabezados, nuevas_filas
 
+def _notas_de_fuente(consultas):
+    """Nota al pie según las tablas que leyó el informe: recepción, embarques o ambas."""
+    texto = " ".join(c or "" for c in consultas).lower()
+    notas = []
+    if re.search(r"\bdatos\b", texto):
+        notas.append(NOTA_FUENTES)
+    if re.search(r"\bembarques\b", texto):
+        notas.append("Embarques según Reporte_Embarque_PBI (Control EAS). Cajas = cajas físicas; "
+                     "Cajas Eq = cajas equivalentes.")
+    if re.search(r"\bembarques_fob\b", texto):
+        notas.append("Valores FOB en USD según Embarque-Liquidacion-PBI. Incluyen embarques solo "
+                     "facturados, cuyo valor es provisorio hasta la liquidación.")
+    return notas or [NOTA_FUENTES]
+
 def generar_informe_personalizado(numero_destino, formato, titulo, secciones, subtitulo=None,
-                                  resumen=None, consulta_kpis=None, alcance=None):
-    """Informe a medida que arma Claude: cada sección es una consulta SQL sobre "datos" (se
-    ejecuta aquí, así las cifras salen de la base y no del modelo), con pivote y gráfico
-    opcionales. Si ninguna sección pide gráfico, la primera lleva el de totales."""
+                                  resumen=None, consulta_kpis=None, alcance=None, embarques=False):
+    """Informe a medida que arma Claude: cada sección es una consulta SQL sobre "datos" (y
+    las tablas de embarques si el perfil las ve), que se ejecuta aquí, así las cifras salen de
+    la base y no del modelo, con pivote y gráfico opcionales. Si ninguna sección pide
+    gráfico, la primera lleva el de totales."""
     if not secciones:
         return "ERROR: el informe necesita al menos una sección con su consulta_sql."
+    notas = _notas_de_fuente([consulta_kpis] + [s.get("consulta_sql") for s in secciones])
     informe = {"titulo": titulo or "Informe de cosecha", "subtitulo": subtitulo,
-               "resumen": resumen, "kpis": [], "secciones": [], "notas": [NOTA_FUENTES]}
+               "resumen": resumen, "kpis": [], "secciones": [], "notas": notas}
     if consulta_kpis:
-        resultado, error = ejecutar_consulta_sql(consulta_kpis, alcance, max_filas=1)
+        resultado, error = ejecutar_consulta_sql(consulta_kpis, alcance, max_filas=1, embarques=embarques)
         if error:
             return f"ERROR en consulta_kpis: {error} No envié nada; corrígela y vuelve a intentarlo."
         if resultado["filas"]:
             for columna, valor in zip(resultado["columnas"], resultado["filas"][0]):
                 valor = _valor_normalizado(valor)
                 tipo = _tipo_columna(columna, [valor])
-                informe["kpis"].append({"etiqueta": columna, "valor": valor,
-                                        "tipo": tipo if tipo in ("numero", "porcentaje") else "texto",
-                                        "signo": _lleva_signo(columna)})
+                kpi = {"etiqueta": columna, "valor": valor,
+                       "tipo": tipo if tipo in ("numero", "porcentaje") else "texto",
+                       "signo": _lleva_signo(columna)}
+                if tipo == "razon":
+                    kpi.update(tipo="numero", decimales=2)
+                informe["kpis"].append(kpi)
     alguno_pide_grafico = any((s.get("grafico") or {}).get("tipo") not in (None, "ninguno")
                               for s in secciones)
     for numero_seccion, seccion in enumerate(secciones[:8]):
         nombre = seccion.get("titulo") or f"Sección {numero_seccion + 1}"
         resultado, error = ejecutar_consulta_sql(seccion.get("consulta_sql"), alcance,
-                                                 max_filas=MAX_FILAS_INFORME)
+                                                 max_filas=MAX_FILAS_INFORME, embarques=embarques)
         if error:
             return f"ERROR en la sección '{nombre}': {error} No envié nada; corrige la consulta y vuelve a intentarlo."
         encabezados = resultado["columnas"]
@@ -6169,8 +6344,19 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
                 pivoteada = True
             except ValueError as e:
                 return f"ERROR en la sección '{nombre}': {e}"
+        # Si la consulta ya trae su fila de total (primera columna de texto = "TOTAL"), esa
+        # es la fila de total: queda al pie, en negrita y fuera del gráfico. Así los promedios
+        # ponderados (USD/caja eq) del total salen de la base y no de sumar promedios.
         tipos = _tipos_columnas(encabezados, filas)
-        total = fila_total(encabezados, filas, tipos) if seccion.get("total", True) else None
+        primera_texto = next((i for i, t in enumerate(tipos) if t == "texto"), None)
+        totales_sql = [f for f in filas if primera_texto is not None
+                       and str(f[primera_texto]).strip().upper() == "TOTAL"]
+        if len(totales_sql) == 1:
+            filas = [f for f in filas if f is not totales_sql[0]]
+            tipos = _tipos_columnas(encabezados, filas)
+            total = totales_sql[0]
+        else:
+            total = fila_total(encabezados, filas, tipos) if seccion.get("total", True) else None
         pedido = seccion.get("grafico") or {}
         dibujo = None
         if pedido.get("tipo") != "ninguno" and filas and (
@@ -6898,13 +7084,17 @@ async def admin_quitar_numero(clave: str, numero: str):
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 @app.get("/test/mensaje")
-def test_mensaje(mensaje: str, numero: str = None, guardar: bool = False):
+def test_mensaje(clave: str, mensaje: str, numero: str = None, guardar: bool = False):
     """
-    TEST LOCAL: Envía un mensaje y obtiene respuesta, con las herramientas que usó Claude.
-    Usa: curl "http://localhost:8005/test/mensaje?mensaje=cuantos%20bins%20de%20tiffany"
+    PRUEBA: envía un mensaje y obtiene la respuesta, con las herramientas que usó Claude.
+    Pide la clave de administración: Caddy publica todo el puerto 8005, y sin número la
+    consulta tiene acceso total (incluidos embarques y FOB).
+    Usa: curl "http://localhost:8005/test/mensaje?clave=...&mensaje=cuantos%20bins%20de%20tiffany"
     Para probar contexto entre mensajes: pasa el mismo &numero=... y &guardar=true en cada llamada.
     OJO: con &numero=... los informes pedidos se envían de verdad por WhatsApp a ese número.
     """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
     traza = []
     respuesta = procesar_mensaje(mensaje, numero, traza=traza)
     if guardar and numero:
@@ -6912,8 +7102,10 @@ def test_mensaje(mensaje: str, numero: str = None, guardar: bool = False):
     return {"pregunta": mensaje, "respuesta": respuesta, "herramientas": traza}
 
 @app.get("/test/conexion")
-async def test_conexion():
-    """TEST LOCAL: Verifica conexión a SQL Server"""
+async def test_conexion(clave: str):
+    """PRUEBA: verifica la conexión a SQL Server (con la clave de administración)."""
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
     conn = conectar_sql()
     if conn:
         conn.close()
