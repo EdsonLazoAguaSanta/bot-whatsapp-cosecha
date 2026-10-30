@@ -743,8 +743,23 @@ def obtener_historial_conversacion(numero_sender):
 # CONEXIÓN SQL SERVER
 # ============================================================================
 
+# Modo mantención: si existe este archivo, el bot no abre ninguna conexión a SQL Server, responde
+# con un aviso y no hace los envíos programados. Se activa y desactiva sin reiniciar, con
+# /admin/base?estado=desconectar|conectar (o creando/borrando el archivo).
+ARCHIVO_BASE_DESCONECTADA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "BASE_DESCONECTADA")
+MENSAJE_BASE_DESCONECTADA = (
+    "La base de datos de cosecha y embarques está en mantención por un momento, así que ahora no "
+    "puedo consultar cifras ni armar informes. Vuelve a escribirme en un rato."
+)
+
+def base_desconectada():
+    return os.path.exists(ARCHIVO_BASE_DESCONECTADA)
+
 def conectar_sql():
     """Conecta a SQL Server"""
+    if base_desconectada():
+        logger.warning("Base desconectada (modo mantención): no se abre conexión a SQL Server")
+        return None
     try:
         conn_str = (
             f"Driver={{ODBC Driver 17 for SQL Server}};"
@@ -2458,6 +2473,18 @@ def obtener_temporada_actual():
         return None
 
 TEMPORADA_ACTUAL = obtener_temporada_actual()
+
+def recargar_catalogos():
+    """Los catálogos se cargan al arrancar: si el bot arrancó con la base desconectada quedaron
+    vacíos. Al reconectar se vuelven a leer (si una lectura falla, se conserva la anterior)."""
+    global VARIEDADES_CONOCIDAS, PACKINGS_CONOCIDOS, ENVASES_CONOCIDOS, PRODUCTORES_CONOCIDOS, GRUPOS_CONOCIDOS
+    VARIEDADES_CONOCIDAS = cargar_variedades_conocidas() or VARIEDADES_CONOCIDAS
+    PACKINGS_CONOCIDOS = cargar_packings_conocidos() or PACKINGS_CONOCIDOS
+    ENVASES_CONOCIDOS = cargar_envases_conocidos() or ENVASES_CONOCIDOS
+    PRODUCTORES_CONOCIDOS = cargar_productores_conocidos() or PRODUCTORES_CONOCIDOS
+    GRUPOS_CONOCIDOS = cargar_grupos_conocidos() or GRUPOS_CONOCIDOS
+    sincronizar_nombres_zonales()
+    return {"variedades": len(VARIEDADES_CONOCIDAS), "productores": len(PRODUCTORES_CONOCIDOS)}
 
 def normalizar_variedad(variedad_usuario):
     """Limpia espacios; la traducción al nombre exacto ya la hace Claude usando VARIEDADES_CONOCIDAS"""
@@ -4310,6 +4337,9 @@ def enviar_cuestionarios(turno, fecha=None):
     """Job programado: 'diario_am' (08:00) manda lo previsto del día y pide confirmar;
     'diario_pm' (15:00) repite lo informado en la mañana y pide confirmarlo al cierre.
     Va a zonales y productores (solo a los admin mientras dure el modo prueba)."""
+    if base_desconectada():
+        logger.warning(f"Base desconectada (modo mantención): no se envía el cuestionario {turno}")
+        return
     try:
         fecha = fecha or date.today()
         destinatarios = destinatarios_envios(("zonal", "productor"))
@@ -4524,6 +4554,9 @@ def construir_resumen_semanal(fecha=None, nombre=None, fundos=None, para_eas=Fal
 def enviar_resumen_semanal(fecha=None):
     """Job de los lunes 08:00: su semana a cada productor/zonal, y el consolidado al EAS
     (todo solo a los admin mientras dure el modo prueba)."""
+    if base_desconectada():
+        logger.warning("Base desconectada (modo mantención): no se envía el resumen semanal")
+        return
     try:
         fecha = fecha or date.today()
         enviados = sin_datos = errores = omitidos = por_plantilla = 0
@@ -4693,6 +4726,9 @@ def registrar_alerta_enviada(tipo, contenido, destinatarios):
 def enviar_alerta_desviaciones():
     """Job programado (semanal): envía al EAS (solo admin en modo prueba) el resumen de
     variedades desviadas más de UMBRAL_DESVIACION_PCT % respecto del estimado."""
+    if base_desconectada():
+        logger.warning("Base desconectada (modo mantención): no se envía la alerta de desviaciones")
+        return
     try:
         resultado = construir_alerta_desviaciones()
         if not resultado:
@@ -4883,6 +4919,13 @@ def atender_mensaje(message):
 
             logger.info(f"Mensaje de {numero_sender}: {msg_text}")
 
+            if base_desconectada():
+                # Sin base no hay cifras: se avisa y no se llama a Claude (inventaría o diría
+                # que no hay datos). Los cuestionarios pendientes quedan en cola para después.
+                guardar_conversacion(numero_sender, msg_type, msg_text, MENSAJE_BASE_DESCONECTADA)
+                enviar_whatsapp(numero_sender, MENSAJE_BASE_DESCONECTADA)
+                return
+
             # Si tenía un cuestionario esperando (se le mandó la plantilla porque la ventana
             # de 24 h estaba cerrada), su mensaje la reabre: primero se le entrega la tabla y
             # recién después se atiende lo que escribió.
@@ -4964,7 +5007,35 @@ async def privacy():
 @app.get("/health")
 async def health():
     """Verifica estado del bot"""
-    return {"status": "Bot activo y listo"}
+    if base_desconectada():
+        return {"status": "Bot activo, base desconectada (modo mantención)", "base": "desconectada"}
+    return {"status": "Bot activo y listo", "base": "conectada"}
+
+@app.get("/admin/base")
+def admin_base(clave: str, estado: str = None):
+    """
+    Modo mantención de la base SQL, sin reiniciar el bot. estado=desconectar: no abre conexiones,
+    responde con un aviso y no hace los envíos programados; estado=conectar: vuelve a la normalidad.
+    Al conectar vuelve a leer los catálogos (variedades, productores...), que quedan vacíos si
+    el bot arrancó desconectado. Sin estado, solo informa. Uso: .../admin/base?clave=...&estado=desconectar
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if estado is not None:
+        accion = estado.strip().lower()
+        if accion in ("desconectar", "mantencion", "mantención", "off", "0"):
+            with open(ARCHIVO_BASE_DESCONECTADA, "w", encoding="utf-8") as f:
+                f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            logger.warning("Base desconectada por /admin/base (modo mantención)")
+        elif accion in ("conectar", "on", "1"):
+            if os.path.exists(ARCHIVO_BASE_DESCONECTADA):
+                os.remove(ARCHIVO_BASE_DESCONECTADA)
+            logger.warning("Base reconectada por /admin/base")
+            return {"status": "ok", "base": "conectada", "catalogos": recargar_catalogos()}
+        else:
+            return JSONResponse({"status": "error", "error": "estado debe ser desconectar o conectar"},
+                                status_code=400)
+    return {"status": "ok", "base": "desconectada" if base_desconectada() else "conectada"}
 
 @app.get("/historial")
 async def historial(clave: str, limit: int = 50):
