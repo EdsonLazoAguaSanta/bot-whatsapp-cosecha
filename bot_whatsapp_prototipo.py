@@ -913,6 +913,24 @@ BASE_ORIGEN_ESTIMADO = BASE_ORIGEN_ESTIM_PRIMAVERA
 # Primavera que cubre la temporada entera y es la que usan las consultas del bot.
 BASE_ORIGEN_CUESTIONARIO = BASE_ORIGEN_TRISEMANAL
 
+# La Trisemanal (estimación de cosecha por día) sale SIEMPRE de la vista
+# [PKG-Cos-Trisemanal-Vigente], no de la tabla [PKG-Cos-Trisemanal]: la vista trae un solo valor
+# por día, el de la trisemanal más reciente (la columna Trisemanal dice de cuál viene), así que no
+# se filtra ni se agrupa por horizonte. Recepcion_Consolidada solo trae los primeros días de cada
+# trisemanal (el 02-11-2026: 2 días contra 14 de la vista), así que sus filas 'Trisemanal' se
+# reemplazan por las de la vista. Todas las consultas de cosecha leen esta unión, que conserva las
+# columnas de Recepcion_Consolidada y agrega CajasEq y Trisemanal (solo en las filas Trisemanal).
+RECEPCION_SQL = (
+    "(SELECT Temporada, [Base Origen], Especie, Variedad, [Variedad Agronomica], Productor, Grupo, Packing, "
+    "Fecha, Semana, Envase, Bultos, KgsRecepcionados, Terminado, Productor_R, Grupo_R, tipo_despacho, "
+    "CAST(NULL AS float) AS CajasEq, CAST(NULL AS float) AS Trisemanal "
+    f"FROM [Recepcion_Consolidada] WHERE ISNULL([Base Origen], '') <> '{BASE_ORIGEN_TRISEMANAL}' "
+    "UNION ALL "
+    f"SELECT Temporada, N'{BASE_ORIGEN_TRISEMANAL}', Especie, Variedad, Variedad, Productor, Grupo, Packing, "
+    "[Fecha Cosecha], Semana, Envase, Bultos, KgsRecepcionados, 'NO', Productor, Grupo, NULL, "
+    "[Cajas Eq], Trisemanal FROM [PKG-Cos-Trisemanal-Vigente])"
+)
+
 FUENTES_ESTIMADO = {
     "primavera": BASE_ORIGEN_ESTIM_PRIMAVERA,
     "trisemanal": BASE_ORIGEN_TRISEMANAL,
@@ -999,7 +1017,7 @@ def obtener_bins_estimados(variedad, fuente_estimado=None, temporada=None, alcan
         sql_alc, params_alc = _sql_alcance(alcance)
         query = f"""
         SELECT SUM(KgsRecepcionados) as total
-        FROM [Recepcion_Consolidada]
+        FROM {RECEPCION_SQL} AS Recepcion_Consolidada
         WHERE Variedad LIKE ?
         AND [Base Origen] = ?
         AND Temporada = ?
@@ -1029,7 +1047,7 @@ def obtener_cosecha_actual(variedad, fecha=None, alcance=None):
         sql_alc, params_alc = _sql_alcance(alcance)
         query = f"""
         SELECT SUM(KgsRecepcionados) as total
-        FROM [Recepcion_Consolidada]
+        FROM {RECEPCION_SQL} AS Recepcion_Consolidada
         WHERE Variedad LIKE ?
         AND [Base Origen] = ?
         AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE))
@@ -1067,7 +1085,7 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estim
         sql_alc, params_alc = _sql_alcance(alcance)
         filtro_alc = f" AND {sql_alc}" if sql_alc else ""
         cursor.execute(
-            f"""SELECT SUM(KgsRecepcionados) FROM [Recepcion_Consolidada]
+            f"""SELECT SUM(KgsRecepcionados) FROM {RECEPCION_SQL} AS Recepcion_Consolidada
                WHERE Variedad LIKE ? AND [Base Origen] = ?
                AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE)){filtro_alc}""",
             [f"%{variedad}%", base, fecha] + params_alc
@@ -1076,7 +1094,7 @@ def obtener_comparacion_estimado_vs_cosechado(variedad, fecha=None, fuente_estim
         estimado = fila[0] if fila and fila[0] else 0
 
         cursor.execute(
-            f"""SELECT SUM(KgsRecepcionados) FROM [Recepcion_Consolidada]
+            f"""SELECT SUM(KgsRecepcionados) FROM {RECEPCION_SQL} AS Recepcion_Consolidada
                WHERE Variedad LIKE ? AND [Base Origen] = ?
                AND CAST(Fecha AS DATE) = COALESCE(?, CAST(GETDATE() AS DATE)){filtro_alc}""",
             [f"%{variedad}%", BASE_ORIGEN_REAL, fecha] + params_alc
@@ -1118,10 +1136,10 @@ def obtener_resumen_por_productor(productor, alcance=None):
         sql_alc, params_alc = _sql_alcance(alcance)
         query = f"""
         SELECT SUM(KgsRecepcionados) as total, COUNT(DISTINCT Variedad) as variedades
-        FROM [Recepcion_Consolidada]
+        FROM {RECEPCION_SQL} AS Recepcion_Consolidada
         WHERE Productor LIKE ?
         AND [Base Origen] = ?
-        AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+        AND Temporada = (SELECT MAX(Temporada) FROM {RECEPCION_SQL} AS Recepcion_Consolidada WHERE Fecha <= GETDATE())
         {"AND " + sql_alc if sql_alc else ""}
         """
         cursor.execute(query, [f"%{productor}%", BASE_ORIGEN_REAL] + params_alc)
@@ -1147,10 +1165,10 @@ def obtener_resumen_por_packing(packing, alcance=None):
         sql_alc, params_alc = _sql_alcance(alcance)
         query = f"""
         SELECT SUM(KgsRecepcionados) as total, COUNT(DISTINCT Variedad) as variedades
-        FROM [Recepcion_Consolidada]
+        FROM {RECEPCION_SQL} AS Recepcion_Consolidada
         WHERE Packing LIKE ?
         AND [Base Origen] = ?
-        AND Temporada = (SELECT MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Fecha <= GETDATE())
+        AND Temporada = (SELECT MAX(Temporada) FROM {RECEPCION_SQL} AS Recepcion_Consolidada WHERE Fecha <= GETDATE())
         {"AND " + sql_alc if sql_alc else ""}
         """
         cursor.execute(query, [f"%{packing}%", BASE_ORIGEN_REAL] + params_alc)
@@ -1316,7 +1334,7 @@ def obtener_comparativo_estimaciones(especie=None, variedad=None, productor=None
         where = " AND ".join(condiciones)
         query = f"""
             SELECT Variedad, [Base Origen], SUM({columna_suma}) as total
-            FROM [Recepcion_Consolidada]
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
             WHERE {where}
             GROUP BY Variedad, [Base Origen]
             HAVING SUM({columna_suma}) > 0
@@ -1570,7 +1588,7 @@ def obtener_cosecha_detalle(fecha_inicio=None, fecha_fin=None, especie=None, var
         query = f"""
             SELECT Packing, Productor, Especie, Variedad, CAST(Fecha AS DATE) as Fecha, [Base Origen],
                    SUM({columna_suma}) as total
-            FROM [Recepcion_Consolidada]
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
             WHERE {where}
             GROUP BY Packing, Productor, Especie, Variedad, CAST(Fecha AS DATE), [Base Origen]
             HAVING SUM({columna_suma}) > 0
@@ -1869,7 +1887,7 @@ def obtener_cosecha_flexible(agrupar_por, fecha_inicio=None, fecha_fin=None, esp
         group_cols = f"{columnas_sql}, " if columnas_sql else ""
         query = f"""
             SELECT {select_cols}[Base Origen], SUM({columna_suma}) as total
-            FROM [Recepcion_Consolidada]
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
             WHERE {where}
             GROUP BY {group_cols}[Base Origen]
             HAVING SUM({columna_suma}) > 0
@@ -1985,7 +2003,7 @@ def obtener_proyeccion(fecha_inicio, fecha_fin, dimensiones, fuentes, filtros=No
         cursor.execute(f"""
             SELECT {select_dim}CAST(Semana AS INT) AS semana, [Base Origen],
                    SUM(KgsRecepcionados) AS kg
-            FROM [Recepcion_Consolidada]
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
             WHERE {" AND ".join(condiciones)}
             GROUP BY {select_dim}CAST(Semana AS INT), [Base Origen]
             HAVING SUM(KgsRecepcionados) > 0
@@ -2054,7 +2072,7 @@ def generar_informe_proyeccion(numero_destino=None, semanas=None, fecha_inicio=N
                                grupo=None, alcance=None, zonal=None, grafico=None, resumen=None):
     """Informe de proyección de cosecha: filas por fundo/especie/variedad/planta y las
     semanas como columnas, con totales y un gráfico de kilos por semana. Por defecto, las
-    próximas 3 semanas en kilos de Precosecha."""
+    próximas 3 semanas en kilos de Precosecha: desde hoy hasta hoy + 20 días."""
     try:
         semanas = int(semanas or RESUMEN_SEMANAS)
         if semanas < 1 or semanas > 12:
@@ -2065,7 +2083,7 @@ def generar_informe_proyeccion(numero_destino=None, semanas=None, fecha_inicio=N
             except (ValueError, TypeError):
                 return "No entendí la fecha de inicio. Indícala como DD-MM-YYYY."
         else:
-            inicio = _lunes_de(date.today())
+            inicio = date.today()  # «las próximas N semanas» = desde hoy hasta hoy + N*7 - 1 días
         fin = inicio + timedelta(days=semanas * 7 - 1)
 
         fuentes = [f for f in (fuentes or ["precosecha"]) if f in FUENTES_PROYECCION] or ["precosecha"]
@@ -2136,7 +2154,7 @@ def hay_datos_caja_eq(conn, fecha_inicio, fecha_fin, especie=None, variedad=None
                 params.append(f"%{valor}%")
         cursor = conn.cursor()
         cursor.execute(
-            f"SELECT TOP 1 1 FROM [Recepcion_Consolidada] WHERE {' AND '.join(condiciones)}",
+            f"SELECT TOP 1 1 FROM {RECEPCION_SQL} AS Recepcion_Consolidada WHERE {' AND '.join(condiciones)}",
             params,
         )
         return cursor.fetchone() is not None
@@ -2176,7 +2194,7 @@ def _obtener_extremo_cosecha(especie, variedad, packing, productor, temporada, u
         where = " AND ".join(condiciones)
 
         funcion_sql = "MAX" if usar_maximo else "MIN"
-        cursor.execute(f"SELECT {funcion_sql}(CAST(Fecha AS DATE)) FROM [Recepcion_Consolidada] WHERE {where}", params)
+        cursor.execute(f"SELECT {funcion_sql}(CAST(Fecha AS DATE)) FROM {RECEPCION_SQL} AS Recepcion_Consolidada WHERE {where}", params)
         fila = cursor.fetchone()
         conn.close()
 
@@ -2429,8 +2447,8 @@ def _consulta_con_datos(consulta, alcance, embarques=False):
     ctes = [(f"datos AS (SELECT {_sql_expr_temporada()} AS Temporada, rc.Temporada AS TemporadaBase, "
              f"rc.[Base Origen], rc.Especie, rc.Variedad, rc.[Variedad Agronomica], rc.Productor, "
              f"rc.Grupo, {_sql_expr_zonal('rc.Productor')} AS Zonal, rc.Packing, rc.Fecha, rc.Semana, "
-             f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho "
-             f"FROM [Recepcion_Consolidada] rc WHERE {' AND '.join(condiciones)})")]
+             f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho, rc.CajasEq, rc.Trisemanal "
+             f"FROM {RECEPCION_SQL} rc WHERE {' AND '.join(condiciones)})")]
     if embarques:
         ctes += _ctes_embarques()[:len(_tablas_embarques(embarques))]
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
@@ -3113,12 +3131,19 @@ TOOL_CONSULTAR_SQL = {
         "según la fecha: semana ISO 44 a 43, la misma que usan las demás herramientas; úsala para 'esta "
         "temporada', 'la pasada', comparar temporadas), TemporadaBase (la que trae la base, que ya asigna a la "
         "temporada siguiente la cereza temprana de octubre; úsala solo si la piden), [Base Origen] "
-        "('Recepción Planta' = real, 'Estim Primavera' = Precosecha, 'Trisemanal', 'Estim Invierno'), Especie (en "
+        "('Recepción Planta' = real, 'Estim Primavera' = Precosecha, 'Trisemanal' = estimación de cosecha por día, "
+        "'Estim Invierno'), Especie (en "
         "inglés: CHERRY, GRAPE...), Variedad, [Variedad Agronomica], Productor (= fundo), Grupo, Zonal (calculada: "
         "zonal responsable del productor, 'Sin zonal' si no tiene), Packing (= planta), Fecha (datetime), Semana "
         "(float, semana ISO), Envase (nchar: BINS, TOTES, CAJA EQ...), Bultos (float, unidades de envase), "
-        "KgsRecepcionados (float, kilos), Terminado, tipo_despacho. Ya excluye las filas duplicadas sin kilos, así que "
-        "puedes sumar Bultos y KgsRecepcionados directo. Reglas: agrega en SQL (GROUP BY, SUM) en vez de traer filas "
+        "KgsRecepcionados (float, kilos), Terminado, tipo_despacho, CajasEq (float, cajas equivalentes; SOLO en las "
+        "filas Trisemanal) y Trisemanal (float, SOLO en las filas Trisemanal: de qué trisemanal viene ese día, ej. 44). "
+        "Ya excluye las filas duplicadas sin kilos, así que puedes sumar Bultos y KgsRecepcionados directo. "
+        "TRISEMANAL: sus filas traen UN solo valor por día, el de la trisemanal más reciente, así que se suman "
+        "directo, sin filtrar ni agrupar por horizonte ni por la columna Trisemanal. 'Las próximas 3 semanas' (y en "
+        "general 'las próximas N semanas') = CAST(Fecha AS DATE) desde hoy hasta hoy + (N*7 - 1) días, es decir "
+        "BETWEEN CAST(GETDATE() AS DATE) AND DATEADD(day, 20, CAST(GETDATE() AS DATE)) para 3 semanas; en la "
+        "Trisemanal informa los kilos y las Cajas Eq (SUM(CajasEq)). Reglas: agrega en SQL (GROUP BY, SUM) en vez de traer filas "
         "sueltas, usa TOP para rankings, CAST(Fecha AS DATE) para fechas (compáralo con 'AAAA-MM-DD'; si comparas "
         "Fecha sin CAST usa 'AAAAMMDD', porque el servidor está en español y lee mal '2026-10-26' como datetime) y "
         "CAST(Semana AS INT) para semanas; compara "
@@ -4511,7 +4536,7 @@ def obtener_previsto(fecha_inicio, fecha_fin, fundos=None):
         cursor.execute(f"""
             SELECT Productor, Especie, Envase,
                    SUM(KgsRecepcionados) as kg, SUM(Bultos) as bultos
-            FROM [Recepcion_Consolidada]
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
             WHERE {" AND ".join(condiciones)}
             GROUP BY Productor, Especie, Envase
             HAVING SUM(KgsRecepcionados) > 0
@@ -4610,7 +4635,7 @@ def construir_confirmacion_tarde(fecha=None, nombre=None, fundos=None, ajuste_pr
 def _totales_semana(fecha, fundos):
     """Kilos y bultos previstos en el periodo del resumen semanal, para las cifras que van
     en la plantilla de reenganche."""
-    inicio = _lunes_de(fecha or date.today())
+    inicio = fecha or date.today()
     fin = inicio + timedelta(days=RESUMEN_SEMANAS * 7 - 1)
     filas = obtener_previsto_por_fuente(inicio, fin, fundos=fundos) or []
     # columna 5 = kg; se suman ambas fuentes por separado y se usa la mayor, que es la
@@ -4809,7 +4834,7 @@ def obtener_previsto_plantas(fecha, plantas=None):
         cursor.execute(f"""
             SELECT ISNULL(LTRIM(RTRIM(Packing)), '(sin planta)') AS Planta, Productor, Especie,
                    SUM(KgsRecepcionados) AS kg, SUM(Bultos) AS bultos
-            FROM [Recepcion_Consolidada]
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
             WHERE {" AND ".join(condiciones)}
             GROUP BY ISNULL(LTRIM(RTRIM(Packing)), '(sin planta)'), Productor, Especie
             HAVING SUM(KgsRecepcionados) > 0
@@ -5005,7 +5030,7 @@ def obtener_previsto_por_fuente(fecha_inicio, fecha_fin, fundos=None):
             SELECT Productor, Especie, CAST(Semana AS INT) AS semana, [Base Origen],
                    MIN(CAST(Fecha AS DATE)) AS desde,
                    SUM(KgsRecepcionados) AS kg
-            FROM [Recepcion_Consolidada]
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
             WHERE {" AND ".join(condiciones)}
             GROUP BY Productor, Especie, CAST(Semana AS INT), [Base Origen]
             HAVING SUM(KgsRecepcionados) > 0
@@ -5048,7 +5073,8 @@ def construir_resumen_semanal(fecha=None, nombre=None, fundos=None, para_eas=Fal
     el consolidado por semana y por productor."""
     try:
         fecha = fecha or date.today()
-        inicio = _lunes_de(fecha)
+        # Desde el día del envío (los lunes, el mismo lunes) hasta 20 días después.
+        inicio = fecha
         fin = inicio + timedelta(days=RESUMEN_SEMANAS * 7 - 1)
         filas = obtener_previsto_por_fuente(inicio, fin, fundos=fundos)
         if not filas:
