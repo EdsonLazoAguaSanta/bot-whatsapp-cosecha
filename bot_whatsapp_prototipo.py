@@ -351,6 +351,10 @@ def inicializar_db_local():
     # asignados", que significa que no debe ver nada.
     if "acceso_total" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN acceso_total INTEGER DEFAULT 0")
+    # Qué ve de embarques un EAS o gerencia: 0 = nada, 1 = embarques sin FOB, 2 = también el
+    # FOB. Vacío = todo (lo que veían antes de existir la opción).
+    if "ver_embarques" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN ver_embarques INTEGER")
     # Migración: el productor único que había antes pasa a ser el primer fundo asignado.
     conn.execute("""
         INSERT OR IGNORE INTO numeros_fundos (numero, fundo)
@@ -804,6 +808,7 @@ def listar_numeros_permitidos():
             fila["fundos_de_su_zonal"] = len(productores_de_zonal(fila["zonal"]))
         fila["ve_todo"] = (fila["rol"] or ROL_POR_DEFECTO) in ROLES_VEN_TODO or bool(fila["acceso_total"])
         fila["plantas"] = plantas_de(fila["numero"])
+        fila["embarques"] = NOMBRE_NIVEL_EMBARQUES[nivel_embarques(fila["numero"])]
     conn.close()
     return filas
 
@@ -2283,9 +2288,35 @@ ROLES_EMBARQUES = ("admin", "eas", "gerencia")
 TABLAS_EMBARQUES = ("embarques", "embarques_fob")
 NOMBRES_RESERVADOS_SQL = {"datos", *TABLAS_EMBARQUES}
 
-def puede_ver_embarques(numero):
-    """Sin número es una prueba local de administración (ver /test/mensaje)."""
-    return numero is None or rol_de(numero) in ROLES_EMBARQUES
+NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
+NOMBRE_NIVEL_EMBARQUES = {nivel: nombre for nombre, nivel in NIVELES_EMBARQUES.items()}
+
+def nivel_embarques(numero):
+    """Qué puede ver de embarques: 0 = nada; 1 = la tabla `embarques` (cajas, naves,
+    destinos), sin valores FOB; 2 = también `embarques_fob`. El admin ve todo; EAS y gerencia,
+    lo que se les haya elegido (por defecto todo); los demás perfiles, nada. Sin número es una
+    prueba local de administración (ver /test/mensaje)."""
+    if numero is None:
+        return 2
+    rol = rol_de(numero)
+    if rol not in ROLES_EMBARQUES:
+        return 0
+    if rol == "admin":
+        return 2
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute("SELECT ver_embarques FROM numeros_permitidos WHERE numero = ?",
+                            (normalizar_numero(numero),)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo el nivel de embarques: {str(e)}")
+        return 0
+    return 2 if not fila or fila[0] is None else max(0, min(2, int(fila[0])))
+
+def _tablas_embarques(embarques):
+    """Tablas de embarques permitidas para un nivel (True = todas, como antes)."""
+    nivel = 2 if embarques is True else int(embarques or 0)
+    return TABLAS_EMBARQUES[:nivel]
 
 # El historial de confirmaciones y ajustes lo consultan los mismos perfiles que ven todo.
 ROLES_CONFIRMACIONES = ("admin", "eas", "gerencia")
@@ -2327,8 +2358,11 @@ def validar_consulta_sql(sql, tablas_extra=()):
     permitidas = {"datos", *tablas_extra}
     vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
     if vedadas:
-        return None, ("Las tablas de embarques (embarques, embarques_fob) son solo para los perfiles "
-                      "EAS y gerencia.")
+        if "embarques" in permitidas:
+            return None, ("Los valores FOB (tabla embarques_fob) no están habilitados para este usuario: "
+                          "solo puede consultar `embarques`.")
+        return None, ("Las tablas de embarques (embarques, embarques_fob) no están habilitadas para "
+                      "este usuario.")
     error = _revisar_origenes(tokens, ctes | permitidas)
     if error:
         return None, error
@@ -2398,7 +2432,7 @@ def _consulta_con_datos(consulta, alcance, embarques=False):
              f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho "
              f"FROM [Recepcion_Consolidada] rc WHERE {' AND '.join(condiciones)})")]
     if embarques:
-        ctes += _ctes_embarques()
+        ctes += _ctes_embarques()[:len(_tablas_embarques(embarques))]
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
     if resto != consulta:
         return f"WITH {', '.join(ctes)}, {resto}"
@@ -2414,7 +2448,7 @@ def _mensaje_error_sql(error):
 def ejecutar_consulta_sql(sql, alcance, max_filas=MAX_FILAS_SQL, embarques=False):
     """({"columnas", "filas", "truncado"}, None) o (None, error). embarques=True permite
     además las tablas de embarques (quien llama ya verificó el perfil)."""
-    consulta, error = validar_consulta_sql(sql, TABLAS_EMBARQUES if embarques else ())
+    consulta, error = validar_consulta_sql(sql, _tablas_embarques(embarques))
     if error:
         return None, error
     conn = conectar_sql()
@@ -3202,11 +3236,37 @@ TOOL_CONSULTAR_SQL_EMBARQUES = {
         },
     },
 }
-TOOL_GENERAR_INFORME_EMBARQUES = {
-    **TOOL_GENERAR_INFORME,
-    "description": (TOOL_GENERAR_INFORME["description"]
-                    + " Las secciones también pueden leer `embarques` y `embarques_fob` (ver consultar_sql)."),
+# Para quien ve embarques pero no el FOB: solo la tabla `embarques` y las reglas que aplican.
+DESCRIPCION_EMBARQUES_SIN_FOB = (
+    " ADEMÁS, este usuario puede consultar la tabla de EMBARQUES (exportación), con TODOS los productores "
+    "(no tiene filtro de fundos). Cada fila es un pallet o parte de un pallet embarcado. "
+    "`embarques` (vista Reporte_Embarque_PBI): Temporada (int, temporada de embarque), Especie (inglés), Variedad, "
+    "TipoVariedad, Cajas (cajas físicas), CajasEq (cajas equivalentes), Pallets (fracción de pallet; suma para "
+    "contar pallets), CajasPorPallet, Contenedor (NULL en aéreos, terrestres y naves convencionales), Recibidor "
+    "(cliente), Nave, Via ('Marítima', 'Aérea', 'Terrestre'), FechaZarpe (date), SemanaZarpe (int, ISO), Puerto "
+    "(de llegada), ETA (date), Mercado (región: LEJANO ORIENTE, USA EAST COAST, USA WEST COAST, EUROPA, "
+    "SUDAMERICA, CENTROAMERICA, NORTEAMERICA, CHILE...), PaisVenta (casi siempre NULL). "
+    "Este usuario NO tiene habilitados los valores FOB, precios, retornos ni liquidaciones (no existe "
+    "`embarques_fob` para él). REGLAS DE AGUA SANTA para embarques: (1) 'cajas' sin más = cajas FÍSICAS (Cajas); "
+    "las equivalentes solo si las piden. (2) 'Destino' o 'mercado' = Mercado (región) y Puerto. (3) Para cruzar "
+    "embarques con cosecha usa Especie/Variedad/Temporada; no hay kilos embarcados, así que no compares kilos "
+    "cosechados con cajas embarcadas como si fueran la misma unidad."
+)
+TOOL_CONSULTAR_SQL_EMBARQUES_SIN_FOB = {
+    **TOOL_CONSULTAR_SQL,
+    "description": TOOL_CONSULTAR_SQL["description"] + DESCRIPCION_EMBARQUES_SIN_FOB,
+    "input_schema": {
+        **TOOL_CONSULTAR_SQL["input_schema"],
+        "properties": {
+            **TOOL_CONSULTAR_SQL["input_schema"]["properties"],
+            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos` y/o `embarques`."},
+        },
+    },
 }
+
+def _herramienta_sql(nivel):
+    return (TOOL_CONSULTAR_SQL_EMBARQUES if nivel >= 2
+            else TOOL_CONSULTAR_SQL_EMBARQUES_SIN_FOB if nivel == 1 else TOOL_CONSULTAR_SQL)
 
 TOOL_CONSULTAR_CONFIRMACIONES = {
     "name": "consultar_confirmaciones",
@@ -3227,13 +3287,27 @@ _FUENTE_INFORME = {
     "description": "'cosecha' (por defecto): la consulta es SQL Server sobre `datos` y las tablas de embarques. "
                    "'confirmaciones': la consulta es SQLite sobre la tabla `confirmaciones` (ver consultar_confirmaciones).",
 }
-TOOL_GENERAR_INFORME_EMBARQUES = json.loads(json.dumps(TOOL_GENERAR_INFORME_EMBARQUES))
-TOOL_GENERAR_INFORME_EMBARQUES["description"] += (
-    " Con fuente='confirmaciones' una sección (o las cifras clave, con fuente_kpis) lee el historial de "
-    "confirmaciones y ajustes en vez de la base de cosecha."
-)
-TOOL_GENERAR_INFORME_EMBARQUES["input_schema"]["properties"]["fuente_kpis"] = _FUENTE_INFORME
-TOOL_GENERAR_INFORME_EMBARQUES["input_schema"]["properties"]["secciones"]["items"]["properties"]["fuente"] = _FUENTE_INFORME
+_INFORMES_POR_PERMISO = {}
+
+def _herramienta_informe(nivel, confirmaciones):
+    """generar_informe según lo que puede leer el usuario: las tablas de embarques de su nivel
+    y, si ve el historial, la fuente 'confirmaciones'. Se arma una vez por combinación, así la
+    definición es siempre la misma (la caché de prompts depende de eso)."""
+    clave = (nivel, bool(confirmaciones))
+    if clave not in _INFORMES_POR_PERMISO:
+        tool = json.loads(json.dumps(TOOL_GENERAR_INFORME))
+        if nivel >= 2:
+            tool["description"] += " Las secciones también pueden leer `embarques` y `embarques_fob` (ver consultar_sql)."
+        elif nivel == 1:
+            tool["description"] += (" Las secciones también pueden leer `embarques` (ver consultar_sql); los valores "
+                                    "FOB no están habilitados para este usuario.")
+        if confirmaciones:
+            tool["description"] += (" Con fuente='confirmaciones' una sección (o las cifras clave, con fuente_kpis) "
+                                    "lee el historial de confirmaciones y ajustes en vez de la base de cosecha.")
+            tool["input_schema"]["properties"]["fuente_kpis"] = _FUENTE_INFORME
+            tool["input_schema"]["properties"]["secciones"]["items"]["properties"]["fuente"] = _FUENTE_INFORME
+        _INFORMES_POR_PERMISO[clave] = tool
+    return _INFORMES_POR_PERMISO[clave]
 
 # Esta herramienta está SIEMPRE disponible (ver procesar_mensaje): el usuario puede reportar
 # un ajuste de proyección cuando ocurre, no solo mientras haya un cuestionario vigente. Si hay
@@ -3624,7 +3698,23 @@ por datos— usa la herramienta registrar_respuesta_cuestionario con resultado "
 detalle concreto: queda registrado y se le avisa al equipo EAS. NUNCA le digas que no puedes
 registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con esa herramienta.""")
 
-    if puede_ver_embarques(numero_sender):
+    nivel = nivel_embarques(numero_sender)
+    if nivel == 1:
+        partes.append(
+            "EMBARQUES: este usuario puede consultar los embarques de exportación (cajas, pallets, "
+            "clientes, naves, puertos y mercados) con la tabla `embarques` de consultar_sql y "
+            "generar_informe, pero NO tiene habilitados los valores FOB, precios, retornos ni "
+            "liquidaciones. Si los pide, explícale con amabilidad que esa información no está "
+            "habilitada para su usuario y que puede pedírsela a Edson Lazo."
+        )
+    elif nivel == 0 and numero_sender and rol_de(numero_sender) in ROLES_EMBARQUES:
+        partes.append(
+            "EMBARQUES: la información de embarques y exportación (cajas embarcadas, clientes, naves, "
+            "puertos, mercados, FOB, precios o liquidaciones) no está habilitada para este usuario. "
+            "Si la pide, explícale con amabilidad que no la tiene habilitada y que puede pedírsela a "
+            "Edson Lazo."
+        )
+    elif nivel >= 2:
         partes.append(
             "EMBARQUES: este usuario puede consultar los embarques de exportación (cajas, pallets, "
             "clientes, naves, puertos, mercados y valores FOB) con las tablas `embarques` y "
@@ -3692,7 +3782,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
 
     if tool_name == "consultar_sql":
         return consultar_sql(tool_input.get("consulta"), alcance,
-                             embarques=puede_ver_embarques(numero_sender))
+                             embarques=nivel_embarques(numero_sender))
 
     if tool_name == "generar_informe":
         return generar_informe_personalizado(
@@ -3704,7 +3794,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             resumen=tool_input.get("resumen") or None,
             consulta_kpis=tool_input.get("consulta_kpis") or None,
             alcance=alcance,
-            embarques=puede_ver_embarques(numero_sender),
+            embarques=nivel_embarques(numero_sender),
             confirmaciones=puede_ver_confirmaciones(numero_sender),
             fuente_kpis=tool_input.get("fuente_kpis") or None,
         )
@@ -3834,11 +3924,10 @@ LIMITE_RESULTADO_HISTORIAL = 1500
 def herramientas_disponibles(numero_sender=None):
     # La herramienta de reporte va siempre que haya número: un ajuste de proyección se avisa
     # cuando pasa, no solo mientras hay un cuestionario vigente.
-    if puede_ver_embarques(numero_sender):
-        sql = [TOOL_CONSULTAR_SQL_EMBARQUES, TOOL_GENERAR_INFORME_EMBARQUES]
-    else:
-        sql = [TOOL_CONSULTAR_SQL, TOOL_GENERAR_INFORME]
-    if puede_ver_confirmaciones(numero_sender):
+    nivel = nivel_embarques(numero_sender)
+    confirmaciones = puede_ver_confirmaciones(numero_sender)
+    sql = [_herramienta_sql(nivel), _herramienta_informe(nivel, confirmaciones)]
+    if confirmaciones:
         sql.append(TOOL_CONSULTAR_CONFIRMACIONES)
     # La planta solo consulta: los ajustes los reportan zonales y productores.
     reporta = numero_sender and rol_de(numero_sender) != "planta"
@@ -7135,12 +7224,31 @@ def _estado_numero(numero):
         "zonal": zonal,
         "fundos": fundos_de(num),
         "plantas": plantas_de(num),
+        "embarques": NOMBRE_NIVEL_EMBARQUES[nivel_embarques(num)],
         "ve_todo": ve_todo,
         "acceso_total": acceso_total,
         "alcance": detalle_alcance,
         "recibe_notificaciones": notif,
         "notificaciones": detalle_notif,
     }
+
+def _embarques_param(valor):
+    """Valida ?embarques= : (0 | 1 | 2 | None si no vino, error). Acepta no/sin_fob/fob (y
+    0/1/2, si = fob)."""
+    if valor is None:
+        return None, None
+    texto = valor.strip().lower()
+    equivalencias = {"no": 0, "0": 0, "sin_fob": 1, "1": 1, "cajas": 1, "fob": 2, "2": 2, "si": 2, "sí": 2, "todo": 2}
+    if texto not in equivalencias:
+        return None, JSONResponse(
+            {"status": "error", "error": "embarques debe ser no, sin_fob o fob."}, status_code=400)
+    return equivalencias[texto], None
+
+def fijar_nivel_embarques(numero, nivel):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.execute("UPDATE numeros_permitidos SET ver_embarques = ? WHERE numero = ?", (nivel, normalizar_numero(numero)))
+    conn.commit()
+    conn.close()
 
 def _plantas_param(plantas):
     """Valida ?plantas= (separadas por "|"): (lista con los nombres exactos | [] para quitar |
@@ -7181,7 +7289,7 @@ def _zonal_param(zonal):
 async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre: str = None,
                                rol: str = None, productor: str = None, fundos: str = None,
                                notificaciones: str = None, acceso_total: str = None, zonal: str = None,
-                               plantas: str = None):
+                               plantas: str = None, embarques: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
@@ -7198,7 +7306,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas"}
+        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques"}
         | set(ALIAS_PARAMETROS),
     )
     if error:
@@ -7212,6 +7320,9 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     if error:
         return error
     plantas_lista, error = _plantas_param(plantas)
+    if error:
+        return error
+    nivel_emb, error = _embarques_param(embarques)
     if error:
         return error
     try:
@@ -7237,6 +7348,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
                            revocar_acceso_total=(acceso is None))
         if plantas_lista is not None:
             asignar_plantas(numero_normalizado, plantas_lista)
+        if nivel_emb is not None:
+            fijar_nivel_embarques(numero_normalizado, nivel_emb)
 
         bienvenida_enviada = False
         if es_nuevo:
@@ -7257,7 +7370,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
 @app.get("/admin/numeros/rol")
 async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str = None,
                             productor: str = None, fundos: str = None, notificaciones: str = None,
-                            acceso_total: str = None, zonal: str = None, plantas: str = None):
+                            acceso_total: str = None, zonal: str = None, plantas: str = None,
+                            embarques: str = None):
     """
     Cambia el rol, el zonal, los fundos asignados y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
@@ -7272,16 +7386,16 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas"}
+        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques"}
         | set(ALIAS_PARAMETROS),
     )
     if error:
         return error
     if (rol is None and productor is None and fundos is None and notificaciones is None
-            and acceso_total is None and zonal is None and plantas is None):
+            and acceso_total is None and zonal is None and plantas is None and embarques is None):
         return JSONResponse(
             {"status": "error",
-             "error": "Indica al menos rol, zonal, fundos, plantas, productor, notificaciones o acceso_total"},
+             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, productor, notificaciones o acceso_total"},
             status_code=400,
         )
     if rol is not None and rol not in ROLES_VALIDOS:
@@ -7293,6 +7407,9 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     if error:
         return error
     plantas_lista, error = _plantas_param(plantas)
+    if error:
+        return error
+    nivel_emb, error = _embarques_param(embarques)
     if error:
         return error
     try:
@@ -7313,6 +7430,8 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
                            revocar_acceso_total=(acceso is None))
         if plantas_lista is not None:
             asignar_plantas(numero, plantas_lista)
+        if nivel_emb is not None:
+            fijar_nivel_embarques(numero, nivel_emb)
         num = normalizar_numero(numero)
         return {"status": "ok", "numero": num, **_estado_numero(num)}
     except Exception as e:
