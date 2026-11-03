@@ -304,6 +304,9 @@ def inicializar_db_local():
             cuestionario_id INTEGER
         )
     """)
+    # aviso = lo que se le avisó al equipo: solo lo que la persona informó en ese mensaje.
+    if "aviso" not in [fila[1] for fila in conn.execute("PRAGMA table_info(confirmaciones)")]:
+        conn.execute("ALTER TABLE confirmaciones ADD COLUMN aviso TEXT")
     columnas_cuest = [fila[1] for fila in conn.execute("PRAGMA table_info(cuestionarios)")]
     # Productores que iban en la tabla de cada cuestionario (JSON): con eso se sabe quién
     # confirmó qué al armar el resumen de cierre de cada planta.
@@ -2566,6 +2569,59 @@ def ejecutar_consulta_confirmaciones(sql, max_filas=MAX_FILAS_SQL):
     finally:
         conn.close()
 
+EVENTO_HISTORIAL = {"confirmado": "confirmó", "ajustado": "ajuste", "corregido": "corrección",
+                    "anulado": "anuló su ajuste", "reporte": "aviso sin cuestionario"}
+
+def historial_confirmaciones(numero_consultante, persona=None, productor=None, desde=None, hasta=None,
+                             incluir_confirmaciones=True, max_lineas=60):
+    """Una línea por confirmación, ajuste, corrección o anulación, en orden. Admin, EAS y gerencia
+    ven todo; un zonal o productor, lo que reportó él y lo que toca sus fundos."""
+    try:
+        hoy = date.today()
+        hasta_d = datetime.strptime(hasta, "%Y-%m-%d").date() if hasta else hoy
+        desde_d = datetime.strptime(desde, "%Y-%m-%d").date() if desde else hasta_d - timedelta(days=6)
+    except ValueError:
+        return "No entendí las fechas: usa AAAA-MM-DD."
+    eventos = list(EVENTO_HISTORIAL) if incluir_confirmaciones else [e for e in EVENTO_HISTORIAL if e != "confirmado"]
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.row_factory = sqlite3.Row
+    filas = conn.execute(
+        f"SELECT fecha_hora, fecha, evento, turno, numero, nombre, productores, aviso, detalle, texto_usuario "
+        f"FROM confirmaciones WHERE evento IN ({', '.join('?' * len(eventos))}) "
+        f"AND date(fecha_hora) BETWEEN ? AND ? ORDER BY id",
+        (*eventos, desde_d.isoformat(), hasta_d.isoformat())
+    ).fetchall()
+    conn.close()
+    # Alcance: el equipo ve todo; un zonal o productor, lo propio y lo de sus fundos.
+    if numero_consultante and rol_de(numero_consultante) not in ROLES_CONFIRMACIONES \
+            and not tiene_acceso_total(numero_consultante):
+        propio = normalizar_numero(numero_consultante)
+        fundos = fundos_efectivos(propio)
+        filas = [f for f in filas if f["numero"] == propio or any(
+            _fundo_coincide(x, p) for x in fundos for p in (f["productores"] or "").split("; ") if p)]
+    if persona:
+        buscado = _normalizar_nombre(persona)
+        filas = [f for f in filas if buscado in _normalizar_nombre(f["nombre"] or "")]
+    if productor:
+        buscado = _normalizar_nombre(productor)
+        filas = [f for f in filas if buscado in _normalizar_nombre(f["productores"] or "")
+                 or buscado in _normalizar_nombre(f["aviso"] or f["detalle"] or "")]
+    if not filas:
+        return f"No hay confirmaciones ni ajustes registrados del {desde_d:%d-%m} al {hasta_d:%d-%m} con esos filtros."
+    recortadas = len(filas) > max_lineas
+    filas = filas[-max_lineas:]
+    titulo = f"Historial del {desde_d:%d-%m} al {hasta_d:%d-%m}" + (f" ({persona})" if persona else "")
+    lineas = [f"{titulo}: {len(filas)} hecho(s)" + (f", los últimos {max_lineas}" if recortadas else "")]
+    for f in filas:
+        cuando = datetime.strptime(f["fecha_hora"][:16], "%Y-%m-%d %H:%M").strftime("%d-%m %H:%M")
+        que = EVENTO_HISTORIAL.get(f["evento"], f["evento"])
+        origen = TURNO_AVISO.get(f["turno"] or "", "")
+        texto = _aviso_corto(f["aviso"] or f["detalle"] or f["texto_usuario"] or "", 160)
+        lineas.append(f"• {cuando} · {f['nombre'] or f['numero']} · {que}"
+                      + (f" ({origen})" if origen and f["evento"] != "reporte" else "")
+                      + (f": {texto}" if texto and f["evento"] != "confirmado" else ""))
+    return "\n".join(lineas)
+
 def consultar_confirmaciones(sql):
     """Resultado de una consulta al historial como texto para Claude."""
     resultado, error = ejecutar_consulta_confirmaciones(sql)
@@ -3305,6 +3361,28 @@ TOOL_CONSULTAR_CONFIRMACIONES = {
     },
 }
 
+TOOL_HISTORIAL_CONFIRMACIONES = {
+    "name": "historial_confirmaciones",
+    "description": (
+        "Muestra, en orden y en una línea por hecho, las confirmaciones, ajustes, correcciones y anulaciones "
+        "que han enviado zonales y productores (lo mismo que se le avisó al equipo). Úsala cuando pidan 'el "
+        "historial', 'historial de Pedro', 'qué ha cambiado', 'todo lo que confirmó o corrigió', normalmente "
+        "después de recibir un aviso de ajuste. Por defecto los últimos 7 días. Cada usuario ve solo lo de sus "
+        "fundos (admin, EAS y gerencia ven todo). Entrega el resultado tal cual, sin reescribirlo en párrafos "
+        "largos; si piden más detalle de un hecho puntual, ahí puedes explicarlo."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "persona": {"type": "string", "description": "Nombre (o parte) de quien reportó, ej. 'Pedro'. Opcional."},
+            "productor": {"type": "string", "description": "Fundo o productor (nombre o parte). Opcional."},
+            "desde": {"type": "string", "description": "AAAA-MM-DD. Por defecto, hace 6 días."},
+            "hasta": {"type": "string", "description": "AAAA-MM-DD. Por defecto, hoy."},
+            "incluir_confirmaciones": {"type": "boolean", "description": "Incluir las confirmaciones sin cambios (por defecto sí)."},
+        },
+    },
+}
+
 # Para los perfiles que ven el historial (los mismos que ven embarques), el informe a medida
 # puede leer también `confirmaciones`: por sección (fuente) y en las cifras clave (fuente_kpis).
 _FUENTE_INFORME = {
@@ -3350,10 +3428,14 @@ TOOL_REGISTRAR_CUESTIONARIO = {
             },
             "detalle_ajuste": {
                 "type": "string",
-                "description": "Obligatorio si resultado='ajustado': resumen claro y concreto de lo que reportó el usuario, con variedad, magnitud y unidad si las dio. Ej: 'BOREAL: ~2.000 kg menos que lo proyectado'. Si no dio cifras, describe el cambio igual: 'GARCICA: cosecha atrasada aprox. una semana'."
+                "description": "Obligatorio si resultado='ajustado': cómo queda el ajuste de ESTE cuestionario (el día al que se refiere), claro y concreto, con variedad, magnitud y unidad si las dio. Ej: 'BOREAL: ~2.000 kg menos que lo proyectado'. Si no dio cifras, describe el cambio igual: 'GARCICA: cosecha atrasada aprox. una semana'. No incluyas datos de otros días ni el historial de reportes anteriores."
+            },
+            "aviso": {
+                "type": "string",
+                "description": "Obligatorio: lo que se le AVISA al equipo, en UNA o DOS líneas (máximo 250 caracteres): SOLO lo que la persona informó en ESTE mensaje, qué confirma o qué cambia (fundo o variedad, cifra y día). Ej: 'Hoy 03-11 no hay cosecha en ninguno de sus fundos (trisemanal 80.328 kg)', 'Confirma lo previsto para hoy', 'BOREAL: 2.000 kg menos el jueves'. Nunca repitas reportes anteriores ni el historial: eso lo ven pidiendo el historial."
             }
         },
-        "required": ["resultado"]
+        "required": ["resultado", "aviso"]
     },
 }
 
@@ -3711,8 +3793,9 @@ El usuario ya lo respondió (estado: {cuestionario_activo["estado"]}; lo registr
 Si su mensaje de ahora es una CORRECCIÓN o un nuevo ajuste sobre esa misma proyección (ej. "mejor
 serán 10 mil kilos más", "me equivoqué, era garcica", "al final déjalo como estaba"), usa la
 herramienta registrar_respuesta_cuestionario para ACTUALIZAR lo registrado: resultado "ajustado"
-con el detalle nuevo COMPLETO (reemplaza al anterior, no lo complementa), o "confirmado" si vuelve
-a la proyección original. Si el mensaje es una consulta normal que no tiene relación con el
+con el detalle de cómo queda el ajuste de ESE cuestionario (reemplaza al anterior, sin datos de otros
+días) y en `aviso` SOLO lo que cambió en este mensaje, o "confirmado" si vuelve a la proyección
+original. Si el mensaje es una consulta normal que no tiene relación con el
 cuestionario, atiéndela con las demás herramientas como siempre.""")
     elif numero_sender and rol_de(numero_sender) != "planta":
         partes.append("""REPORTES DE AJUSTE: este usuario no tiene ningún cuestionario de proyección vigente ahora, pero
@@ -3789,6 +3872,15 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
     if alcance is not None and not alcance:
         return MENSAJE_SIN_PLANTA if isinstance(alcance, AlcancePlanta) else MENSAJE_SIN_FUNDOS
 
+    if tool_name == "historial_confirmaciones":
+        if isinstance(alcance, AlcancePlanta):
+            return "El historial de reportes de los zonales no está disponible para el perfil planta."
+        return historial_confirmaciones(
+            numero_sender, persona=tool_input.get("persona"), productor=tool_input.get("productor"),
+            desde=tool_input.get("desde"), hasta=tool_input.get("hasta"),
+            incluir_confirmaciones=tool_input.get("incluir_confirmaciones", True),
+        )
+
     if tool_name == "consultar_confirmaciones":
         if not puede_ver_confirmaciones(numero_sender):
             return "El historial de confirmaciones es solo para los perfiles admin, EAS y gerencia."
@@ -3803,6 +3895,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             tool_input.get("resultado", "confirmado"),
             detalle_ajuste=tool_input.get("detalle_ajuste"),
             texto_usuario=texto_usuario,
+            aviso=tool_input.get("aviso"),
         )
 
     if tool_name == "consultar_sql":
@@ -3954,10 +4047,12 @@ def herramientas_disponibles(numero_sender=None):
     sql = [_herramienta_sql(nivel), _herramienta_informe(nivel, confirmaciones)]
     if confirmaciones:
         sql.append(TOOL_CONSULTAR_CONFIRMACIONES)
-    # La planta solo consulta: los ajustes los reportan zonales y productores.
-    reporta = numero_sender and rol_de(numero_sender) != "planta"
+    # La planta solo consulta: los ajustes los reportan zonales y productores, y el historial de
+    # reportes es de ellos y del equipo.
+    reporta = not numero_sender or rol_de(numero_sender) != "planta"
     return (TOOLS + [TOOL_PROYECCION] + sql
-            + ([TOOL_REGISTRAR_CUESTIONARIO] if reporta else []))
+            + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
+            + ([TOOL_HISTORIAL_CONFIRMACIONES] if reporta else []))
 
 def _historial_como_mensajes(numero_sender, nombres_herramientas):
     """Reconstruye la conversación reciente como mensajes para Claude, incluidas las
@@ -4316,7 +4411,8 @@ def _fundo_coincide(fundo_asignado, texto):
     return (asignado not in conocidos and asignado in nombre) or (nombre not in conocidos and nombre in asignado)
 
 def registrar_evento(evento, numero, turno=None, fecha=None, productores=None, plantas=None,
-                     kg=None, detalle=None, texto_usuario=None, avisados=None, cuestionario_id=None):
+                     kg=None, detalle=None, texto_usuario=None, avisados=None, cuestionario_id=None,
+                     aviso=None):
     """Agrega un hecho al historial `confirmaciones` (nunca se edita ni se borra)."""
     try:
         num = normalizar_numero(numero)
@@ -4324,12 +4420,12 @@ def registrar_evento(evento, numero, turno=None, fecha=None, productores=None, p
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.execute(
             "INSERT INTO confirmaciones (fecha, evento, turno, numero, nombre, perfil, zonal, productores, "
-            "plantas, kg_previstos, detalle, texto_usuario, avisados, cuestionario_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "plantas, kg_previstos, detalle, texto_usuario, avisados, cuestionario_id, aviso) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (str(fecha or date.today())[:10], evento, turno, num, info.get("nombre"),
              info.get("rol") or ROL_POR_DEFECTO, info.get("zonal"),
              "; ".join(productores) if productores else None, "; ".join(plantas) if plantas else None,
-             kg, detalle, texto_usuario, avisados, cuestionario_id)
+             kg, detalle, texto_usuario, avisados, cuestionario_id, aviso)
         )
         conn.commit()
         conn.close()
@@ -4379,7 +4475,25 @@ def obtener_cuestionario_activo(numero):
         logger.error(f"Error buscando cuestionario activo: {str(e)}")
         return None
 
-def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, texto_usuario=None):
+def _aviso_corto(texto, largo=300):
+    texto = " ".join(str(texto or "").split())
+    return texto if len(texto) <= largo else texto[:largo].rsplit(" ", 1)[0] + "…"
+
+def _ultimo_aviso(cuestionario_id):
+    """Lo último que se avisó de ese cuestionario (para decir qué quedó sin efecto)."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT COALESCE(aviso, detalle) FROM confirmaciones WHERE cuestionario_id = ? "
+            "AND evento IN ('ajustado', 'corregido', 'reporte') ORDER BY id DESC LIMIT 1",
+            (cuestionario_id,)
+        ).fetchone()
+        conn.close()
+        return fila[0] if fila else None
+    except Exception:
+        return None
+
+def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, texto_usuario=None, aviso=None):
     """Registra (o corrige) la respuesta del cuestionario vigente del número. Mientras el
     cuestionario esté dentro de sus 24 h se puede responder de nuevo: la corrección REEMPLAZA
     lo registrado y vuelve a avisar al EAS. Si había un ajuste y la persona vuelve a lo
@@ -4429,13 +4543,21 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         return "Tuve un problema registrando tu reporte. Intenta de nuevo en un momento."
 
     ajuste_anterior = (activo or {}).get("ajuste") or (activo or {}).get("respuesta") or "(sin detalle)"
+    # El aviso dice SOLO lo que la persona informó en este mensaje (antes iba el detalle completo,
+    # que al corregir arrastraba todo lo anterior y llegaba como un historial ilegible).
+    aviso = _aviso_corto(aviso or detalle_ajuste or texto_usuario or "(sin detalle)")
     avisados = None
     if resultado == "ajustado":
         avisados = notificar_ajuste_cuestionario(
-            numero, detalle_ajuste or texto_usuario or "(sin detalle)", es_correccion=es_correccion
+            numero, aviso, es_correccion=es_correccion, texto_usuario=texto_usuario,
+            turno=activo["turno"] if activo else "espontaneo",
         )
     elif anula:
-        avisados = notificar_ajuste_cuestionario(numero, ajuste_anterior, anulacion=True)
+        anulado = _aviso_corto(_ultimo_aviso(cuestionario_id) or ajuste_anterior, 200)
+        avisados = notificar_ajuste_cuestionario(
+            numero, aviso, anulacion=True, texto_usuario=texto_usuario, anulado=anulado,
+            turno=activo["turno"] if activo else "espontaneo",
+        )
     try:
         productores = json.loads(activo["productores"]) if activo and activo.get("productores") else None
     except (TypeError, ValueError):
@@ -4446,11 +4568,11 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         evento, numero, turno=activo["turno"] if activo else "espontaneo",
         fecha=(activo or {}).get("fecha_hora_envio") or date.today(), productores=productores,
         detalle=ajuste_anterior if anula else detalle_ajuste, texto_usuario=texto_usuario,
-        avisados=avisados, cuestionario_id=cuestionario_id,
+        avisados=avisados, cuestionario_id=cuestionario_id, aviso=aviso,
     )
 
     if resultado == "ajustado":
-        detalle = f":\n{detalle_ajuste}" if detalle_ajuste else "."
+        detalle = f":\n{aviso}"
         if es_correccion:
             return f"✅ Corrección registrada{detalle}\nGracias, reemplacé lo anterior y le avisamos al equipo EAS."
         if es_espontaneo:
@@ -4463,23 +4585,39 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         return "✅ Listo, dejé la proyección registrada como confirmada (sin ajustes)."
     return "✅ Proyección confirmada, quedó registrada. ¡Gracias!"
 
-def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False, anulacion=False):
+TURNO_AVISO = {"diario_am": "cuestionario de las 08:00", "diario_pm": "confirmación de las 15:00",
+               "espontaneo": "sin cuestionario"}
+
+def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False, anulacion=False,
+                                  texto_usuario=None, anulado=None, turno=None):
     """Aviso inmediato cuando alguien ajusta su proyección (o anula un ajuste anterior):
     siempre al admin, a gerencia y EAS si tienen las notificaciones activadas, y a los
     zonales que tengan asignado alguno de los fundos de quien reporta (un zonal solo se
-    entera de lo suyo). Devuelve a cuántas personas les llegó."""
+    entera de lo suyo). Es corto: SOLO lo que la persona informó en este mensaje (`detalle`
+    = el aviso), lo que escribió si es breve, y cómo pedir el historial. Devuelve a cuántas
+    personas les llegó."""
     try:
         num = normalizar_numero(numero_origen)
         info = next((n for n in listar_numeros_permitidos() if n["numero"] == num), None)
         quien = (info.get("nombre") if info else None) or num
         fundos_origen = fundos_efectivos(num)
+        hora = datetime.now().strftime("%H:%M")
+        origen = TURNO_AVISO.get(turno or "", "")
+        cuando = f" ({origen}, {hora})" if origen else f" ({hora})"
         if anulacion:
-            mensaje = (f"↩️ AJUSTE ANULADO por {quien} (+{num}): deja su proyección como estaba, sin "
-                       f"cambios. Ya no corre lo que había reportado:\n\n{detalle}")
+            lineas = [f"↩️ {quien} anuló su ajuste{cuando}: deja lo previsto sin cambios."]
+            if anulado:
+                lineas.append(f"Ya no corre: {anulado}")
         elif es_correccion:
-            mensaje = f"📝 CORRECCIÓN de proyección de {quien} (+{num}), reemplaza su reporte anterior:\n\n{detalle}"
+            lineas = [f"📝 {quien} corrigió su reporte{cuando}:", detalle]
         else:
-            mensaje = f"📝 Ajuste de proyección reportado por {quien} (+{num}):\n\n{detalle}"
+            lineas = [f"📝 {quien} reportó un ajuste{cuando}:", detalle]
+        escrito = " ".join(str(texto_usuario or "").split())
+        if escrito and len(escrito) <= 200 and escrito.lower() not in detalle.lower():
+            lineas.append(f"Escribió: «{escrito}»")
+        nombre_pila = (quien or "").split()[0] if quien and not quien.isdigit() else quien
+        lineas.append(f"Para ver todo lo que ha confirmado o cambiado, pídeme «historial de {nombre_pila}».")
+        mensaje = "\n".join(lineas)
 
         destinatarios = destinatarios_envios(("eas", "admin", "gerencia"))
         if ENVIOS_AUTOMATICOS_PRODUCCION:
