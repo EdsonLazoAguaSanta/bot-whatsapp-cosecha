@@ -358,6 +358,10 @@ def inicializar_db_local():
     # FOB. Vacío = todo (lo que veían antes de existir la opción).
     if "ver_embarques" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN ver_embarques INTEGER")
+    # Qué bases lee un usuario: 'ambas', 'cosecha' o 'packing'. Vacío = solo cosecha: Packing se
+    # habilita usuario por usuario (ver bases_de).
+    if "ver_bases" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN ver_bases TEXT")
     # Migración: el productor único que había antes pasa a ser el primer fundo asignado.
     conn.execute("""
         INSERT OR IGNORE INTO numeros_fundos (numero, fundo)
@@ -836,6 +840,7 @@ def listar_numeros_permitidos():
         fila["ve_todo"] = (fila["rol"] or ROL_POR_DEFECTO) in ROLES_VEN_TODO or bool(fila["acceso_total"])
         fila["plantas"] = plantas_de(fila["numero"])
         fila["embarques"] = NOMBRE_NIVEL_EMBARQUES[nivel_embarques(fila["numero"])]
+        fila["bases"] = NOMBRE_BASES[bases_de(fila["numero"])]
     conn.close()
     return filas
 
@@ -2280,13 +2285,16 @@ _SQL_FIN_FROM = {"where", "group", "order", "having", "union", "except", "inters
                  "option", "window", "select"}
 _SQL_FUNCIONES_TABLA = {"string_split", "openjson", "generate_series"}
 
-def _revisar_origenes(tokens, ctes):
+def _revisar_origenes(tokens, ctes, bases=("datos", "packing")):
     """Error si algún origen de datos es distinto de "datos" o de un WITH propio. Un origen
     es lo que va después de FROM, JOIN, APPLY o de una coma dentro de la cláusula FROM, en
     cualquier nivel de paréntesis. Se recorre llevando, por nivel, si se está dentro de un
     FROM: así "FROM datos a JOIN datos b ON ..., Recepcion_Consolidada f" también se
     revisa (una versión anterior dejaba de buscar comas al llegar al JOIN, y por ahí se
-    podía leer la tabla real sin el filtro de alcance)."""
+    podía leer la tabla real sin el filtro de alcance). `bases` son las tablas que este usuario
+    tiene habilitadas: la otra se rechaza aquí, porque "packing" también es una columna de
+    `datos` y no se puede vetar por la sola palabra."""
+    tablas = _texto_tablas(bases)
     dentro_de_from = {0: False}
     profundidad = 0
     esperando_origen = False
@@ -2299,11 +2307,13 @@ def _revisar_origenes(tokens, ctes):
             if token != "(":
                 nombre = token.strip("[]\"").lower()
                 if i + 1 < n and tokens[i + 1] == ".":
-                    return f"No puedes leer '{token}.{tokens[i + 2] if i + 2 < n else ''}': solo las tablas 'datos' y 'packing'."
+                    return f"No puedes leer '{token}.{tokens[i + 2] if i + 2 < n else ''}': solo {tablas}."
                 es_funcion = nombre in _SQL_FUNCIONES_TABLA and i + 1 < n and tokens[i + 1] == "("
                 if not es_funcion and nombre not in ctes:
-                    return (f"Solo puedes consultar las tablas 'datos' y 'packing' (o tus propios WITH); "
-                            f"'{token}' no está permitido.")
+                    if nombre in BASES_LECTURA["ambas"]:
+                        return (f"La tabla '{nombre}' no está habilitada para este usuario: "
+                                f"solo puede consultar {tablas}.")
+                    return f"Solo puedes consultar {tablas} (o tus propios WITH); '{token}' no está permitido."
                 i += 1
                 continue
         if token == "(":
@@ -2363,6 +2373,38 @@ def _tablas_embarques(embarques):
     nivel = 2 if embarques is True else int(embarques or 0)
     return TABLAS_EMBARQUES[:nivel]
 
+# Bases que lee cada usuario, de cualquier perfil. 'cosecha' = la tabla `datos` y las herramientas
+# de cosecha; 'packing' = la tabla `packing`. Los envíos automáticos (cuestionarios, resúmenes y
+# avisos) no dependen de esto: siguen según el perfil.
+BASES_LECTURA = {"ambas": ("datos", "packing"), "cosecha": ("datos",), "packing": ("packing",)}
+NOMBRE_BASES = {tablas: nombre for nombre, tablas in BASES_LECTURA.items()}
+BASES_POR_DEFECTO = "cosecha"
+
+def bases_de(numero):
+    """Tablas que puede leer: el admin, ambas; los demás, lo que se les haya elegido. Sin elegir
+    = solo cosecha, así nadie ve Packing hasta que se le habilite. Sin número es una prueba
+    local de administración (ver /test/mensaje)."""
+    if numero is None:
+        return BASES_LECTURA["ambas"]
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute("SELECT rol, ver_bases FROM numeros_permitidos WHERE numero = ?",
+                            (normalizar_numero(numero),)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo las bases del usuario: {str(e)}")
+        return BASES_LECTURA[BASES_POR_DEFECTO]
+    if fila and fila[0] == "admin":
+        return BASES_LECTURA["ambas"]
+    return BASES_LECTURA.get(fila[1] if fila else None, BASES_LECTURA[BASES_POR_DEFECTO])
+
+def _texto_tablas(tablas):
+    """"la tabla 'datos'" o "las tablas 'datos' y 'packing'", para los mensajes de error."""
+    tablas = list(tablas)
+    if len(tablas) == 1:
+        return f"la tabla '{tablas[0]}'"
+    return "las tablas " + ", ".join(f"'{t}'" for t in tablas[:-1]) + f" y '{tablas[-1]}'"
+
 # El historial de confirmaciones y ajustes lo consultan los mismos perfiles que ven todo.
 ROLES_CONFIRMACIONES = ("admin", "eas", "gerencia")
 
@@ -2370,9 +2412,9 @@ def puede_ver_confirmaciones(numero):
     """Sin número es una prueba local de administración (ver /test/mensaje)."""
     return numero is None or rol_de(numero) in ROLES_CONFIRMACIONES
 
-def validar_consulta_sql(sql, tablas_extra=()):
-    """Devuelve (consulta, None) si es un SELECT de solo lectura sobre "datos" (y las
-    tablas_extra permitidas a este usuario), o (None, motivo) si no."""
+def validar_consulta_sql(sql, tablas_extra=(), bases=BASES_LECTURA["ambas"]):
+    """Devuelve (consulta, None) si es un SELECT de solo lectura sobre las bases de este usuario
+    (y las tablas_extra que tenga permitidas), o (None, motivo) si no."""
     texto = (sql or "").strip()
     while texto.endswith(";"):
         texto = texto[:-1].rstrip()
@@ -2394,13 +2436,13 @@ def validar_consulta_sql(sql, tablas_extra=()):
         palabra = token.strip("[]\"").lower()
         if (palabra in _SQL_PROHIBIDAS or palabra.startswith(("sp_", "xp_", "fn_", "@", "#"))
                 or (palabra.startswith("sys") and not palabra.startswith("sysdatetime"))):
-            return None, f"La consulta usa '{token}', que no está permitido (solo lectura de 'datos')."
+            return None, f"La consulta usa '{token}', que no está permitido (solo lectura)."
     ctes = {re.sub(r"[\[\]\"]", "", m).lower() for m in re.findall(
         r"(?:\bwith|,)\s*(\[[^\]]+\]|[A-Za-z_]\w*)\s*(?:\([^()]*\))?\s+as\s*\(", sin_literales, re.I)}
     reservados = ctes & NOMBRES_RESERVADOS_SQL
     if reservados:
         return None, f"No definas un WITH llamado '{sorted(reservados)[0]}': ese nombre ya es una tabla."
-    permitidas = {"datos", "packing", *tablas_extra}
+    permitidas = {*bases, *tablas_extra}
     vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
     if vedadas:
         if "embarques" in permitidas:
@@ -2408,7 +2450,7 @@ def validar_consulta_sql(sql, tablas_extra=()):
                           "solo puede consultar `embarques`.")
         return None, ("Las tablas de embarques (embarques, embarques_fob) no están habilitadas para "
                       "este usuario.")
-    error = _revisar_origenes(tokens, ctes | permitidas)
+    error = _revisar_origenes(tokens, ctes | permitidas, bases)
     if error:
         return None, error
     return texto, None
@@ -2489,23 +2531,27 @@ def _cte_packing(alcance):
             "NULLIF(LTRIM(RTRIM(pc.Calibre)), '') AS Calibre "
             f"FROM [Packing_Consolidado] pc WHERE {' AND '.join(condiciones)})")
 
-def _consulta_con_datos(consulta, alcance, embarques=False):
+def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA["ambas"]):
     """Antepone el WITH "datos": la tabla real + Zonal, con la temporada oficial por fecha,
     sin las filas duplicadas sin kilos (las mismas que excluyen todas las consultas del bot)
-    y acotada al alcance del usuario. Con embarques=True agrega también las tablas de
-    embarques (solo para los perfiles de ROLES_EMBARQUES)."""
+    y acotada al alcance del usuario. Solo se definen las bases de este usuario: la otra no
+    existe para su consulta. Con embarques=True agrega también las tablas de embarques (solo
+    para los perfiles de ROLES_EMBARQUES)."""
     condiciones = ["rc.KgsRecepcionados IS NOT NULL"]
     if isinstance(alcance, AlcancePlanta):
         condiciones.append(_sql_plantas(alcance, columna="rc.Packing", literales=True)[0])
     elif alcance is not None:
         sql_fundos, _ = _sql_fundos(alcance, columna="rc.Productor", literales=True) if alcance else ("1 = 0", [])
         condiciones.append(sql_fundos)
-    ctes = [(f"datos AS (SELECT {_sql_expr_temporada()} AS Temporada, rc.Temporada AS TemporadaBase, "
-             f"rc.[Base Origen], rc.Especie, rc.Variedad, rc.[Variedad Agronomica], rc.Productor, "
-             f"rc.Grupo, {_sql_expr_zonal('rc.Productor')} AS Zonal, rc.Packing, rc.Fecha, rc.Semana, "
-             f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho, rc.CajasEq, rc.Trisemanal "
-             f"FROM {RECEPCION_SQL} rc WHERE {' AND '.join(condiciones)})"),
-            _cte_packing(alcance)]
+    ctes = []
+    if "datos" in bases:
+        ctes.append(f"datos AS (SELECT {_sql_expr_temporada()} AS Temporada, rc.Temporada AS TemporadaBase, "
+                    f"rc.[Base Origen], rc.Especie, rc.Variedad, rc.[Variedad Agronomica], rc.Productor, "
+                    f"rc.Grupo, {_sql_expr_zonal('rc.Productor')} AS Zonal, rc.Packing, rc.Fecha, rc.Semana, "
+                    f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho, rc.CajasEq, rc.Trisemanal "
+                    f"FROM {RECEPCION_SQL} rc WHERE {' AND '.join(condiciones)})")
+    if "packing" in bases:
+        ctes.append(_cte_packing(alcance))
     if embarques:
         ctes += _ctes_embarques()[:len(_tablas_embarques(embarques))]
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
@@ -2520,10 +2566,11 @@ def _mensaje_error_sql(error):
     texto = re.sub(r"\(\d+\)\s*\(SQL\w+\)", "", texto)
     return " ".join(texto.split())[:400]
 
-def ejecutar_consulta_sql(sql, alcance, max_filas=MAX_FILAS_SQL, embarques=False):
+def ejecutar_consulta_sql(sql, alcance, max_filas=MAX_FILAS_SQL, embarques=False, bases=BASES_LECTURA["ambas"]):
     """({"columnas", "filas", "truncado"}, None) o (None, error). embarques=True permite
-    además las tablas de embarques (quien llama ya verificó el perfil)."""
-    consulta, error = validar_consulta_sql(sql, _tablas_embarques(embarques))
+    además las tablas de embarques (quien llama ya verificó el perfil); bases son las tablas
+    de cosecha y packing que este usuario tiene habilitadas."""
+    consulta, error = validar_consulta_sql(sql, _tablas_embarques(embarques), bases=bases)
     if error:
         return None, error
     conn = conectar_sql()
@@ -2532,7 +2579,7 @@ def ejecutar_consulta_sql(sql, alcance, max_filas=MAX_FILAS_SQL, embarques=False
     try:
         conn.timeout = TIEMPO_MAX_SQL
         cursor = conn.cursor()
-        cursor.execute(_consulta_con_datos(consulta, alcance, embarques=embarques))
+        cursor.execute(_consulta_con_datos(consulta, alcance, embarques=embarques, bases=bases))
         if not cursor.description:
             return None, "La consulta no devolvió una tabla."
         columnas = [d[0] or f"columna_{i + 1}" for i, d in enumerate(cursor.description)]
@@ -2558,9 +2605,9 @@ def _texto_crudo(valor):
         return valor.isoformat()
     return str(valor)
 
-def consultar_sql(sql, alcance, embarques=False):
+def consultar_sql(sql, alcance, embarques=False, bases=BASES_LECTURA["ambas"]):
     """Resultado de una consulta libre como texto para Claude."""
-    resultado, error = ejecutar_consulta_sql(sql, alcance, embarques=embarques)
+    resultado, error = ejecutar_consulta_sql(sql, alcance, embarques=embarques, bases=bases)
     if error:
         return f"ERROR: {error}"
     if not resultado["filas"]:
@@ -3269,12 +3316,15 @@ TOOL_PROYECCION = {
     },
 }
 
-TOOL_CONSULTAR_SQL = {
-    "name": "consultar_sql",
-    "description": (
+# La descripción de consultar_sql se arma con lo que el usuario puede leer (ver _herramienta_sql):
+# una tabla que no tiene habilitada ni se describe.
+_SQL_INTRO = (
         "Consulta LIBRE de solo lectura (T-SQL de SQL Server) para todo lo que las otras herramientas no cubren: "
         "rankings, cruces, comparaciones entre temporadas, avance %, promedios, kg por bin, qué variedad está más "
-        "atrasada, top N, etc. Escribe UN solo SELECT (o WITH ... SELECT) sobre la tabla `datos`, que ya viene "
+        "atrasada, top N, etc. "
+)
+_SQL_DATOS = (
+        "Escribe UN solo SELECT (o WITH ... SELECT) sobre la tabla `datos`, que ya viene "
         "filtrada por lo que este usuario puede ver. Columnas de `datos`: Temporada (int, la temporada oficial "
         "según la fecha: semana ISO 44 a 43, la misma que usan las demás herramientas; úsala para 'esta "
         "temporada', 'la pasada', comparar temporadas), TemporadaBase (la que trae la base, que ya asigna a la "
@@ -3296,23 +3346,56 @@ TOOL_CONSULTAR_SQL = {
         "Fecha sin CAST usa 'AAAAMMDD', porque el servidor está en español y lee mal '2026-10-26' como datetime) y "
         "CAST(Semana AS INT) para semanas; compara "
         "fuentes con SUM(CASE WHEN [Base Origen] = '...' THEN KgsRecepcionados ELSE 0 END); NULLIF para dividir. "
-        "TAMBIÉN puedes consultar la tabla `packing` (Packing_Consolidado), el EMBALAJE de la fruta: qué se "
-        "procesó en planta, en qué categoría y calibre. Viene filtrada por lo que este usuario puede ver, igual "
-        "que `datos`. Columnas: Temporada y TemporadaBase (igual que en datos), [Base Origen] "
+)
+_SQL_PACKING_COLUMNAS = (
+        "[Base Origen] "
         "('Packing Planta' = embalaje REAL, 'Trisem Proceso' = proyección de proceso de corto plazo, "
         "'Estim Primavera' y 'Estim Invierno' = las mismas estimaciones de la cosecha), Especie, Variedad, "
         "[Variedad Agronomica], Productor, Grupo, Zonal, Packing (= planta), Fecha, Semana, Bultos, CajasEq "
         "(cajas equivalentes), KgsEmbalados, KgsVaciados, Categoria (CAT 1, EXTRA FANCY...; NULL si no viene) y "
-        "Calibre (NULL si no viene). REGLAS de `packing`: (a) KgsEmbalados = lo que SALIÓ embalado y solo existe "
+        "Calibre (NULL si no viene). "
+)
+_SQL_PACKING_REGLAS = (
+        "REGLAS de `packing`: (a) KgsEmbalados = lo que SALIÓ embalado y solo existe "
         "en 'Packing Planta'; KgsVaciados = lo que ENTRÓ al proceso y es lo único que traen las filas de "
         "estimación, así que para estimaciones de packing usa KgsVaciados. (b) El rendimiento de packing = "
         "SUM(KgsEmbalados)/NULLIF(SUM(KgsVaciados),0) sobre 'Packing Planta'. (c) Categoria viene escrita de "
         "varias formas ('CAT 1' y 'CAT1' son lo mismo): si agrupas por categoría, únelas con "
-        "REPLACE(Categoria, ' ', ''). (d) No mezcles kilos de `datos` (recepción) con los de `packing` como si "
-        "fueran lo mismo: recepción es lo que llegó del campo y packing es lo que se procesó. (e) La fuente "
-        "'Packing Edge' está excluida por decisión de Agua Santa; no la menciones como disponible. "
-        "Devuelve máximo 400 filas. Si da error, lee el mensaje, corrige y reintenta."
+        "REPLACE(Categoria, ' ', ''). "
+)
+_SQL_PACKING_EDGE = "La fuente 'Packing Edge' está excluida por decisión de Agua Santa; no la menciones como disponible. "
+_SQL_FIN = "Devuelve máximo 400 filas. Si da error, lee el mensaje, corrige y reintenta."
+
+_DESCRIPCION_SQL = {
+    ("datos", "packing"): (
+        _SQL_INTRO + _SQL_DATOS
+        + "TAMBIÉN puedes consultar la tabla `packing` (Packing_Consolidado), el EMBALAJE de la fruta: qué se "
+          "procesó en planta, en qué categoría y calibre. Viene filtrada por lo que este usuario puede ver, igual "
+          "que `datos`. Columnas: Temporada y TemporadaBase (igual que en datos), "
+        + _SQL_PACKING_COLUMNAS + _SQL_PACKING_REGLAS
+        + "(d) No mezcles kilos de `datos` (recepción) con los de `packing` como si "
+          "fueran lo mismo: recepción es lo que llegó del campo y packing es lo que se procesó. (e) "
+        + _SQL_PACKING_EDGE + _SQL_FIN
     ),
+    ("datos",): _SQL_INTRO + _SQL_DATOS + _SQL_FIN,
+    ("packing",): (
+        "Consulta LIBRE de solo lectura (T-SQL de SQL Server) sobre el embalaje de la fruta: rankings, "
+        "comparaciones entre temporadas, rendimiento, categorías y calibres, top N, etc. Escribe UN solo SELECT "
+        "(o WITH ... SELECT) sobre la tabla `packing` (Packing_Consolidado): qué se procesó en planta, en qué "
+        "categoría y calibre. Ya viene filtrada por lo que este usuario puede ver. Columnas: Temporada (int, la "
+        "temporada oficial según la fecha: semana ISO 44 a 43; úsala para 'esta temporada', 'la pasada', comparar "
+        "temporadas), TemporadaBase (la que trae la base; úsala solo si la piden), "
+        + _SQL_PACKING_COLUMNAS + _SQL_PACKING_REGLAS + "(d) " + _SQL_PACKING_EDGE
+        + "Agrega en SQL (GROUP BY, SUM) en vez de traer filas sueltas, usa TOP para rankings, CAST(Fecha AS DATE) "
+          "para fechas (compáralo con 'AAAA-MM-DD'; si comparas Fecha sin CAST usa 'AAAAMMDD', porque el servidor "
+          "está en español y lee mal '2026-10-26' como datetime) y CAST(Semana AS INT) para semanas; NULLIF para "
+          "dividir. " + _SQL_FIN
+    ),
+}
+
+TOOL_CONSULTAR_SQL = {
+    "name": "consultar_sql",
+    "description": _DESCRIPCION_SQL[("datos", "packing")],
     "input_schema": {
         "type": "object",
         "properties": {
@@ -3323,6 +3406,11 @@ TOOL_CONSULTAR_SQL = {
     },
 }
 
+def _lista_tablas(tablas, union):
+    """'`datos`, `packing` y/o `embarques`', para las descripciones de las herramientas."""
+    tablas = [f"`{t}`" for t in tablas]
+    return tablas[0] if len(tablas) == 1 else f"{', '.join(tablas[:-1])} {union} {tablas[-1]}"
+
 TOOL_GENERAR_INFORME = {
     "name": "generar_informe",
     "description": (
@@ -3330,7 +3418,7 @@ TOOL_GENERAR_INFORME = {
         "de consultar_cosecha_flexible (estimado vs real) ni el de generar_informe_proyeccion: varias secciones, "
         "comparaciones entre temporadas, rankings, una tabla con semanas o fechas como columnas, un gráfico "
         "específico, cifras clave a elección, un comentario o análisis, etc. Cada sección es una consulta SQL sobre "
-        "`datos` o `packing` (mismas columnas y reglas que consultar_sql) que se ejecuta al armar el archivo, así las cifras "
+        "<TABLAS> (mismas columnas y reglas que consultar_sql) que se ejecuta al armar el archivo, así las cifras "
         "salen siempre de la base. Por defecto la primera sección lleva un gráfico pequeño de totales; la fila "
         "TOTAL se agrega sola y suma solo las cantidades (no los %, ni las columnas por unidad como USD/caja eq o "
         "promedios, que no se pueden sumar). Si necesitas un total correcto para esas columnas, haz que la "
@@ -3346,7 +3434,7 @@ TOOL_GENERAR_INFORME = {
             "titulo": {"type": "string", "description": "Título del informe."},
             "subtitulo": {"type": "string", "description": "Periodo, filtros y unidad (ej. 'Temporada 2027 · kilos · zonal Joaquin Llano')."},
             "resumen": RESUMEN_INFORME_SCHEMA,
-            "consulta_kpis": {"type": "string", "description": "Opcional: SELECT sobre `datos` que devuelve UNA fila; cada columna es una cifra clave del encabezado (el alias de la columna es su etiqueta, ej. AS [Kilos reales]). Usa '%' en el alias para porcentajes."},
+            "consulta_kpis": {"type": "string", "description": "Opcional: SELECT sobre <TABLAS> que devuelve UNA fila; cada columna es una cifra clave del encabezado (el alias de la columna es su etiqueta, ej. AS [Kilos reales]). Usa '%' en el alias para porcentajes."},
             "secciones": {
                 "type": "array",
                 "description": "Secciones del informe, en orden (máximo 8).",
@@ -3354,7 +3442,7 @@ TOOL_GENERAR_INFORME = {
                     "type": "object",
                     "properties": {
                         "titulo": {"type": "string"},
-                        "consulta_sql": {"type": "string", "description": "SELECT sobre `datos` con las columnas de la tabla, ya con alias legibles (ej. AS [Kilos real])."},
+                        "consulta_sql": {"type": "string", "description": "SELECT sobre <TABLAS> con las columnas de la tabla, ya con alias legibles (ej. AS [Kilos real])."},
                         "pivote": {
                             "type": "object",
                             "description": "Opcional, para poner valores como columnas (ej. las semanas): la consulta debe traer las columnas de filas, la columna a pivotear y el valor.",
@@ -3398,7 +3486,7 @@ DESCRIPCION_EMBARQUES = (
     "(de llegada), ETA (date), Mercado (región: LEJANO ORIENTE, USA EAST COAST, USA WEST COAST, EUROPA, "
     "SUDAMERICA, CENTROAMERICA, NORTEAMERICA, CHILE...), PaisVenta (casi siempre NULL). "
     "`embarques_fob` (vista Embarque-Liquidacion-PBI, las MISMAS filas con datos comerciales; no trae "
-    "contenedor ni pallets): Temporada, Productor, Grupo, Zonal (calculada, igual que en datos), Planta, Especie, "
+    "contenedor ni pallets): Temporada, Productor, Grupo, Zonal (calculada: zonal responsable del productor), Planta, Especie, "
     "Variedad, TipoVariedad, Serie (calibre/serie equivalente), Cajas, CajasEq, FOB (USD, monto total de la "
     "fila), FOBPool (USD, FOB del pool), Estado ('Liquidación' = liquidado, 'Factura' = solo facturado, valor "
     "provisorio), Arribado ('Sí'/'No'), Recibidor, CodigoRecibidor, Nave, Via, FechaZarpe, SemanaZarpe, Puerto, "
@@ -3413,17 +3501,6 @@ DESCRIPCION_EMBARQUES = (
     "compares kilos cosechados con cajas embarcadas como si fueran la misma unidad."
 )
 
-TOOL_CONSULTAR_SQL_EMBARQUES = {
-    **TOOL_CONSULTAR_SQL,
-    "description": TOOL_CONSULTAR_SQL["description"] + DESCRIPCION_EMBARQUES,
-    "input_schema": {
-        **TOOL_CONSULTAR_SQL["input_schema"],
-        "properties": {
-            **TOOL_CONSULTAR_SQL["input_schema"]["properties"],
-            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos`, `packing`, `embarques` y/o `embarques_fob`."},
-        },
-    },
-}
 # Para quien ve embarques pero no el FOB: solo la tabla `embarques` y las reglas que aplican.
 DESCRIPCION_EMBARQUES_SIN_FOB = (
     " ADEMÁS, este usuario puede consultar la tabla de EMBARQUES (exportación), con TODOS los productores "
@@ -3440,21 +3517,27 @@ DESCRIPCION_EMBARQUES_SIN_FOB = (
     "embarques con cosecha usa Especie/Variedad/Temporada; no hay kilos embarcados, así que no compares kilos "
     "cosechados con cajas embarcadas como si fueran la misma unidad."
 )
-TOOL_CONSULTAR_SQL_EMBARQUES_SIN_FOB = {
-    **TOOL_CONSULTAR_SQL,
-    "description": TOOL_CONSULTAR_SQL["description"] + DESCRIPCION_EMBARQUES_SIN_FOB,
-    "input_schema": {
-        **TOOL_CONSULTAR_SQL["input_schema"],
-        "properties": {
-            **TOOL_CONSULTAR_SQL["input_schema"]["properties"],
-            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos` y/o `embarques`."},
-        },
-    },
-}
+_SQL_POR_PERMISO = {}
 
-def _herramienta_sql(nivel):
-    return (TOOL_CONSULTAR_SQL_EMBARQUES if nivel >= 2
-            else TOOL_CONSULTAR_SQL_EMBARQUES_SIN_FOB if nivel == 1 else TOOL_CONSULTAR_SQL)
+def _herramienta_sql(nivel, bases=("datos", "packing")):
+    """consultar_sql según lo que puede leer el usuario. Se arma una vez por combinación, así la
+    definición es siempre la misma (la caché de prompts depende de eso)."""
+    clave = (nivel, bases)
+    if clave not in _SQL_POR_PERMISO:
+        extra = DESCRIPCION_EMBARQUES if nivel >= 2 else DESCRIPCION_EMBARQUES_SIN_FOB if nivel == 1 else ""
+        tablas = [*bases, *TABLAS_EMBARQUES[:nivel]]
+        _SQL_POR_PERMISO[clave] = {
+            **TOOL_CONSULTAR_SQL,
+            "description": _DESCRIPCION_SQL[bases] + extra,
+            "input_schema": {
+                **TOOL_CONSULTAR_SQL["input_schema"],
+                "properties": {
+                    **TOOL_CONSULTAR_SQL["input_schema"]["properties"],
+                    "consulta": {"type": "string", "description": f"La consulta SELECT sobre {_lista_tablas(tablas, 'y/o')}."},
+                },
+            },
+        }
+    return _SQL_POR_PERMISO[clave]
 
 TOOL_CONSULTAR_CONFIRMACIONES = {
     "name": "consultar_confirmaciones",
@@ -3492,20 +3575,22 @@ TOOL_HISTORIAL_CONFIRMACIONES = {
 
 # Para los perfiles que ven el historial (los mismos que ven embarques), el informe a medida
 # puede leer también `confirmaciones`: por sección (fuente) y en las cifras clave (fuente_kpis).
-_FUENTE_INFORME = {
-    "type": "string", "enum": ["cosecha", "confirmaciones"],
-    "description": "'cosecha' (por defecto): la consulta es SQL Server sobre `datos` y las tablas de embarques. "
-                   "'confirmaciones': la consulta es SQLite sobre la tabla `confirmaciones` (ver consultar_confirmaciones).",
-}
 _INFORMES_POR_PERMISO = {}
 
-def _herramienta_informe(nivel, confirmaciones):
-    """generar_informe según lo que puede leer el usuario: las tablas de embarques de su nivel
-    y, si ve el historial, la fuente 'confirmaciones'. Se arma una vez por combinación, así la
-    definición es siempre la misma (la caché de prompts depende de eso)."""
-    clave = (nivel, bool(confirmaciones))
+def _herramienta_informe(nivel, confirmaciones, bases=("datos", "packing")):
+    """generar_informe según lo que puede leer el usuario: sus bases, las tablas de embarques de
+    su nivel y, si ve el historial, la fuente 'confirmaciones'. Se arma una vez por combinación,
+    así la definición es siempre la misma (la caché de prompts depende de eso)."""
+    clave = (nivel, bool(confirmaciones), bases)
     if clave not in _INFORMES_POR_PERMISO:
-        tool = json.loads(json.dumps(TOOL_GENERAR_INFORME))
+        tablas = _lista_tablas(bases, "o")
+        # El valor 'cosecha' de la fuente es SQL Server, también para quien solo lee packing.
+        fuente = {
+            "type": "string", "enum": ["cosecha", "confirmaciones"],
+            "description": f"'cosecha' (por defecto): la consulta es SQL Server sobre {tablas} y las tablas de embarques. "
+                           "'confirmaciones': la consulta es SQLite sobre la tabla `confirmaciones` (ver consultar_confirmaciones).",
+        }
+        tool = json.loads(json.dumps(TOOL_GENERAR_INFORME).replace("<TABLAS>", tablas))
         if nivel >= 2:
             tool["description"] += " Las secciones también pueden leer `embarques` y `embarques_fob` (ver consultar_sql)."
         elif nivel == 1:
@@ -3513,9 +3598,9 @@ def _herramienta_informe(nivel, confirmaciones):
                                     "FOB no están habilitados para este usuario.")
         if confirmaciones:
             tool["description"] += (" Con fuente='confirmaciones' una sección (o las cifras clave, con fuente_kpis) "
-                                    "lee el historial de confirmaciones y ajustes en vez de la base de cosecha.")
-            tool["input_schema"]["properties"]["fuente_kpis"] = _FUENTE_INFORME
-            tool["input_schema"]["properties"]["secciones"]["items"]["properties"]["fuente"] = _FUENTE_INFORME
+                                    "lee el historial de confirmaciones y ajustes en vez de SQL Server.")
+            tool["input_schema"]["properties"]["fuente_kpis"] = fuente
+            tool["input_schema"]["properties"]["secciones"]["items"]["properties"]["fuente"] = fuente
         _INFORMES_POR_PERMISO[clave] = tool
     return _INFORMES_POR_PERMISO[clave]
 
@@ -3944,10 +4029,30 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
             "Si este usuario la pide, explícale con amabilidad que no está disponible para su perfil."
         )
 
+    bases = bases_de(numero_sender)
+    if bases == BASES_LECTURA["cosecha"]:
+        partes.append(
+            "PACKING: la base de packing (el embalaje de la fruta: kilos embalados y vaciados, rendimiento de "
+            "packing, categorías y calibres embalados, proyección de proceso) no está habilitada para este "
+            "usuario. Si la pide, explícale con amabilidad que no la tiene habilitada y que puede pedírsela a "
+            "Edson Lazo. Esto no toca la cosecha: las consultas por planta o packing de lo RECIBIDO siguen "
+            "disponibles, con las herramientas de cosecha y la columna Packing de `datos`."
+        )
+    elif bases == BASES_LECTURA["packing"]:
+        partes.append(
+            "COSECHA: este usuario SOLO tiene habilitada la base de packing (el embalaje de la fruta), con la "
+            "tabla `packing` de consultar_sql y generar_informe. NO tiene la base de cosecha (recepción, "
+            "estimaciones de cosecha, Trisemanal, proyecciones): para él no existen la tabla `datos` ni las "
+            "herramientas de cosecha, así que ignora lo que digan estas instrucciones sobre consultarlas y no "
+            "ofrezcas esos datos. Si los pide, explícale con amabilidad que no tiene habilitada la cosecha y que "
+            "puede pedírsela a Edson Lazo."
+        )
+
+    tablas_alcance = " y ".join(f"`{b}`" for b in bases)
     if isinstance(alcance, AlcancePlanta):
         partes.append(f"""ALCANCE DE ESTE USUARIO (perfil planta): solo puede ver lo que entra a estas plantas
 (columna Packing): {", ".join(alcance) or "ninguna"}.
-Las herramientas (incluida la tabla `datos` de consultar_sql) ya filtran por esas plantas: todo lo que
+Las herramientas (y {tablas_alcance} en consultar_sql) ya filtran por esas plantas: todo lo que
 recibas corresponde solo a ellas. Si pregunta por otra planta, explícale con naturalidad que solo
 puedes darle información de la suya. Este perfil NO responde cuestionarios ni registra ajustes: si
 quiere informar que la cosecha viene distinta, pídele que lo hable con el zonal del productor o con el
@@ -3956,7 +4061,7 @@ para su planta según la Trisemanal, con lo que confirmaron o ajustaron los zona
     elif alcance:
         partes.append(f"""ALCANCE DE ESTE USUARIO: solo tiene acceso a la información de estos fundos/productores:
 {", ".join(alcance)}.
-Las herramientas (incluida la tabla `datos` de consultar_sql) ya filtran automáticamente por esos
+Las herramientas (y {tablas_alcance} en consultar_sql) ya filtran automáticamente por esos
 fundos, así que los resultados que recibas SIEMPRE corresponden solo a ellos: no necesitas agregar
 filtros ni advertir nada en cada respuesta. Si el usuario pregunta por un productor, fundo o zonal que
 NO está dentro de su alcance, explícale con naturalidad que solo puedes darle información de los fundos
@@ -3972,12 +4077,20 @@ def construir_system_prompt(es_audio=False, cuestionario_activo=None, alcance=No
         {"type": "text", "text": _prompt_variable(es_audio, cuestionario_activo, alcance, numero_sender)},
     ]
 
+# Todas leen la base de cosecha, incluida consultar_resumen_packing: es lo RECIBIDO en una planta.
+HERRAMIENTAS_COSECHA = {t["name"] for t in TOOLS + [TOOL_PROYECCION]}
+
 def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None):
     # Barrera de alcance: zonal y productor solo ven sus fundos. Se calcula aquí, desde el
     # número que escribe, y NO desde nada que venga en el mensaje o que decida el modelo.
     alcance = alcance_de(numero_sender) if numero_sender else None
     if alcance is not None and not alcance:
         return MENSAJE_SIN_PLANTA if isinstance(alcance, AlcancePlanta) else MENSAJE_SIN_FUNDOS
+
+    # Misma barrera para las bases: no basta con no ofrecerle la herramienta al modelo.
+    bases = bases_de(numero_sender)
+    if tool_name in HERRAMIENTAS_COSECHA and "datos" not in bases:
+        return "La base de cosecha no está habilitada para este usuario: solo puede consultar packing."
 
     if tool_name == "historial_confirmaciones":
         if isinstance(alcance, AlcancePlanta):
@@ -4007,7 +4120,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
 
     if tool_name == "consultar_sql":
         return consultar_sql(tool_input.get("consulta"), alcance,
-                             embarques=nivel_embarques(numero_sender))
+                             embarques=nivel_embarques(numero_sender), bases=bases)
 
     if tool_name == "generar_informe":
         return generar_informe_personalizado(
@@ -4022,6 +4135,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             embarques=nivel_embarques(numero_sender),
             confirmaciones=puede_ver_confirmaciones(numero_sender),
             fuente_kpis=tool_input.get("fuente_kpis") or None,
+            bases=bases,
         )
 
     if tool_name == "generar_informe_proyeccion":
@@ -4151,13 +4265,15 @@ def herramientas_disponibles(numero_sender=None):
     # cuando pasa, no solo mientras hay un cuestionario vigente.
     nivel = nivel_embarques(numero_sender)
     confirmaciones = puede_ver_confirmaciones(numero_sender)
-    sql = [_herramienta_sql(nivel), _herramienta_informe(nivel, confirmaciones)]
+    bases = bases_de(numero_sender)
+    sql = [_herramienta_sql(nivel, bases), _herramienta_informe(nivel, confirmaciones, bases)]
     if confirmaciones:
         sql.append(TOOL_CONSULTAR_CONFIRMACIONES)
     # La planta solo consulta: los ajustes los reportan zonales y productores, y el historial de
     # reportes es de ellos y del equipo.
     reporta = not numero_sender or rol_de(numero_sender) != "planta"
-    return (TOOLS + [TOOL_PROYECCION] + sql
+    cosecha = TOOLS + [TOOL_PROYECCION] if "datos" in bases else []
+    return (cosecha + sql
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
             + ([TOOL_HISTORIAL_CONFIRMACIONES] if reporta else []))
 
@@ -7207,7 +7323,8 @@ def _notas_de_fuente(consultas):
     notas = []
     if re.search(r"\bdatos\b", texto):
         notas.append(NOTA_FUENTES)
-    if re.search(r"\bpacking\b", texto):
+    # Solo como tabla: "Packing" también es la columna de planta de `datos`.
+    if re.search(r"\b(?:from|join)\s+\[?packing\b", texto):
         notas.append("Embalaje según Packing_Consolidado (Control EAS). Kgs Embalados = salida del "
                      "proceso; Kgs Vaciados = entrada. No incluye la fuente Packing Edge.")
     if re.search(r"\bembarques\b", texto):
@@ -7222,20 +7339,20 @@ def _notas_de_fuente(consultas):
                      "facturados, cuyo valor es provisorio hasta la liquidación.")
     return notas or [NOTA_FUENTES]
 
-def _consulta_informe(sql, fuente, alcance, max_filas, embarques, confirmaciones):
+def _consulta_informe(sql, fuente, alcance, max_filas, embarques, confirmaciones, bases):
     """Ejecuta la consulta de una sección según su fuente: la base de cosecha (SQL Server) o
     el historial de confirmaciones (SQLite, solo para los perfiles que lo ven)."""
     if fuente == "confirmaciones":
         if not confirmaciones:
             return None, "el historial de confirmaciones es solo para admin, EAS y gerencia."
         return ejecutar_consulta_confirmaciones(sql, max_filas=max_filas)
-    return ejecutar_consulta_sql(sql, alcance, max_filas=max_filas, embarques=embarques)
+    return ejecutar_consulta_sql(sql, alcance, max_filas=max_filas, embarques=embarques, bases=bases)
 
 def generar_informe_personalizado(numero_destino, formato, titulo, secciones, subtitulo=None,
                                   resumen=None, consulta_kpis=None, alcance=None, embarques=False,
-                                  confirmaciones=False, fuente_kpis=None):
-    """Informe a medida que arma Claude: cada sección es una consulta SQL sobre "datos" (y
-    las tablas de embarques si el perfil las ve), que se ejecuta aquí, así las cifras salen de
+                                  confirmaciones=False, fuente_kpis=None, bases=BASES_LECTURA["ambas"]):
+    """Informe a medida que arma Claude: cada sección es una consulta SQL sobre las bases del
+    usuario (y las tablas de embarques si el perfil las ve), que se ejecuta aquí, así las cifras salen de
     la base y no del modelo, con pivote y gráfico opcionales. Si ninguna sección pide
     gráfico, la primera lleva el de totales."""
     if not secciones:
@@ -7244,7 +7361,7 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
     informe = {"titulo": titulo or "Informe de cosecha", "subtitulo": subtitulo,
                "resumen": resumen, "kpis": [], "secciones": [], "notas": notas}
     if consulta_kpis:
-        resultado, error = _consulta_informe(consulta_kpis, fuente_kpis, alcance, 1, embarques, confirmaciones)
+        resultado, error = _consulta_informe(consulta_kpis, fuente_kpis, alcance, 1, embarques, confirmaciones, bases)
         if error:
             return f"ERROR en consulta_kpis: {error} No envié nada; corrígela y vuelve a intentarlo."
         if resultado["filas"]:
@@ -7262,7 +7379,7 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
     for numero_seccion, seccion in enumerate(secciones[:8]):
         nombre = seccion.get("titulo") or f"Sección {numero_seccion + 1}"
         resultado, error = _consulta_informe(seccion.get("consulta_sql"), seccion.get("fuente"), alcance,
-                                             MAX_FILAS_INFORME, embarques, confirmaciones)
+                                             MAX_FILAS_INFORME, embarques, confirmaciones, bases)
         if error:
             return f"ERROR en la sección '{nombre}': {error} No envié nada; corrige la consulta y vuelve a intentarlo."
         encabezados = resultado["columnas"]
@@ -7499,6 +7616,7 @@ def _estado_numero(numero):
         "fundos": fundos_de(num),
         "plantas": plantas_de(num),
         "embarques": NOMBRE_NIVEL_EMBARQUES[nivel_embarques(num)],
+        "bases": NOMBRE_BASES[bases_de(num)],
         "ve_todo": ve_todo,
         "acceso_total": acceso_total,
         "alcance": detalle_alcance,
@@ -7521,6 +7639,22 @@ def _embarques_param(valor):
 def fijar_nivel_embarques(numero, nivel):
     conn = sqlite3.connect(DB_LOCAL_PATH)
     conn.execute("UPDATE numeros_permitidos SET ver_embarques = ? WHERE numero = ?", (nivel, normalizar_numero(numero)))
+    conn.commit()
+    conn.close()
+
+def _bases_param(valor):
+    """Valida ?bases= : (ambas | cosecha | packing | None si no vino, error)."""
+    if valor is None:
+        return None, None
+    texto = valor.strip().lower()
+    if texto not in BASES_LECTURA:
+        return None, JSONResponse(
+            {"status": "error", "error": "bases debe ser ambas, cosecha o packing."}, status_code=400)
+    return texto, None
+
+def fijar_bases(numero, nombre):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.execute("UPDATE numeros_permitidos SET ver_bases = ? WHERE numero = ?", (nombre, normalizar_numero(numero)))
     conn.commit()
     conn.close()
 
@@ -7563,7 +7697,7 @@ def _zonal_param(zonal):
 async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre: str = None,
                                rol: str = None, productor: str = None, fundos: str = None,
                                notificaciones: str = None, acceso_total: str = None, zonal: str = None,
-                               plantas: str = None, embarques: str = None):
+                               plantas: str = None, embarques: str = None, bases: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
@@ -7571,6 +7705,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     zonal: lo vincula a un zonal de /admin/zonales: ve los productores de ese zonal.
     fundos: fundos asignados separados por "|" (para zonal/productor, que solo ven los suyos).
     notificaciones: 1/si para que gerencia o eas reciba los avisos automáticos.
+    bases: ambas | cosecha | packing, lo que puede consultar (sin elegir: solo cosecha).
     Uso: .../admin/numeros/agregar?clave=...&numero=56912345678&nombre=Joaquin&zonal=Joaquin Llano
     """
     if clave != ADMIN_CLAVE:
@@ -7580,7 +7715,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques"}
+        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases"}
         | set(ALIAS_PARAMETROS),
     )
     if error:
@@ -7597,6 +7732,9 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     if error:
         return error
     nivel_emb, error = _embarques_param(embarques)
+    if error:
+        return error
+    bases_elegidas, error = _bases_param(bases)
     if error:
         return error
     try:
@@ -7624,6 +7762,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
             asignar_plantas(numero_normalizado, plantas_lista)
         if nivel_emb is not None:
             fijar_nivel_embarques(numero_normalizado, nivel_emb)
+        if bases_elegidas is not None:
+            fijar_bases(numero_normalizado, bases_elegidas)
 
         bienvenida_enviada = False
         if es_nuevo:
@@ -7645,12 +7785,13 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
 async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str = None,
                             productor: str = None, fundos: str = None, notificaciones: str = None,
                             acceso_total: str = None, zonal: str = None, plantas: str = None,
-                            embarques: str = None):
+                            embarques: str = None, bases: str = None):
     """
-    Cambia el rol, el zonal, los fundos asignados y/o si recibe notificaciones.
+    Cambia el rol, el zonal, los fundos asignados, las bases que lee y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
     notificaciones=1), zonal y productor (solo SUS fundos).
     zonal: lo vincula a un zonal (ve sus productores); zonal=ninguno lo desvincula.
+    bases: ambas | cosecha | packing, lo que puede consultar.
     Uso: .../admin/numeros/rol?clave=...&numero=56912345678&rol=zonal&zonal=Pedro Dominguez
     """
     if clave != ADMIN_CLAVE:
@@ -7660,16 +7801,16 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques"}
+        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases"}
         | set(ALIAS_PARAMETROS),
     )
     if error:
         return error
     if (rol is None and productor is None and fundos is None and notificaciones is None
-            and acceso_total is None and zonal is None and plantas is None and embarques is None):
+            and acceso_total is None and zonal is None and plantas is None and embarques is None and bases is None):
         return JSONResponse(
             {"status": "error",
-             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, productor, notificaciones o acceso_total"},
+             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, bases, productor, notificaciones o acceso_total"},
             status_code=400,
         )
     if rol is not None and rol not in ROLES_VALIDOS:
@@ -7684,6 +7825,9 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     if error:
         return error
     nivel_emb, error = _embarques_param(embarques)
+    if error:
+        return error
+    bases_elegidas, error = _bases_param(bases)
     if error:
         return error
     try:
@@ -7706,6 +7850,8 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
             asignar_plantas(numero, plantas_lista)
         if nivel_emb is not None:
             fijar_nivel_embarques(numero, nivel_emb)
+        if bases_elegidas is not None:
+            fijar_bases(numero, bases_elegidas)
         num = normalizar_numero(numero)
         return {"status": "ok", "numero": num, **_estado_numero(num)}
     except Exception as e:
