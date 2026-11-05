@@ -554,6 +554,21 @@ def _normalizar_nombre(texto):
     sin_tildes = unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode()
     return " ".join(sin_tildes.upper().split())
 
+def _clave_fundo(texto):
+    """Clave para reconocer el MISMO fundo escrito de varias formas. Los nombres se cargan a
+    mano en cada base, así que varían en tildes, puntos y abreviaturas: 'AGRÍCOLA EL CARMELO
+    LTDA' y 'AGRICOLA EL CARMELO LTDA', o 'FRUTICOLA TANTEHUE LIMITADA - SANTA RAQUEL' y
+    'FRUTICOLA TANTEHUE LTDA. - SANTA RAQUEL'.
+
+    Solo quita diferencias de ESCRITURA: no acerca nombres parecidos. Eso importa porque
+    'AGROINDUSTRIAL Y COMERCIAL SUPERFRUIT LTDA' y '... - LOS SUSPIROS' son fundos distintos y
+    de zonales distintos, y deben seguir separados."""
+    base = _normalizar_nombre(texto)
+    base = re.sub(r"\bLIMITADA\b", "LTDA", base)
+    base = re.sub(r"\bSOCIEDAD\b", "SOC", base)
+    base = re.sub(r"[^A-Z0-9]+", " ", base)
+    return " ".join(base.split())
+
 def asignacion_zonales():
     """{productor: zonal} tal como está en productores_zonales."""
     try:
@@ -688,7 +703,10 @@ def _sql_expr_zonal(columna="Productor"):
     los reconoce como la misma expresión si el texto es idéntico."""
     por_zonal = {}
     for productor, zonal in asignacion_zonales().items():
-        por_zonal.setdefault(zonal, []).append(productor)
+        # Se incluyen las otras escrituras del mismo fundo: si no, esas filas salen
+        # "Sin zonal" aunque el productor sí tenga zonal asignado.
+        for nombre in (variantes_de_fundo(productor) or [productor]):
+            por_zonal.setdefault(zonal, []).append(nombre)
     if not por_zonal:
         return _literal_sql(ZONAL_SIN_ASIGNAR)
     casos = " ".join(
@@ -710,11 +728,17 @@ def _sql_fundos(fundos, columna="Productor", literales=False):
         fundo = (fundo or "").strip()
         if not fundo:
             continue
+        # Todas las formas en que está escrito ese mismo fundo (tildes, puntos, LTDA/LIMITADA).
+        variantes = variantes_de_fundo(fundo)
+        if variantes:
+            exactos.extend(variantes)
+            continue
         real = conocidos.get(_normalizar_nombre(fundo))
         if real:
             exactos.append(real)
         else:
             parciales.append(fundo)
+    exactos = sorted(set(exactos))
     partes, params = [], []
     if exactos:
         if literales:
@@ -2756,6 +2780,42 @@ def cargar_productores_conocidos():
         return []
 
 PRODUCTORES_CONOCIDOS = cargar_productores_conocidos()
+
+def cargar_variantes_productor():
+    """{clave_fundo: [nombres tal cual están en cada base]}. Se leen las dos tablas porque un
+    mismo fundo puede estar escrito distinto en cada una, y si no se juntan el filtro por
+    fundos deja fuera esas filas sin avisar."""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return {}
+        cursor = conn.cursor()
+        nombres = set()
+        for tabla in ("[Recepcion_Consolidada]", "[Packing_Consolidado]"):
+            try:
+                cursor.execute(f"SELECT DISTINCT Productor FROM {tabla} WHERE Productor IS NOT NULL")
+                nombres.update(f[0].strip() for f in cursor.fetchall() if f[0] and f[0].strip())
+            except Exception as e:
+                logger.error(f"No pude leer productores de {tabla}: {str(e)}")
+        conn.close()
+        variantes = {}
+        for nombre in nombres:
+            variantes.setdefault(_clave_fundo(nombre), set()).add(nombre)
+        repetidos = {k: v for k, v in variantes.items() if len(v) > 1}
+        if repetidos:
+            logger.info(f"Fundos escritos de más de una forma: {len(repetidos)} "
+                        f"({', '.join(sorted(repetidos)[:3])}...)")
+        return {k: sorted(v) for k, v in variantes.items()}
+    except Exception as e:
+        logger.error(f"Error cargando variantes de productor: {str(e)}")
+        return {}
+
+VARIANTES_PRODUCTOR = cargar_variantes_productor()
+
+def variantes_de_fundo(fundo):
+    """Todas las formas en que ese fundo aparece escrito en las bases. Devuelve [] si no se
+    reconoce (ahí el filtro cae a la coincidencia parcial de siempre)."""
+    return VARIANTES_PRODUCTOR.get(_clave_fundo(fundo), [])
 sincronizar_nombres_zonales()
 
 def cargar_grupos_conocidos():
@@ -2803,11 +2863,13 @@ def recargar_catalogos():
     """Los catálogos se cargan al arrancar: si el bot arrancó con la base desconectada quedaron
     vacíos. Al reconectar se vuelven a leer (si una lectura falla, se conserva la anterior)."""
     global VARIEDADES_CONOCIDAS, PACKINGS_CONOCIDOS, ENVASES_CONOCIDOS, PRODUCTORES_CONOCIDOS, GRUPOS_CONOCIDOS
+    global VARIANTES_PRODUCTOR
     VARIEDADES_CONOCIDAS = cargar_variedades_conocidas() or VARIEDADES_CONOCIDAS
     PACKINGS_CONOCIDOS = cargar_packings_conocidos() or PACKINGS_CONOCIDOS
     ENVASES_CONOCIDOS = cargar_envases_conocidos() or ENVASES_CONOCIDOS
     PRODUCTORES_CONOCIDOS = cargar_productores_conocidos() or PRODUCTORES_CONOCIDOS
     GRUPOS_CONOCIDOS = cargar_grupos_conocidos() or GRUPOS_CONOCIDOS
+    VARIANTES_PRODUCTOR = cargar_variantes_productor() or VARIANTES_PRODUCTOR
     sincronizar_nombres_zonales()
     return {"variedades": len(VARIEDADES_CONOCIDAS), "productores": len(PRODUCTORES_CONOCIDOS)}
 
