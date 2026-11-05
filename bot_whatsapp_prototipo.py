@@ -2275,10 +2275,10 @@ def _revisar_origenes(tokens, ctes):
             if token != "(":
                 nombre = token.strip("[]\"").lower()
                 if i + 1 < n and tokens[i + 1] == ".":
-                    return f"No puedes leer '{token}.{tokens[i + 2] if i + 2 < n else ''}': solo la tabla 'datos'."
+                    return f"No puedes leer '{token}.{tokens[i + 2] if i + 2 < n else ''}': solo las tablas 'datos' y 'packing'."
                 es_funcion = nombre in _SQL_FUNCIONES_TABLA and i + 1 < n and tokens[i + 1] == "("
                 if not es_funcion and nombre not in ctes:
-                    return (f"Solo puedes consultar la tabla 'datos' (o tus propios WITH); "
+                    return (f"Solo puedes consultar las tablas 'datos' y 'packing' (o tus propios WITH); "
                             f"'{token}' no está permitido.")
                 i += 1
                 continue
@@ -2307,7 +2307,7 @@ def _revisar_origenes(tokens, ctes):
 # depende de acceso_total: un zonal con acceso a todos los fundos igual no la ve.
 ROLES_EMBARQUES = ("admin", "eas", "gerencia")
 TABLAS_EMBARQUES = ("embarques", "embarques_fob")
-NOMBRES_RESERVADOS_SQL = {"datos", *TABLAS_EMBARQUES}
+NOMBRES_RESERVADOS_SQL = {"datos", "packing", *TABLAS_EMBARQUES}
 
 NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
 NOMBRE_NIVEL_EMBARQUES = {nivel: nombre for nombre, nivel in NIVELES_EMBARQUES.items()}
@@ -2376,7 +2376,7 @@ def validar_consulta_sql(sql, tablas_extra=()):
     reservados = ctes & NOMBRES_RESERVADOS_SQL
     if reservados:
         return None, f"No definas un WITH llamado '{sorted(reservados)[0]}': ese nombre ya es una tabla."
-    permitidas = {"datos", *tablas_extra}
+    permitidas = {"datos", "packing", *tablas_extra}
     vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
     if vedadas:
         if "embarques" in permitidas:
@@ -2389,7 +2389,7 @@ def validar_consulta_sql(sql, tablas_extra=()):
         return None, error
     return texto, None
 
-def _sql_expr_temporada(columna_fecha="rc.Fecha"):
+def _sql_expr_temporada(columna_fecha="rc.Fecha", columna_temporada="rc.Temporada"):
     """Temporada oficial según la fecha (semana ISO 44 a 43, la misma regla de
     rango_temporada que usan todas las consultas del bot). La columna Temporada de la base
     no siempre calza: por ejemplo, ya asigna a la temporada siguiente la cereza temprana
@@ -2402,7 +2402,7 @@ def _sql_expr_temporada(columna_fecha="rc.Fecha"):
         # '2025-10-27' como año-día-mes y falla por fecha fuera de rango.
         casos.append(f"WHEN {columna_fecha} >= '{inicio.strftime('%Y%m%d')}' AND "
                      f"{columna_fecha} < '{(fin + timedelta(days=1)).strftime('%Y%m%d')}' THEN {temporada}")
-    return f"(CASE {' '.join(casos)} ELSE rc.Temporada END)"
+    return f"(CASE {' '.join(casos)} ELSE {columna_temporada} END)"
 
 def _sql_via(columna):
     return (f"CASE {columna} WHEN 'Sea' THEN N'Marítima' WHEN 'Air' THEN N'Aérea' "
@@ -2436,6 +2436,35 @@ def _ctes_embarques():
     )
     return [embarques, embarques_fob]
 
+# Packing_Consolidado: el embalaje de la fruta (la contraparte de la recepción). Se deja
+# fuera 'Packing Edge' por decisión de Edson (05-11-2026); el resto de las fuentes sí se
+# consulta. No tiene el problema de filas duplicadas sin kilos de Recepcion_Consolidada
+# (verificado: 1 fila de 91.377 sin KgsEmbalados), así que no se filtra nada más.
+BASE_ORIGEN_PACKING_EXCLUIDA = "Packing Edge"
+
+def _cte_packing(alcance):
+    """Tabla `packing` con nombres en castellano y acotada al alcance del usuario, igual que
+    `datos`. Las columnas de texto vienen de campos nchar con espacios de relleno, por eso el
+    LTRIM/RTRIM: sin él, Categoria llega como 'CAT 1                 '."""
+    condiciones = [f"pc.[Base origen] <> N'{BASE_ORIGEN_PACKING_EXCLUIDA}'"]
+    if isinstance(alcance, AlcancePlanta):
+        condiciones.append(_sql_plantas(alcance, columna="pc.Packing_name", literales=True)[0])
+    elif alcance is not None:
+        sql_fundos, _ = _sql_fundos(alcance, columna="pc.Productor", literales=True) if alcance else ("1 = 0", [])
+        condiciones.append(sql_fundos)
+    temporada = _sql_expr_temporada("pc.Fecha", "pc.Temporada")
+    return ("packing AS (SELECT "
+            f"{temporada} AS Temporada, pc.Temporada AS TemporadaBase, "
+            "LTRIM(RTRIM(pc.[Base origen])) AS [Base Origen], pc.Especie, pc.Variedad, "
+            "pc.Variedad_Agronomica AS [Variedad Agronomica], pc.Productor, "
+            "pc.Familia_Productor AS Grupo, "
+            f"{_sql_expr_zonal('pc.Productor')} AS Zonal, "
+            "LTRIM(RTRIM(pc.Packing_name)) AS Packing, pc.Fecha, pc.Semana, "
+            "pc.Bultos, pc.Cajas_Eq AS CajasEq, pc.KgsEmbalados, pc.KgsVaciados, "
+            "NULLIF(LTRIM(RTRIM(pc.Categoria)), '') AS Categoria, "
+            "NULLIF(LTRIM(RTRIM(pc.Calibre)), '') AS Calibre "
+            f"FROM [Packing_Consolidado] pc WHERE {' AND '.join(condiciones)})")
+
 def _consulta_con_datos(consulta, alcance, embarques=False):
     """Antepone el WITH "datos": la tabla real + Zonal, con la temporada oficial por fecha,
     sin las filas duplicadas sin kilos (las mismas que excluyen todas las consultas del bot)
@@ -2451,7 +2480,8 @@ def _consulta_con_datos(consulta, alcance, embarques=False):
              f"rc.[Base Origen], rc.Especie, rc.Variedad, rc.[Variedad Agronomica], rc.Productor, "
              f"rc.Grupo, {_sql_expr_zonal('rc.Productor')} AS Zonal, rc.Packing, rc.Fecha, rc.Semana, "
              f"rc.Envase, rc.Bultos, rc.KgsRecepcionados, rc.Terminado, rc.tipo_despacho, rc.CajasEq, rc.Trisemanal "
-             f"FROM {RECEPCION_SQL} rc WHERE {' AND '.join(condiciones)})")]
+             f"FROM {RECEPCION_SQL} rc WHERE {' AND '.join(condiciones)})"),
+            _cte_packing(alcance)]
     if embarques:
         ctes += _ctes_embarques()[:len(_tablas_embarques(embarques))]
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
@@ -3204,12 +3234,27 @@ TOOL_CONSULTAR_SQL = {
         "Fecha sin CAST usa 'AAAAMMDD', porque el servidor está en español y lee mal '2026-10-26' como datetime) y "
         "CAST(Semana AS INT) para semanas; compara "
         "fuentes con SUM(CASE WHEN [Base Origen] = '...' THEN KgsRecepcionados ELSE 0 END); NULLIF para dividir. "
+        "TAMBIÉN puedes consultar la tabla `packing` (Packing_Consolidado), el EMBALAJE de la fruta: qué se "
+        "procesó en planta, en qué categoría y calibre. Viene filtrada por lo que este usuario puede ver, igual "
+        "que `datos`. Columnas: Temporada y TemporadaBase (igual que en datos), [Base Origen] "
+        "('Packing Planta' = embalaje REAL, 'Trisem Proceso' = proyección de proceso de corto plazo, "
+        "'Estim Primavera' y 'Estim Invierno' = las mismas estimaciones de la cosecha), Especie, Variedad, "
+        "[Variedad Agronomica], Productor, Grupo, Zonal, Packing (= planta), Fecha, Semana, Bultos, CajasEq "
+        "(cajas equivalentes), KgsEmbalados, KgsVaciados, Categoria (CAT 1, EXTRA FANCY...; NULL si no viene) y "
+        "Calibre (NULL si no viene). REGLAS de `packing`: (a) KgsEmbalados = lo que SALIÓ embalado y solo existe "
+        "en 'Packing Planta'; KgsVaciados = lo que ENTRÓ al proceso y es lo único que traen las filas de "
+        "estimación, así que para estimaciones de packing usa KgsVaciados. (b) El rendimiento de packing = "
+        "SUM(KgsEmbalados)/NULLIF(SUM(KgsVaciados),0) sobre 'Packing Planta'. (c) Categoria viene escrita de "
+        "varias formas ('CAT 1' y 'CAT1' son lo mismo): si agrupas por categoría, únelas con "
+        "REPLACE(Categoria, ' ', ''). (d) No mezcles kilos de `datos` (recepción) con los de `packing` como si "
+        "fueran lo mismo: recepción es lo que llegó del campo y packing es lo que se procesó. (e) La fuente "
+        "'Packing Edge' está excluida por decisión de Agua Santa; no la menciones como disponible. "
         "Devuelve máximo 400 filas. Si da error, lee el mensaje, corrige y reintenta."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos`."},
+            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos` y/o `packing`."},
             "proposito": {"type": "string", "description": "En pocas palabras, qué quieres averiguar con esta consulta."},
         },
         "required": ["consulta"],
@@ -3223,7 +3268,7 @@ TOOL_GENERAR_INFORME = {
         "de consultar_cosecha_flexible (estimado vs real) ni el de generar_informe_proyeccion: varias secciones, "
         "comparaciones entre temporadas, rankings, una tabla con semanas o fechas como columnas, un gráfico "
         "específico, cifras clave a elección, un comentario o análisis, etc. Cada sección es una consulta SQL sobre "
-        "`datos` (mismas columnas y reglas que consultar_sql) que se ejecuta al armar el archivo, así las cifras "
+        "`datos` o `packing` (mismas columnas y reglas que consultar_sql) que se ejecuta al armar el archivo, así las cifras "
         "salen siempre de la base. Por defecto la primera sección lleva un gráfico pequeño de totales; la fila "
         "TOTAL se agrega sola y suma solo las cantidades (no los %, ni las columnas por unidad como USD/caja eq o "
         "promedios, que no se pueden sumar). Si necesitas un total correcto para esas columnas, haz que la "
@@ -3313,7 +3358,7 @@ TOOL_CONSULTAR_SQL_EMBARQUES = {
         **TOOL_CONSULTAR_SQL["input_schema"],
         "properties": {
             **TOOL_CONSULTAR_SQL["input_schema"]["properties"],
-            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos`, `embarques` y/o `embarques_fob`."},
+            "consulta": {"type": "string", "description": "La consulta SELECT sobre `datos`, `packing`, `embarques` y/o `embarques_fob`."},
         },
     },
 }
@@ -7100,6 +7145,9 @@ def _notas_de_fuente(consultas):
     notas = []
     if re.search(r"\bdatos\b", texto):
         notas.append(NOTA_FUENTES)
+    if re.search(r"\bpacking\b", texto):
+        notas.append("Embalaje según Packing_Consolidado (Control EAS). Kgs Embalados = salida del "
+                     "proceso; Kgs Vaciados = entrada. No incluye la fuente Packing Edge.")
     if re.search(r"\bembarques\b", texto):
         notas.append("Embarques según Reporte_Embarque_PBI (Control EAS). Cajas = cajas físicas; "
                      "Cajas Eq = cajas equivalentes.")
