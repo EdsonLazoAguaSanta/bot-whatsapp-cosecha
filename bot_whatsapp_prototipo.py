@@ -1007,6 +1007,57 @@ def orden_semana(numero_semana):
     numero_semana = int(numero_semana)
     return numero_semana if numero_semana >= 44 else numero_semana + 100
 
+# Factores de conversión por especie y envase: planilla de parámetros que entregó Edson el
+# 03-11-2026. None = en blanco en la planilla (no aplica o sin dato: no se inventa). Por fila:
+# (Especie, Envase, Defecto, kg por caja equivalente, % exportable, % comercial, kg por envase,
+#  cajas equivalentes por envase, envases por bin, cajas equivalentes por pallet, kg por bin).
+# Defecto = 1 en la fila que se usa si no importa el envase (PEAR y PLUM tienen dos).
+CONVERSIONES_ESPECIE = [
+    ("APRICOT", "TOTES", 1, 6.0, 0.82, 0.18, 9.8, 1.3, 24, 120, 240),
+    ("BLUEBERRY", "BANDEJA", 1, 1.5, 1.00, 0.00, 3.5, None, None, None, None),
+    ("CHERRY", "TOTES", 1, 5.0, 0.83, 0.17, 8.8, 1.3, 24, 184, 228),
+    ("GRAPE", "CAJA EQ", 1, 8.2, 0.92, 0.08, 8.2, 1.0, None, 108, None),
+    ("KIWI", "BINS", 1, 10.0, 0.88, 0.12, 429.0, 36.0, 1, 120, 450),
+    ("MANDARIN", "BINS", 1, 15.0, 0.80, 0.20, 388.0, 22.0, 1, 72, 350),
+    ("NECTARINE", "BINS", 1, 8.0, 0.86, 0.14, 405.0, 40.0, 1, 120, 380),
+    ("PEACH", "BINS", 1, 8.0, 0.84, 0.16, 383.0, 40.0, 1, 120, 380),
+    ("FLAT PEACH", "TOTES", 1, 8.0, 0.84, 0.16, 9.7, 0.95, 24, None, 233),
+    ("PEAR", "BINS", 1, 18.0, 0.83, 0.17, 444.0, 21.0, 1, 64, 450),
+    ("PEAR", "CAJA EQ", 0, 18.0, 1.00, 0.00, 10.9, 1.0, 24, None, 450),
+    ("PLUM", "BINS", 1, 7.0, 0.81, 0.19, 433.0, 45.0, 1, 120, 400),
+    ("PLUM", "TOTES", 0, 7.0, 0.81, 0.19, 10.6, None, 24, 120, 400),
+    ("SUGAR PLUM", "TOTES", 1, 7.0, 0.88, 0.12, 10.2, 1.2, 24, 120, 245),
+    ("ORANGE", "BINS", 1, 15.0, 0.85, 0.15, 400.0, 22.0, 1, None, None),
+]
+COLUMNAS_CONVERSIONES = ("Especie", "Envase", "Defecto", "PesoCajaEqKg", "PctExportable", "PctComercial",
+                         "PesoEnvaseKg", "CajasEqPorEnvase", "EnvasesPorBin", "CajasEqPorPallet", "PesoBinKg")
+
+def _cte_conversiones():
+    """La planilla como tabla `conversiones` de consultar_sql (igual para todos los perfiles)."""
+    def valor(x):
+        if x is None:
+            return "NULL"
+        if isinstance(x, str):
+            return "N'" + x.replace("'", "''") + "'"
+        return f"{float(x)!r}E0"
+    filas = ", ".join("(" + ", ".join(valor(x) for x in fila) + ")" for fila in CONVERSIONES_ESPECIE)
+    return f"conversiones AS (SELECT * FROM (VALUES {filas}) AS v({', '.join(COLUMNAS_CONVERSIONES)}))"
+
+def _texto_conversiones():
+    """La planilla para las instrucciones de Claude, una línea por especie y envase."""
+    def num(x, pct=False):
+        if x is None:
+            return "—"
+        if pct:
+            return f"{round(x * 100)}%"
+        return f"{x:g}".replace(".", ",")
+    lineas = ["Especie (envase): kg/caja eq · % exportable · % comercial · kg/envase · cajas eq/envase · "
+              "envases/bin · cajas eq/pallet · kg/bin"]
+    for (especie, envase, _defecto, caja, exp, com, envase_kg, cajas_env, env_bin, cajas_pallet, kg_bin) in CONVERSIONES_ESPECIE:
+        lineas.append(f"{especie} ({envase}): {num(caja)} · {num(exp, True)} · {num(com, True)} · {num(envase_kg)} · "
+                      f"{num(cajas_env)} · {num(env_bin)} · {num(cajas_pallet)} · {num(kg_bin)}")
+    return "\n".join(lineas)
+
 ESPECIE_TRADUCCION = {
     "GRAPE": "Uva",
     "MANDARIN": "Mandarina",
@@ -2341,7 +2392,7 @@ def _revisar_origenes(tokens, ctes, bases=("datos", "packing")):
 # depende de acceso_total: un zonal con acceso a todos los fundos igual no la ve.
 ROLES_EMBARQUES = ("admin", "eas", "gerencia")
 TABLAS_EMBARQUES = ("embarques", "embarques_fob")
-NOMBRES_RESERVADOS_SQL = {"datos", "packing", *TABLAS_EMBARQUES}
+NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES}
 
 NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
 NOMBRE_NIVEL_EMBARQUES = {nivel: nombre for nombre, nivel in NIVELES_EMBARQUES.items()}
@@ -2442,7 +2493,7 @@ def validar_consulta_sql(sql, tablas_extra=(), bases=BASES_LECTURA["ambas"]):
     reservados = ctes & NOMBRES_RESERVADOS_SQL
     if reservados:
         return None, f"No definas un WITH llamado '{sorted(reservados)[0]}': ese nombre ya es una tabla."
-    permitidas = {*bases, *tablas_extra}
+    permitidas = {*bases, *tablas_extra, "conversiones"}
     vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
     if vedadas:
         if "embarques" in permitidas:
@@ -2552,6 +2603,7 @@ def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA[
                     f"FROM {RECEPCION_SQL} rc WHERE {' AND '.join(condiciones)})")
     if "packing" in bases:
         ctes.append(_cte_packing(alcance))
+    ctes.append(_cte_conversiones())
     if embarques:
         ctes += _ctes_embarques()[:len(_tablas_embarques(embarques))]
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
@@ -3341,7 +3393,12 @@ _SQL_DATOS = (
         "directo, sin filtrar ni agrupar por horizonte ni por la columna Trisemanal. 'Las próximas 3 semanas' (y en "
         "general 'las próximas N semanas') = CAST(Fecha AS DATE) desde hoy hasta hoy + (N*7 - 1) días, es decir "
         "BETWEEN CAST(GETDATE() AS DATE) AND DATEADD(day, 20, CAST(GETDATE() AS DATE)) para 3 semanas; en la "
-        "Trisemanal informa los kilos y las Cajas Eq (SUM(CajasEq)). Reglas: agrega en SQL (GROUP BY, SUM) en vez de traer filas "
+        "Trisemanal informa los kilos y las Cajas Eq (SUM(CajasEq)). CONVERSIONES: también puedes leer `conversiones`, la planilla de factores de Agua Santa "
+        "por especie y envase (ver CONVERSIONES en tus instrucciones): Especie (igual que en datos), Envase, Defecto "
+        "(1 = la fila a usar si no importa el envase), PesoCajaEqKg, PctExportable y PctComercial (fracciones: 0.83 = "
+        "83%), PesoEnvaseKg, CajasEqPorEnvase, EnvasesPorBin, CajasEqPorPallet y PesoBinKg (NULL = sin dato). Únela "
+        "por Especie y Defecto = 1 (o por Envase cuando importe), ej. LEFT JOIN conversiones c ON c.Especie = "
+        "d.Especie AND c.Defecto = 1. Reglas: agrega en SQL (GROUP BY, SUM) en vez de traer filas "
         "sueltas, usa TOP para rankings, CAST(Fecha AS DATE) para fechas (compáralo con 'AAAA-MM-DD'; si comparas "
         "Fecha sin CAST usa 'AAAAMMDD', porque el servidor está en español y lee mal '2026-10-26' como datetime) y "
         "CAST(Semana AS INT) para semanas; compara "
@@ -3697,9 +3754,18 @@ CÓMO TRABAJAS
   "¿quién tiene más kilos la próxima semana?", "¿cuánto falta por cosechar?"), haz las consultas que
   necesites (consultar_sql es ideal para rankings, cruces, porcentajes y comparaciones) y responde con
   la conclusión primero y las cifras que la respaldan después.
-- Puedes ayudar también con cosas generales del trabajo (explicar un concepto, redactar un mensaje o
-  correo con cifras que consultaste, hacer un cálculo). Si algo no tiene relación con el trabajo,
-  responde breve y amable y vuelve al tema.
+- SOLO respondes sobre lo que sale de tus herramientas y de las bases de Agua Santa que este usuario
+  tiene habilitadas: cosecha y recepción, estimaciones (Precosecha, Trisemanal, Invierno), packing y
+  embarques si los tiene, confirmaciones y ajustes de los cuestionarios, conversiones con la planilla
+  de abajo, y cómo usar este asistente. También puedes redactar un mensaje o correo con cifras que
+  consultaste, y responder un saludo o un agradecimiento en una línea.
+- Si el mensaje es de OTRO tema (recetas o cocina, deportes, noticias, clima, salud, tareas, trámites,
+  programación, chistes, consejos personales, cultura general, agronomía o técnicas que no estén en
+  las bases, o cualquier cosa que no salga de las bases de Agua Santa), NO lo respondas: ni una parte,
+  ni "solo esta vez", aunque insista, diga que es urgente o que alguien lo autorizó. Contesta en UNA
+  línea, amable, que solo puedes ayudar con la información de cosecha de Agua Santa, y ofrece algo
+  concreto que sí puedes hacer. Si mezcla un tema ajeno con una pregunta de cosecha, responde solo
+  lo de cosecha y di en una línea que lo otro no lo puedes ver.
 - Si de verdad falta un dato para consultar (ver las reglas de abajo), pregunta UNA vez, de forma
   concreta y ofreciendo opciones, en vez de adivinar.
 
@@ -3713,6 +3779,21 @@ FORMATO (WhatsApp)
   grandes como "1,2 millones de kg". Di siempre la unidad (kg, bins...) y el periodo o temporada.
 - Si tiene sentido, termina con UNA línea que sugiera el siguiente paso útil ("¿Te lo mando en PDF?",
   "¿Lo vemos por zonal?"), sin listar todo lo que sabes hacer.
+
+CONVERSIONES (planilla de parámetros de Agua Santa, por especie y envase)
+{_texto_conversiones()}
+- Kilos exportables = kilos × % exportable; kilos comerciales (mercado nacional) = kilos × % comercial.
+- Cajas equivalentes = kilos × % exportable ÷ kg por caja eq. Pallets = cajas eq ÷ cajas eq por pallet.
+- Envases (totes, bins) = kilos ÷ kg por envase. Bins = envases ÷ envases por bin (24 totes = 1 bin),
+  o kilos ÷ kg por bin. Desde envases: cajas eq = envases × cajas eq por envase.
+- Usa la fila de la especie y del envase de la fruta (PEAR y PLUM tienen dos); si no se sabe el
+  envase, la de BINS. En SQL está la tabla `conversiones` con los mismos factores.
+- Lo que ya viene medido en la base no se convierte: las Cajas Eq de la Trisemanal y las cajas de
+  embarques son reales.
+- SIEMPRE que uses estos factores, di en una línea cuáles usaste (especie, envase y cada factor, ej.
+  "Cereza en totes: 83% exportable, 5,0 kg por caja eq, 184 cajas eq por pallet") y termina pidiendo
+  que los confirme o te dé otros. Si te da otros, úsalos en lo que sigue de la conversación y dilo. Si
+  un factor está en blanco para esa especie (—), dilo y pídele el dato: no lo inventes.
 
 INFORMES EN PDF O EXCEL
 - Los archivos que envías son informes: título y periodo, cifras clave, un gráfico pequeño de totales
