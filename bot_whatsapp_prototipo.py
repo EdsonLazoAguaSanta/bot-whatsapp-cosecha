@@ -2391,7 +2391,12 @@ def _revisar_origenes(tokens, ctes, bases=("datos", "packing")):
 # (clientes, naves, valores FOB) que Agua Santa decidió mostrar solo a estos perfiles. No
 # depende de acceso_total: un zonal con acceso a todos los fundos igual no la ve.
 ROLES_EMBARQUES = ("admin", "eas", "gerencia")
-TABLAS_EMBARQUES = ("embarques", "embarques_fob")
+TABLAS_EMBARQUES = ("embarques", "embarques_detalle", "embarques_fob")
+# Qué tablas de embarques ve cada nivel. El calibre (serie), el productor y la planta solo vienen
+# en la vista de liquidación, junto con el FOB: «solo embarques» la ve como `embarques_detalle`,
+# sin los valores (FOB, FOB pool ni estado de liquidación). Antes ese nivel perdía la vista
+# entera, y con ella el calibre, que no es un dato de plata.
+TABLAS_POR_NIVEL = {0: (), 1: ("embarques", "embarques_detalle"), 2: ("embarques", "embarques_fob")}
 NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES}
 
 NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
@@ -2422,7 +2427,7 @@ def nivel_embarques(numero):
 def _tablas_embarques(embarques):
     """Tablas de embarques permitidas para un nivel (True = todas, como antes)."""
     nivel = 2 if embarques is True else int(embarques or 0)
-    return TABLAS_EMBARQUES[:nivel]
+    return TABLAS_POR_NIVEL[max(0, min(2, nivel))]
 
 # Bases que lee cada usuario, de cualquier perfil. 'cosecha' = la tabla `datos` y las herramientas
 # de cosecha; 'packing' = la tabla `packing`. Los envíos automáticos (cuestionarios, resúmenes y
@@ -2497,8 +2502,8 @@ def validar_consulta_sql(sql, tablas_extra=(), bases=BASES_LECTURA["ambas"]):
     vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
     if vedadas:
         if "embarques" in permitidas:
-            return None, ("Los valores FOB (tabla embarques_fob) no están habilitados para este usuario: "
-                          "solo puede consultar `embarques`.")
+            return None, ("Los valores FOB (tabla embarques_fob) no están habilitados para este usuario: para "
+                          "productor, planta o calibre usa `embarques_detalle`, que trae lo mismo sin los valores.")
         return None, ("Las tablas de embarques (embarques, embarques_fob) no están habilitadas para "
                       "este usuario.")
     error = _revisar_origenes(tokens, ctes | permitidas, bases)
@@ -2539,19 +2544,26 @@ def _ctes_embarques():
         "e.Market AS Mercado, NULLIF(e.SaleMarket, '') AS PaisVenta "
         "FROM [Reporte_Embarque_PBI] e)"
     )
-    embarques_fob = (
-        "embarques_fob AS (SELECT CAST(l.Temporada AS INT) AS Temporada, l.[Grower Name] AS Productor, "
-        f"l.growerFamily__name AS Grupo, {_sql_expr_zonal('l.[Grower Name]')} AS Zonal, "
-        "l.[PackingSite Name] AS Planta, l.[Commodity Name] AS Especie, l.Variedad_Agronomica AS Variedad, "
-        "l.Variedad_tipo AS TipoVariedad, l.EqSerie AS Serie, l.Cases AS Cajas, l.Cases_Eq AS CajasEq, "
-        "l.[FOB (usd)] AS FOB, l.[Pool FOB (usd)] AS FOBPool, l.Estatus AS Estado, l.Arribado, "
-        "l.[Receiver name] AS Recibidor, l.[Receiver code] AS CodigoRecibidor, l.[Vessel name] AS Nave, "
-        f"{_sql_via('l.[Vessel type]')} AS Via, l.[Departure date] AS FechaZarpe, "
-        "CAST(l.WeekOnly AS INT) AS SemanaZarpe, l.[Arrival port] AS Puerto, "
-        "l.[Arrival country] AS PaisLlegada, l.ETA, l.[Arrival date] AS FechaLlegada, l.Market AS Mercado "
-        "FROM [Embarque-Liquidacion-PBI] l)"
-    )
-    return [embarques, embarques_fob]
+    def liquidacion(nombre, valores):
+        return (
+            f"{nombre} AS (SELECT CAST(l.Temporada AS INT) AS Temporada, l.[Grower Name] AS Productor, "
+            f"l.growerFamily__name AS Grupo, {_sql_expr_zonal('l.[Grower Name]')} AS Zonal, "
+            "l.[PackingSite Name] AS Planta, l.[Commodity Name] AS Especie, l.Variedad_Agronomica AS Variedad, "
+            "l.Variedad_tipo AS TipoVariedad, l.EqSerie AS Serie, l.Cases AS Cajas, l.Cases_Eq AS CajasEq, "
+            + valores +
+            "l.Arribado, l.[Receiver name] AS Recibidor, l.[Receiver code] AS CodigoRecibidor, l.[Vessel name] AS Nave, "
+            f"{_sql_via('l.[Vessel type]')} AS Via, l.[Departure date] AS FechaZarpe, "
+            "CAST(l.WeekOnly AS INT) AS SemanaZarpe, l.[Arrival port] AS Puerto, "
+            "l.[Arrival country] AS PaisLlegada, l.ETA, l.[Arrival date] AS FechaLlegada, l.Market AS Mercado "
+            "FROM [Embarque-Liquidacion-PBI] l)"
+        )
+    return {
+        "embarques": embarques,
+        # La misma vista de liquidación, sin los valores: para quien ve embarques pero no el FOB.
+        "embarques_detalle": liquidacion("embarques_detalle", ""),
+        "embarques_fob": liquidacion("embarques_fob", "l.[FOB (usd)] AS FOB, l.[Pool FOB (usd)] AS FOBPool, "
+                                                      "l.Estatus AS Estado, "),
+    }
 
 # Packing_Consolidado: el embalaje de la fruta (la contraparte de la recepción). Se deja
 # fuera 'Packing Edge' por decisión de Edson (05-11-2026); el resto de las fuentes sí se
@@ -2605,7 +2617,7 @@ def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA[
         ctes.append(_cte_packing(alcance))
     ctes.append(_cte_conversiones())
     if embarques:
-        ctes += _ctes_embarques()[:len(_tablas_embarques(embarques))]
+        ctes += [cte for nombre, cte in _ctes_embarques().items() if nombre in _tablas_embarques(embarques)]
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
     if resto != consulta:
         return f"WITH {', '.join(ctes)}, {resto}"
@@ -3547,7 +3559,9 @@ DESCRIPCION_EMBARQUES = (
     "Variedad, TipoVariedad, Serie (calibre/serie equivalente), Cajas, CajasEq, FOB (USD, monto total de la "
     "fila), FOBPool (USD, FOB del pool), Estado ('Liquidación' = liquidado, 'Factura' = solo facturado, valor "
     "provisorio), Arribado ('Sí'/'No'), Recibidor, CodigoRecibidor, Nave, Via, FechaZarpe, SemanaZarpe, Puerto, "
-    "PaisLlegada (siempre informado), ETA, FechaLlegada, Mercado. "
+    "PaisLlegada (siempre informado), ETA, FechaLlegada, Mercado. Serie es el CALIBRE de lo embarcado (XL, J, "
+    "JJ, JJJ, G...). En embarques NO hay categoría: la categoría solo existe en packing (lo embalado en planta, que "
+    "no es lo mismo que lo embarcado). "
     "REGLAS DE AGUA SANTA para embarques: (1) 'cajas' sin más = cajas FÍSICAS (Cajas); las equivalentes solo si "
     "las piden. (2) Cuando hables de FOB, precio o retorno muestra SIEMPRE los dos: FOB y FOB pool. (3) USD por "
     "caja = SUM(FOB)/SUM(CajasEq), es decir por caja EQUIVALENTE (y lo mismo con FOBPool); dilo así: 'USD/caja "
@@ -3568,6 +3582,12 @@ DESCRIPCION_EMBARQUES_SIN_FOB = (
     "(cliente), Nave, Via ('Marítima', 'Aérea', 'Terrestre'), FechaZarpe (date), SemanaZarpe (int, ISO), Puerto "
     "(de llegada), ETA (date), Mercado (región: LEJANO ORIENTE, USA EAST COAST, USA WEST COAST, EUROPA, "
     "SUDAMERICA, CENTROAMERICA, NORTEAMERICA, CHILE...), PaisVenta (casi siempre NULL). "
+    "`embarques_detalle` (vista Embarque-Liquidacion-PBI, las MISMAS filas con productor, planta y calibre; no trae "
+    "contenedor ni pallets): Temporada, Productor, Grupo, Zonal (calculada, igual que en datos), Planta, Especie, "
+    "Variedad, TipoVariedad, Serie (el CALIBRE de lo embarcado: XL, J, JJ, JJJ, G...), Cajas, CajasEq, Arribado "
+    "('Sí'/'No'), Recibidor, CodigoRecibidor, Nave, Via, FechaZarpe, SemanaZarpe, Puerto, PaisLlegada, ETA, "
+    "FechaLlegada, Mercado. Para productor, planta o calibre usa embarques_detalle. En embarques NO hay categoría: "
+    "la categoría solo existe en packing (lo embalado en planta, que no es lo mismo que lo embarcado). "
     "Este usuario NO tiene habilitados los valores FOB, precios, retornos ni liquidaciones (no existe "
     "`embarques_fob` para él). REGLAS DE AGUA SANTA para embarques: (1) 'cajas' sin más = cajas FÍSICAS (Cajas); "
     "las equivalentes solo si las piden. (2) 'Destino' o 'mercado' = Mercado (región) y Puerto. (3) Para cruzar "
@@ -3582,7 +3602,7 @@ def _herramienta_sql(nivel, bases=("datos", "packing")):
     clave = (nivel, bases)
     if clave not in _SQL_POR_PERMISO:
         extra = DESCRIPCION_EMBARQUES if nivel >= 2 else DESCRIPCION_EMBARQUES_SIN_FOB if nivel == 1 else ""
-        tablas = [*bases, *TABLAS_EMBARQUES[:nivel]]
+        tablas = [*bases, *_tablas_embarques(nivel)]
         _SQL_POR_PERMISO[clave] = {
             **TOOL_CONSULTAR_SQL,
             "description": _DESCRIPCION_SQL[bases] + extra,
@@ -3651,8 +3671,8 @@ def _herramienta_informe(nivel, confirmaciones, bases=("datos", "packing")):
         if nivel >= 2:
             tool["description"] += " Las secciones también pueden leer `embarques` y `embarques_fob` (ver consultar_sql)."
         elif nivel == 1:
-            tool["description"] += (" Las secciones también pueden leer `embarques` (ver consultar_sql); los valores "
-                                    "FOB no están habilitados para este usuario.")
+            tool["description"] += (" Las secciones también pueden leer `embarques` y `embarques_detalle` (ver "
+                                    "consultar_sql); los valores FOB no están habilitados para este usuario.")
         if confirmaciones:
             tool["description"] += (" Con fuente='confirmaciones' una sección (o las cifras clave, con fuente_kpis) "
                                     "lee el historial de confirmaciones y ajustes en vez de SQL Server.")
@@ -4083,8 +4103,9 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
     if nivel == 1:
         partes.append(
             "EMBARQUES: este usuario puede consultar los embarques de exportación (cajas, pallets, "
-            "clientes, naves, puertos y mercados) con la tabla `embarques` de consultar_sql y "
-            "generar_informe, pero NO tiene habilitados los valores FOB, precios, retornos ni "
+            "clientes, naves, puertos, mercados, productor, planta y calibre) con las tablas `embarques` "
+            "y `embarques_detalle` de consultar_sql y generar_informe, pero NO tiene habilitados los "
+            "valores FOB, precios, retornos ni "
             "liquidaciones. Si los pide, explícale con amabilidad que esa información no está "
             "habilitada para su usuario y que puede pedírsela a Edson Lazo."
         )
@@ -7415,6 +7436,8 @@ def _notas_de_fuente(consultas):
         notas.append("Confirmaciones y ajustes según el historial del Asistente (cuestionarios de las "
                      "08:00 y 15:00, reportes espontáneos y resúmenes a plantas). Los ajustes son lo que "
                      "informaron los zonales: no modifican la base Control EAS.")
+    if re.search(r"\bembarques_detalle\b", texto):
+        notas.append("Productor, planta y calibre de lo embarcado según Embarque-Liquidacion-PBI (sin valores FOB).")
     if re.search(r"\bembarques_fob\b", texto):
         notas.append("Valores FOB en USD según Embarque-Liquidacion-PBI. Incluyen embarques solo "
                      "facturados, cuyo valor es provisorio hasta la liquidación.")
