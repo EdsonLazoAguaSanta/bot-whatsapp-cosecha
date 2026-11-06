@@ -2391,12 +2391,15 @@ def _revisar_origenes(tokens, ctes, bases=("datos", "packing")):
 # (clientes, naves, valores FOB) que Agua Santa decidió mostrar solo a estos perfiles. No
 # depende de acceso_total: un zonal con acceso a todos los fundos igual no la ve.
 ROLES_EMBARQUES = ("admin", "eas", "gerencia")
-TABLAS_EMBARQUES = ("embarques", "embarques_detalle", "embarques_fob")
+TABLAS_EMBARQUES = ("embarques", "embarques_detalle", "embarques_fob", "embarques_pallets")
 # Qué tablas de embarques ve cada nivel. El calibre (serie), el productor y la planta solo vienen
 # en la vista de liquidación, junto con el FOB: «solo embarques» la ve como `embarques_detalle`,
 # sin los valores (FOB, FOB pool ni estado de liquidación). Antes ese nivel perdía la vista
 # entera, y con ella el calibre, que no es un dato de plata.
-TABLAS_POR_NIVEL = {0: (), 1: ("embarques", "embarques_detalle"), 2: ("embarques", "embarques_fob")}
+# `embarques_pallets` (por pallet, con categoría, calibre real y contenedor) va en los dos niveles:
+# sin FOB para «solo embarques» y con FOB para quien lo ve.
+TABLAS_POR_NIVEL = {0: (), 1: ("embarques", "embarques_detalle", "embarques_pallets"),
+                    2: ("embarques", "embarques_fob", "embarques_pallets")}
 NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES}
 
 NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
@@ -2530,7 +2533,27 @@ def _sql_via(columna):
     return (f"CASE {columna} WHEN 'Sea' THEN N'Marítima' WHEN 'Air' THEN N'Aérea' "
             f"WHEN 'Earth' THEN N'Terrestre' ELSE {columna} END")
 
-def _ctes_embarques():
+def _cte_embarques_pallets(con_fob):
+    """Vista PalletsRowsCom: una fila por pallet o parte de pallet embarcado de la temporada en curso,
+    con categoría, calibre real, envase, etiqueta y contenedor (las otras vistas no los traen
+    juntos). Cuadra con Reporte_Embarque_PBI: 299 filas y 29.265 cajas al 06-11-2026. Sus valores
+    en dólares solo van a quien ve el FOB."""
+    valores = ", p.[FOB (usd)] AS FOB, p.[Pool FOB (usd)] AS FOBPool" if con_fob else ""
+    return (
+        "embarques_pallets AS (SELECT CAST(CASE WHEN ISNUMERIC(p.Temporada) = 1 THEN p.Temporada END AS INT) AS Temporada, "
+        f"p.[Grower Name] AS Productor, p.[Grower Group] AS Grupo, {_sql_expr_zonal('p.[Grower Name]')} AS Zonal, "
+        "p.[PackingSite Name] AS Planta, p.[Packing Date] AS FechaEmbalaje, p.[Commodity Name] AS Especie, "
+        "p.[Variety Name] AS Variedad, p.[Package Name] AS Envase, p.[Package Net Weight] AS PesoNetoEnvase, "
+        "p.[Label Name] AS Etiqueta, p.[Category Name] AS Categoria, p.[Caliber Name] AS Calibre, p.Cases AS Cajas, "
+        "CAST(p.[Net Weight] AS FLOAT) AS KilosNetos, p.Pallets, p.Pallet, NULLIF(p.Container, '') AS Contenedor, "
+        "p.[Receiver name] AS Recibidor, p.[Consignee name] AS Consignatario, p.[Vessel name] AS Nave, "
+        f"{_sql_via('p.[Vessel type]')} AS Via, p.[Departure port] AS PuertoEmbarque, p.[Departure date] AS FechaZarpe, "
+        "DATEPART(ISO_WEEK, p.[Departure date]) AS SemanaZarpe, p.[Arrival port] AS Puerto, "
+        f"p.[Arrival country] AS PaisLlegada, p.ETA, p.[Arrival date] AS FechaLlegada{valores} "
+        "FROM [PalletsRowsCom] p WHERE p.[Departure date] IS NOT NULL)"
+    )
+
+def _ctes_embarques(nivel=2):
     """Las dos vistas de embarques con nombres de columna en castellano. Tienen las mismas
     filas (una por pallet o parte de pallet embarcado): la segunda agrega productor, planta y
     valores FOB, pero no trae contenedor ni pallets."""
@@ -2563,6 +2586,7 @@ def _ctes_embarques():
         "embarques_detalle": liquidacion("embarques_detalle", ""),
         "embarques_fob": liquidacion("embarques_fob", "l.[FOB (usd)] AS FOB, l.[Pool FOB (usd)] AS FOBPool, "
                                                       "l.Estatus AS Estado, "),
+        "embarques_pallets": _cte_embarques_pallets(con_fob=nivel >= 2),
     }
 
 # Packing_Consolidado: el embalaje de la fruta (la contraparte de la recepción). Se deja
@@ -2617,7 +2641,8 @@ def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA[
         ctes.append(_cte_packing(alcance))
     ctes.append(_cte_conversiones())
     if embarques:
-        ctes += [cte for nombre, cte in _ctes_embarques().items() if nombre in _tablas_embarques(embarques)]
+        nivel_emb = 2 if embarques is True else int(embarques)
+        ctes += [cte for nombre, cte in _ctes_embarques(nivel_emb).items() if nombre in _tablas_embarques(embarques)]
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
     if resto != consulta:
         return f"WITH {', '.join(ctes)}, {resto}"
@@ -3560,8 +3585,9 @@ DESCRIPCION_EMBARQUES = (
     "fila), FOBPool (USD, FOB del pool), Estado ('Liquidación' = liquidado, 'Factura' = solo facturado, valor "
     "provisorio), Arribado ('Sí'/'No'), Recibidor, CodigoRecibidor, Nave, Via, FechaZarpe, SemanaZarpe, Puerto, "
     "PaisLlegada (siempre informado), ETA, FechaLlegada, Mercado. Serie es el CALIBRE de lo embarcado (XL, J, "
-    "JJ, JJJ, G...). En embarques NO hay categoría: la categoría solo existe en packing (lo embalado en planta, que "
-    "no es lo mismo que lo embarcado). "
+    "JJ, JJJ, G...). "
+    "`embarques_pallets` (vista PalletsRowsCom: una fila por pallet o parte de pallet embarcado, SOLO la temporada en curso; para temporadas anteriores usa las otras tablas de embarques): Temporada, Productor, Grupo, Zonal (calculada), Planta (packing), FechaEmbalaje, Especie, Variedad, Envase (ej. 'CART 2.5 KG VF ATM'), PesoNetoEnvase, Etiqueta (marca, ej. 'PENGUIN'), Categoria (ej. '1'), Calibre (el calibre REAL: 4J, 4JD, 3J, 3JD, 2J, 2JD, J, JD, XL, XLD, L, LD...), Cajas (físicas), KilosNetos, Pallets (fracción; suma para contar pallets), Pallet (código del pallet), Contenedor, Recibidor, Consignatario, Nave, Via, PuertoEmbarque, FechaZarpe, SemanaZarpe (ISO), Puerto (de llegada), PaisLlegada, ETA, FechaLlegada, FOB y FOBPool (USD, por pallet). Úsala para CATEGORÍA, calibre real, envase, etiqueta o cualquier cruce por CONTENEDOR (ej. calibres por contenedor). La Serie de las otras tablas es la serie equivalente, que agrupa calibres (J, JJ, XL, JJJ, G). Ordena los calibres de MAYOR a menor: 4J, 4JD, 3J, 3JD, 2J, 2JD, J, JD, XL, XLD, L, LD (el número de J indica el tamaño; D va después de su calibre sin D). "
+
     "REGLAS DE AGUA SANTA para embarques: (1) 'cajas' sin más = cajas FÍSICAS (Cajas); las equivalentes solo si "
     "las piden. (2) Cuando hables de FOB, precio o retorno muestra SIEMPRE los dos: FOB y FOB pool. (3) USD por "
     "caja = SUM(FOB)/SUM(CajasEq), es decir por caja EQUIVALENTE (y lo mismo con FOBPool); dilo así: 'USD/caja "
@@ -3586,8 +3612,9 @@ DESCRIPCION_EMBARQUES_SIN_FOB = (
     "contenedor ni pallets): Temporada, Productor, Grupo, Zonal (calculada, igual que en datos), Planta, Especie, "
     "Variedad, TipoVariedad, Serie (el CALIBRE de lo embarcado: XL, J, JJ, JJJ, G...), Cajas, CajasEq, Arribado "
     "('Sí'/'No'), Recibidor, CodigoRecibidor, Nave, Via, FechaZarpe, SemanaZarpe, Puerto, PaisLlegada, ETA, "
-    "FechaLlegada, Mercado. Para productor, planta o calibre usa embarques_detalle. En embarques NO hay categoría: "
-    "la categoría solo existe en packing (lo embalado en planta, que no es lo mismo que lo embarcado). "
+    "FechaLlegada, Mercado. Para productor, planta o serie usa embarques_detalle. "
+    "`embarques_pallets` (vista PalletsRowsCom: una fila por pallet o parte de pallet embarcado, SOLO la temporada en curso; para temporadas anteriores usa las otras tablas de embarques): Temporada, Productor, Grupo, Zonal (calculada), Planta (packing), FechaEmbalaje, Especie, Variedad, Envase (ej. 'CART 2.5 KG VF ATM'), PesoNetoEnvase, Etiqueta (marca, ej. 'PENGUIN'), Categoria (ej. '1'), Calibre (el calibre REAL: 4J, 4JD, 3J, 3JD, 2J, 2JD, J, JD, XL, XLD, L, LD...), Cajas (físicas), KilosNetos, Pallets (fracción; suma para contar pallets), Pallet (código del pallet), Contenedor, Recibidor, Consignatario, Nave, Via, PuertoEmbarque, FechaZarpe, SemanaZarpe (ISO), Puerto (de llegada), PaisLlegada, ETA, FechaLlegada. Úsala para CATEGORÍA, calibre real, envase, etiqueta o cualquier cruce por CONTENEDOR (ej. calibres por contenedor). La Serie de las otras tablas es la serie equivalente, que agrupa calibres (J, JJ, XL, JJJ, G). Ordena los calibres de MAYOR a menor: 4J, 4JD, 3J, 3JD, 2J, 2JD, J, JD, XL, XLD, L, LD (el número de J indica el tamaño; D va después de su calibre sin D). "
+
     "Este usuario NO tiene habilitados los valores FOB, precios, retornos ni liquidaciones (no existe "
     "`embarques_fob` para él). REGLAS DE AGUA SANTA para embarques: (1) 'cajas' sin más = cajas FÍSICAS (Cajas); "
     "las equivalentes solo si las piden. (2) 'Destino' o 'mercado' = Mercado (región) y Puerto. (3) Para cruzar "
@@ -3669,10 +3696,12 @@ def _herramienta_informe(nivel, confirmaciones, bases=("datos", "packing")):
         }
         tool = json.loads(json.dumps(TOOL_GENERAR_INFORME).replace("<TABLAS>", tablas))
         if nivel >= 2:
-            tool["description"] += " Las secciones también pueden leer `embarques` y `embarques_fob` (ver consultar_sql)."
+            tool["description"] += (" Las secciones también pueden leer `embarques`, `embarques_fob` y "
+                                    "`embarques_pallets` (ver consultar_sql).")
         elif nivel == 1:
-            tool["description"] += (" Las secciones también pueden leer `embarques` y `embarques_detalle` (ver "
-                                    "consultar_sql); los valores FOB no están habilitados para este usuario.")
+            tool["description"] += (" Las secciones también pueden leer `embarques`, `embarques_detalle` y "
+                                    "`embarques_pallets` (ver consultar_sql); los valores FOB no están habilitados "
+                                    "para este usuario.")
         if confirmaciones:
             tool["description"] += (" Con fuente='confirmaciones' una sección (o las cifras clave, con fuente_kpis) "
                                     "lee el historial de confirmaciones y ajustes en vez de SQL Server.")
@@ -3748,7 +3777,8 @@ def _prompt_estable():
     lista_productores = ", ".join(PRODUCTORES_CONOCIDOS) or "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
     lista_grupos = ", ".join(GRUPOS_CONOCIDOS) or "(lista no disponible por ahora, usa el nombre tal como lo escriba el usuario)"
 
-    return f"""Eres el asistente de cosecha de Agua Santa en WhatsApp. Conversas como un chat de IA: entiendes
+    return f"""Eres el Asistente EAS Agua Santa, el asistente del equipo EAS de Agua Santa en WhatsApp (si te
+preguntan cómo te llamas, ese es tu nombre). Conversas como un chat de IA: entiendes
 preguntas abiertas y de seguimiento, mantienes el hilo de la conversación, encadenas las consultas que
 hagan falta, analizas los resultados y respondes de forma clara y útil. Te escriben desde el celular
 personas del negocio: gerencia, el equipo EAS de estimaciones, zonales y productores.
@@ -4103,8 +4133,9 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
     if nivel == 1:
         partes.append(
             "EMBARQUES: este usuario puede consultar los embarques de exportación (cajas, pallets, "
-            "clientes, naves, puertos, mercados, productor, planta y calibre) con las tablas `embarques` "
-            "y `embarques_detalle` de consultar_sql y generar_informe, pero NO tiene habilitados los "
+            "clientes, naves, puertos, mercados, productor, planta, categoría, calibre y contenedor) con "
+            "las tablas `embarques`, `embarques_detalle` y `embarques_pallets` de consultar_sql y "
+            "generar_informe, pero NO tiene habilitados los "
             "valores FOB, precios, retornos ni "
             "liquidaciones. Si los pide, explícale con amabilidad que esa información no está "
             "habilitada para su usuario y que puede pedírsela a Edson Lazo."
@@ -4119,8 +4150,9 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
     elif nivel >= 2:
         partes.append(
             "EMBARQUES: este usuario puede consultar los embarques de exportación (cajas, pallets, "
-            "clientes, naves, puertos, mercados y valores FOB) con las tablas `embarques` y "
-            "`embarques_fob` de consultar_sql y generar_informe. Sigue las reglas de Agua Santa que "
+            "clientes, naves, puertos, mercados, categoría, calibre, contenedor y valores FOB) con las "
+            "tablas `embarques`, `embarques_fob` y `embarques_pallets` de consultar_sql y generar_informe. "
+            "Sigue las reglas de Agua Santa que "
             "vienen en la descripción de consultar_sql (cajas físicas por defecto, FOB y FOB pool "
             "juntos, USD por caja equivalente, avisar lo facturado sin liquidar)."
         )
@@ -6936,7 +6968,7 @@ def generar_pdf_informe(informe):
     doc = BaseDocTemplate(
         buffer, pagesize=tamano_pagina, leftMargin=margen, rightMargin=margen,
         topMargin=19 * mm, bottomMargin=15 * mm, title=informe["titulo"],
-        author="Asistente de Cosecha Agua Santa",
+        author="Asistente EAS Agua Santa",
     )
     generado = datetime.now().strftime("%d-%m-%Y %H:%M")
 
@@ -6947,7 +6979,7 @@ def generar_pdf_informe(informe):
         canvas.rect(0, alto_pag - 11 * mm, ancho_pag, 11 * mm, stroke=0, fill=1)
         canvas.setFillColor(_color("#ffffff"))
         canvas.setFont("Helvetica-Bold", 9)
-        canvas.drawString(margen, alto_pag - 7 * mm, "AGUA SANTA  ·  Asistente de Cosecha")
+        canvas.drawString(margen, alto_pag - 7 * mm, "AGUA SANTA  ·  Asistente EAS")
         canvas.setFont("Helvetica", 8)
         canvas.drawRightString(ancho_pag - margen, alto_pag - 7 * mm, f"Generado el {generado}")
         canvas.setFillColor(_color(COLOR_TINTA_SUAVE))
@@ -7132,7 +7164,7 @@ def generar_excel_informe(informe):
     if informe.get("subtitulo"):
         hoja.cell(2, 1, informe["subtitulo"]).font = Font(size=10, color=COLOR_TINTA_2[1:])
     hoja.cell(3, 1, f"Generado el {datetime.now().strftime('%d-%m-%Y %H:%M')} por el "
-                    f"Asistente de Cosecha Agua Santa").font = Font(size=8, italic=True,
+                    f"Asistente EAS Agua Santa").font = Font(size=8, italic=True,
                                                                     color=COLOR_TINTA_SUAVE[1:])
     fila = 5
 
@@ -7436,6 +7468,8 @@ def _notas_de_fuente(consultas):
         notas.append("Confirmaciones y ajustes según el historial del Asistente (cuestionarios de las "
                      "08:00 y 15:00, reportes espontáneos y resúmenes a plantas). Los ajustes son lo que "
                      "informaron los zonales: no modifican la base Control EAS.")
+    if re.search(r"\bembarques_pallets\b", texto):
+        notas.append("Categoría, calibre, envase y contenedor por pallet según PalletsRowsCom (temporada en curso).")
     if re.search(r"\bembarques_detalle\b", texto):
         notas.append("Productor, planta y calibre de lo embarcado según Embarque-Liquidacion-PBI (sin valores FOB).")
     if re.search(r"\bembarques_fob\b", texto):
