@@ -88,6 +88,12 @@ ALERTA_SEMANAL_HORA = os.getenv("ALERTA_SEMANAL_HORA", "08:00")
 # Resumen de cierre a las plantas: lo previsto hoy para su planta con lo que confirmaron o
 # ajustaron los zonales en la tarde (después del cuestionario de las 15:00).
 RESUMEN_PLANTAS_HORA = os.getenv("RESUMEN_PLANTAS_HORA", "18:00")
+# Informes diarios de cosecha y de procesos (pedido de Edson, 09-11-2026): a todos los usuarios,
+# cada uno con su alcance y sus bases. INFORMES_DIARIOS_HORA vacío los apaga.
+INFORMES_DIARIOS_HORA = os.getenv("INFORMES_DIARIOS_HORA", "10:30")
+INFORMES_DIARIOS_PERFILES = tuple(
+    p.strip() for p in os.getenv("INFORMES_DIARIOS_PERFILES", "admin,gerencia,eas,zonal,productor,planta").split(",")
+    if p.strip())
 UMBRAL_DESVIACION_PCT = float(os.getenv("UMBRAL_DESVIACION_PCT", "15"))
 # Variedades con estimado acumulado bajo este mínimo no generan alerta (evita ruido de
 # variedades chicas donde un % de desviación grande son pocos kilos).
@@ -312,6 +318,43 @@ def inicializar_db_local():
     # confirmó qué al armar el resumen de cierre de cada planta.
     if "productores" not in columnas_cuest:
         conn.execute("ALTER TABLE cuestionarios ADD COLUMN productores TEXT")
+    # referencia = qué hay que hacer al entregar un mensaje en cola además de mandar su texto:
+    # 'aprobacion:<id>' (marcar entregada la solicitud al zonal) o 'informe:<tipo>:<fecha>'
+    # (armar y mandar el informe diario en ese momento, con las cifras al día).
+    if "referencia" not in [fila[1] for fila in conn.execute("PRAGMA table_info(mensajes_pendientes)")]:
+        conn.execute("ALTER TABLE mensajes_pendientes ADD COLUMN referencia TEXT")
+    # Solicitudes de ajuste de los productores (desde el 09-11-2026): el productor pide, el zonal
+    # responsable del fundo confirma o rechaza y recién ahí se avisa. Una fila por pedido; una
+    # corrección del productor deja la anterior como 'reemplazado'. El historial de cada paso
+    # queda además en `confirmaciones` (eventos por_confirmar, aprobado, rechazado, retirado).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS aprobaciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_hora TEXT DEFAULT (datetime('now', 'localtime')),
+            fecha TEXT,
+            tipo TEXT,
+            estado TEXT,
+            numero_origen TEXT,
+            nombre_origen TEXT,
+            cuestionario_id INTEGER,
+            turno TEXT,
+            productores TEXT,
+            aviso TEXT,
+            detalle TEXT,
+            texto_usuario TEXT,
+            estado_previo TEXT,
+            ajuste_previo TEXT,
+            zonales TEXT,
+            entregas TEXT,
+            resuelto_por TEXT,
+            nombre_resolutor TEXT,
+            fecha_hora_resolucion TEXT,
+            respuesta TEXT,
+            comentario TEXT,
+            detalle_final TEXT,
+            aviso_final TEXT
+        )
+    """)
     if not conn.execute("SELECT COUNT(*) FROM confirmaciones").fetchone()[0]:
         # Primera vez: se carga lo que ya había en `cuestionarios` (cada envío y la última
         # respuesta de cada uno; las correcciones anteriores no quedaron guardadas).
@@ -400,16 +443,15 @@ def numero_esta_permitido(numero):
 #   admin     - solo Edson: ve y hace todo, y recibe siempre los avisos del EAS.
 #   gerencia  - consulta toda la información; recibe avisos solo si se le activa.
 #   eas       - consulta toda la información de todos los productores; avisos solo si se activa.
-#   zonal     - responsable de sus fundos: consulta solo los suyos, responde los cuestionarios
-#               y AUTORIZA los ajustes que piden sus productores.
-#   productor - consulta solo sus fundos y PIDE ajustes de cosecha; su solicitud pasa por el
-#               zonal antes de darse por buena.
+#   zonal     - desde el 09-11-2026 CONSULTA todos los fundos (sin embarques), pero responde
+#               los cuestionarios, reporta ajustes y AUTORIZA los ajustes que piden sus
+#               productores SOLO de sus fundos asignados (ver fundos_que_confirma).
+#   productor - consulta solo sus fundos y PIDE ajustes de cosecha: el pedido le llega al zonal
+#               responsable del fundo y recién cuando lo confirma se avisa a gerencia, admin,
+#               EAS con avisos y la planta (ver solicitar_confirmacion_zonal).
 #   planta    - consulta SOLO lo que entra a su(s) planta(s) (columna Packing) y recibe cada día,
 #               al cierre, el resumen de lo que confirmaron o ajustaron los zonales para su
 #               planta. No responde cuestionarios, no reporta ajustes y no ve embarques.
-# PENDIENTE: el circuito de autorización (el productor pide y el zonal aprueba) todavía no
-# está implementado. Hoy cualquier ajuste reportado se registra directo y se avisa al EAS.
-# Mientras tanto no hay números con perfil productor, así que no se usa esa ruta.
 ROLES_VALIDOS = ("admin", "gerencia", "eas", "zonal", "productor", "planta")
 # Roles sin restricción de fundos (ven la información de todos los productores).
 ROLES_VEN_TODO = ("admin", "gerencia", "eas")
@@ -542,7 +584,20 @@ def alcance_de(numero):
     if rol == "planta":
         # Va antes del acceso total: una planta ve su planta y nada más.
         return AlcancePlanta(plantas_de(numero))
+    if rol == "zonal":
+        # Pedido de Edson (09-11-2026): un zonal CONSULTA todos los fundos aunque tenga fundos
+        # asignados. Lo que confirma o ajusta sigue acotado a los suyos (fundos_que_confirma).
+        return None
     if tiene_acceso_total(numero):
+        return None
+    return fundos_efectivos(numero)
+
+def fundos_que_confirma(numero):
+    """Fundos cuya cosecha puede confirmar o ajustar ese número (cuestionarios, reportes y
+    solicitudes de sus productores). None = todos: perfiles que ven todo, o un zonal o productor
+    con acceso total. Para un zonal es distinto de lo que CONSULTA (todo, ver alcance_de)."""
+    rol = rol_de(numero) or ROL_POR_DEFECTO
+    if rol not in ROLES_ACOTADOS or tiene_acceso_total(numero):
         return None
     return fundos_efectivos(numero)
 
@@ -2760,12 +2815,15 @@ def ejecutar_consulta_confirmaciones(sql, max_filas=MAX_FILAS_SQL):
         conn.close()
 
 EVENTO_HISTORIAL = {"confirmado": "confirmó", "ajustado": "ajuste", "corregido": "corrección",
-                    "anulado": "anuló su ajuste", "reporte": "aviso sin cuestionario"}
+                    "anulado": "anuló su ajuste", "reporte": "aviso sin cuestionario",
+                    "por_confirmar": "pidió confirmar a su zonal", "aprobado": "confirmó como zonal",
+                    "rechazado": "no confirmó como zonal", "retirado": "retiró su pedido"}
 
 def historial_confirmaciones(numero_consultante, persona=None, productor=None, desde=None, hasta=None,
                              incluir_confirmaciones=True, max_lineas=60):
-    """Una línea por confirmación, ajuste, corrección o anulación, en orden. Admin, EAS y gerencia
-    ven todo; un zonal o productor, lo que reportó él y lo que toca sus fundos."""
+    """Una línea por confirmación, ajuste, corrección o anulación, en orden. Admin, EAS, gerencia y
+    (desde el 09-11-2026, que consultan todo) los zonales ven todo; un productor, lo que reportó él
+    y lo que toca sus fundos."""
     try:
         hoy = date.today()
         hasta_d = datetime.strptime(hasta, "%Y-%m-%d").date() if hasta else hoy
@@ -2783,7 +2841,7 @@ def historial_confirmaciones(numero_consultante, persona=None, productor=None, d
     ).fetchall()
     conn.close()
     # Alcance: el equipo ve todo; un zonal o productor, lo propio y lo de sus fundos.
-    if numero_consultante and rol_de(numero_consultante) not in ROLES_CONFIRMACIONES \
+    if numero_consultante and rol_de(numero_consultante) not in ROLES_CONFIRMACIONES + ("zonal",) \
             and not tiene_acceso_total(numero_consultante):
         propio = normalizar_numero(numero_consultante)
         fundos = fundos_efectivos(propio)
@@ -3645,7 +3703,7 @@ def _herramienta_sql(nivel, bases=("datos", "packing")):
 
 TOOL_CONSULTAR_CONFIRMACIONES = {
     "name": "consultar_confirmaciones",
-    "description": "Consulta el HISTORIAL de confirmaciones y ajustes de proyección que registra el Asistente: cuestionarios enviados, confirmaciones, ajustes, correcciones, anulaciones, reportes espontáneos y resúmenes de cierre enviados a las plantas. Úsala para responder o armar informes sobre quién confirmó, quién ajustó, quién no respondió, qué se le avisó a cada planta, etc. Es la base propia del bot en SQLite (NO es SQL Server): usa sintaxis SQLite (date('now','localtime'), strftime, LIMIT en vez de TOP, || para concatenar, sin corchetes). Tabla `confirmaciones`, una fila por hecho; nada se pisa ni se borra. Columnas: id; fecha_hora (texto 'AAAA-MM-DD HH:MM:SS', hora de Chile); fecha (día de la cosecha al que se refiere, 'AAAA-MM-DD'); evento ('enviado' = se le envió el cuestionario; 'confirmado' = confirmó lo previsto tal cual; 'ajustado' = respondió con un ajuste; 'corregido' = cambió su respuesta anterior por un ajuste nuevo, que la reemplaza; 'anulado' = había ajustado y volvió a lo previsto, sin cambios (detalle = lo que quedó sin efecto); 'reporte' = avisó un ajuste sin tener un cuestionario abierto; 'resumen_planta' = se le envió a una planta el resumen de cierre); turno ('diario_am' = cuestionario de las 08:00, 'diario_pm' = confirmación de las 15:00, 'espontaneo', 'cierre_planta'; filas antiguas pueden decir 'manana'); numero; nombre; perfil (zonal, productor, planta, eas...); zonal (zonal al que está vinculado el número); productores (los de la tabla del cuestionario, separados por '; '); plantas (en resumen_planta); kg_previstos (kilos previstos de ese cuestionario o resumen); detalle (el ajuste tal como lo resumió el Asistente; en resumen_planta, cuántos productores quedaron confirmados, con ajuste o sin confirmar); texto_usuario (lo que escribió la persona); avisados (a cuántas personas se les avisó); cuestionario_id. El ÚLTIMO estado de un cuestionario es su evento más reciente por cuestionario_id; 'sin respuesta' = cuestionario con evento 'enviado' y ningún otro evento con ese cuestionario_id. El detalle completo (correcciones y anulaciones) se guarda desde el 02-11-2026; lo anterior se cargó con la última respuesta de cada cuestionario. Para un informe en PDF o Excel usa generar_informe con fuente='confirmaciones' en la sección.",
+    "description": "Consulta el HISTORIAL de confirmaciones y ajustes de proyección que registra el Asistente: cuestionarios enviados, confirmaciones, ajustes, correcciones, anulaciones, reportes espontáneos y resúmenes de cierre enviados a las plantas. Úsala para responder o armar informes sobre quién confirmó, quién ajustó, quién no respondió, qué se le avisó a cada planta, etc. Es la base propia del bot en SQLite (NO es SQL Server): usa sintaxis SQLite (date('now','localtime'), strftime, LIMIT en vez de TOP, || para concatenar, sin corchetes). Tabla `confirmaciones`, una fila por hecho; nada se pisa ni se borra. Columnas: id; fecha_hora (texto 'AAAA-MM-DD HH:MM:SS', hora de Chile); fecha (día de la cosecha al que se refiere, 'AAAA-MM-DD'); evento ('enviado' = se le envió el cuestionario; 'confirmado' = confirmó lo previsto tal cual; 'ajustado' = respondió con un ajuste; 'corregido' = cambió su respuesta anterior por un ajuste nuevo, que la reemplaza; 'anulado' = había ajustado y volvió a lo previsto, sin cambios (detalle = lo que quedó sin efecto); 'reporte' = avisó un ajuste sin tener un cuestionario abierto; 'resumen_planta' = se le envió a una planta el resumen de cierre; desde el 09-11-2026 también 'por_confirmar' = un productor pidió un ajuste y espera que su zonal lo confirme (aviso = lo que pidió), 'aprobado' = el zonal (numero/nombre) confirmó ese ajuste (aviso = lo que quedó firme), 'rechazado' = el zonal no lo confirmó, 'retirado' = el productor retiró su pedido antes de que el zonal respondiera); turno ('diario_am' = cuestionario de las 08:00, 'diario_pm' = confirmación de las 15:00, 'espontaneo', 'cierre_planta'; filas antiguas pueden decir 'manana'); numero; nombre; perfil (zonal, productor, planta, eas...); zonal (zonal al que está vinculado el número); productores (los de la tabla del cuestionario, separados por '; '); plantas (en resumen_planta); kg_previstos (kilos previstos de ese cuestionario o resumen); detalle (el ajuste tal como lo resumió el Asistente; en resumen_planta, cuántos productores quedaron confirmados, con ajuste o sin confirmar); texto_usuario (lo que escribió la persona); avisados (a cuántas personas se les avisó); cuestionario_id. El ÚLTIMO estado de un cuestionario es su evento más reciente por cuestionario_id; 'sin respuesta' = cuestionario con evento 'enviado' y ningún otro evento con ese cuestionario_id. El detalle completo (correcciones y anulaciones) se guarda desde el 02-11-2026; lo anterior se cargó con la última respuesta de cada cuestionario. Para un informe en PDF o Excel usa generar_informe con fuente='confirmaciones' en la sección.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -3731,9 +3789,32 @@ TOOL_REGISTRAR_CUESTIONARIO = {
             "aviso": {
                 "type": "string",
                 "description": "Obligatorio: lo que se le AVISA al equipo, en UNA o DOS líneas (máximo 250 caracteres): SOLO lo que la persona informó en ESTE mensaje, qué confirma o qué cambia (fundo o variedad, cifra y día). Ej: 'Hoy 03-11 no hay cosecha en ninguno de sus fundos (trisemanal 80.328 kg)', 'Confirma lo previsto para hoy', 'BOREAL: 2.000 kg menos el jueves'. Nunca repitas reportes anteriores ni el historial: eso lo ven pidiendo el historial."
+            },
+            "productores": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Productores/fundos a los que se refiere lo que informa, con el nombre EXACTO de la lista de productores (ej. ['AGRICOLA EL CONDOR LTDA']). Ponlo siempre que el usuario nombre un fundo o que se deduzca de su cuestionario; déjalo vacío solo si confirma o ajusta todo su cuestionario sin distinguir fundos. Con él se valida que sea un fundo suyo y se sabe a qué zonal y a qué planta avisar."
             }
         },
         "required": ["resultado", "aviso"]
+    },
+}
+
+# Respuesta del zonal a lo que pidió un productor de sus fundos (lista AJUSTES POR CONFIRMAR del
+# prompt). Solo se ofrece a zonales y a quien tenga solicitudes esperando su respuesta.
+TOOL_CONFIRMAR_AJUSTE = {
+    "name": "confirmar_ajuste_productor",
+    "description": "Registra la respuesta del usuario (zonal) a un ajuste de cosecha que pidió un productor de sus fundos, de la lista AJUSTES POR CONFIRMAR. 'confirmar' lo deja firme y avisa a gerencia, admin, EAS con avisos y la planta; 'rechazar' lo deja sin efecto y solo le avisa al productor. Úsala SOLO cuando el usuario responde a una de esas solicitudes ('sí', 'ok', 'confirmo', 'no', 'no, viene igual'). Si confirma pero con otra cifra ('sí, pero son 8.000'), es 'confirmar' con SU versión en detalle_final y aviso.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "solicitud": {"type": "integer", "description": "Número de la solicitud (#) de la lista AJUSTES POR CONFIRMAR."},
+            "decision": {"type": "string", "enum": ["confirmar", "rechazar"]},
+            "detalle_final": {"type": "string", "description": "Solo si el zonal cambia lo que pidió el productor: cómo queda el ajuste, con variedad, cifra y día."},
+            "aviso": {"type": "string", "description": "Solo si el zonal cambia lo pedido: lo que se avisa en una o dos líneas (máx. 250 caracteres), ej. 'LAPINS: la cosecha de hoy 09-11 cambia a 8.000 kg'."},
+            "comentario": {"type": "string", "description": "Motivo o comentario del zonal (sobre todo al rechazar), para contárselo al productor."}
+        },
+        "required": ["solicitud", "decision"]
     },
 }
 
@@ -4079,6 +4160,23 @@ def _prompt_variable(es_audio=False, cuestionario_activo=None, alcance=None, num
         if rol == "planta":
             quien += f", planta(s): {', '.join(plantas_de(numero_sender)) or 'ninguna asignada'}"
         partes.append(quien + ". Puedes llamarlo por su nombre de pila de vez en cuando, sin abusar.")
+        if rol == "zonal":
+            propios = fundos_que_confirma(numero_sender)
+            lista = ("todos los fundos (tiene acceso total)" if propios is None
+                     else ", ".join(propios) or "ninguno asignado todavía")
+            partes.append(f"""PERFIL ZONAL: puede CONSULTAR la cosecha de todos los fundos y productores, pero solo CONFIRMA,
+AJUSTA o reporta cambios de cosecha de sus fundos asignados: {lista}.
+Si informa un cambio de un fundo que no es suyo, no lo registres: dile con amabilidad que ese cambio lo
+informa el zonal de ese fundo o su productor. Al registrar un ajuste pon siempre en `productores` el o los
+fundos a los que se refiere.""")
+        elif rol == "productor":
+            partes.append("""PERFIL PRODUCTOR: cuando informa un ajuste o cambio de cosecha, registrar_respuesta_cuestionario NO lo
+deja firme: se lo manda al zonal responsable de su fundo para que lo confirme, y al productor se le avisa
+cuando el zonal responda. No le digas que ya se avisó a gerencia ni al EAS. Pon siempre en `productores`
+el fundo al que se refiere.""")
+        pendientes = aprobaciones_para(numero_sender)
+        if pendientes:
+            partes.append(_texto_aprobaciones(pendientes, cuestionario_activo))
 
     if es_audio:
         partes.append(
@@ -4120,6 +4218,13 @@ con el detalle de cómo queda el ajuste de ESE cuestionario (reemplaza al anteri
 días) y en `aviso` SOLO lo que cambió en este mensaje, o "confirmado" si vuelve a la proyección
 original. Si el mensaje es una consulta normal que no tiene relación con el
 cuestionario, atiéndela con las demás herramientas como siempre.""")
+        if cuestionario_activo.get("estado") == "ajuste_por_confirmar":
+            partes.append(
+                "Lo último que este usuario informó sobre ese cuestionario está ESPERANDO LA CONFIRMACIÓN DE SU "
+                "ZONAL: todavía no queda firme. Si corrige la cifra, regístrala igual (reemplaza el pedido anterior "
+                "y se le vuelve a pedir al zonal); si dice que lo deje como estaba, es resultado \"confirmado\" "
+                "(retira su pedido)."
+            )
     elif numero_sender and rol_de(numero_sender) != "planta":
         partes.append("""REPORTES DE AJUSTE: este usuario no tiene ningún cuestionario de proyección vigente ahora, pero
 IGUAL puede reportar en cualquier momento que su cosecha va a venir distinta de lo proyectado
@@ -4250,6 +4355,14 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             detalle_ajuste=tool_input.get("detalle_ajuste"),
             texto_usuario=texto_usuario,
             aviso=tool_input.get("aviso"),
+            productores=tool_input.get("productores") or None,
+        )
+
+    if tool_name == "confirmar_ajuste_productor":
+        return resolver_solicitud_ajuste(
+            numero_sender, tool_input.get("solicitud"), tool_input.get("decision"),
+            detalle_final=tool_input.get("detalle_final") or None, aviso=tool_input.get("aviso") or None,
+            comentario=tool_input.get("comentario") or None, texto_usuario=texto_usuario,
         )
 
     if tool_name == "consultar_sql":
@@ -4407,8 +4520,11 @@ def herramientas_disponibles(numero_sender=None):
     # reportes es de ellos y del equipo.
     reporta = not numero_sender or rol_de(numero_sender) != "planta"
     cosecha = TOOLS + [TOOL_PROYECCION] if "datos" in bases else []
+    # El zonal confirma lo que piden sus productores (y, en modo prueba, el admin que las recibe).
+    resuelve = bool(numero_sender) and (rol_de(numero_sender) == "zonal" or bool(aprobaciones_para(numero_sender)))
     return (cosecha + sql
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
+            + ([TOOL_CONFIRMAR_AJUSTE] if resuelve else [])
             + ([TOOL_HISTORIAL_CONFIRMACIONES] if reporta else []))
 
 def _historial_como_mensajes(numero_sender, nombres_herramientas):
@@ -4850,14 +4966,25 @@ def _ultimo_aviso(cuestionario_id):
     except Exception:
         return None
 
-def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, texto_usuario=None, aviso=None):
+def _productores_json(cuestionario):
+    try:
+        return json.loads(cuestionario["productores"]) if cuestionario and cuestionario.get("productores") else None
+    except (TypeError, ValueError):
+        return None
+
+def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, texto_usuario=None, aviso=None,
+                                     productores=None):
     """Registra (o corrige) la respuesta del cuestionario vigente del número. Mientras el
     cuestionario esté dentro de sus 24 h se puede responder de nuevo: la corrección REEMPLAZA
     lo registrado y vuelve a avisar al EAS. Si había un ajuste y la persona vuelve a lo
     previsto ("déjalo como estaba"), se avisa que el ajuste quedó anulado: si no, el EAS se
     quedaba con el aviso anterior como si siguiera vigente. Cada respuesta queda además en el
     historial `confirmaciones`. La llama Claude vía la herramienta registrar_respuesta_cuestionario;
-    lo que retorna se le envía al usuario."""
+    lo que retorna se le envía al usuario.
+
+    Desde el 09-11-2026: un zonal (o productor) solo confirma o ajusta sus fundos asignados, y lo
+    que cambia un PRODUCTOR no queda firme: va al zonal responsable del fundo
+    (solicitar_confirmacion_zonal) y recién cuando lo confirma se avisa a gerencia, admin y planta."""
     if not numero:
         return "No pude asociar tu reporte a un número de origen."
     if resultado not in ("confirmado", "ajustado"):
@@ -4866,6 +4993,23 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
     if not activo and resultado == "confirmado":
         # "confirmo" sin cuestionario que confirmar no tiene qué registrar.
         return "No tienes ningún cuestionario de proyección vigente para confirmar."
+    productores = [str(p).strip() for p in (productores or []) if p and str(p).strip()]
+    propios = fundos_que_confirma(numero)
+    if productores and propios is not None:
+        ajenos = [p for p in productores if not any(_fundo_coincide(f, p) for f in propios)]
+        if ajenos:
+            lista = _enumerar(propios[:10]) + ("…" if len(propios) > 10 else "")
+            return (f"No registré nada: solo puedes confirmar o ajustar la cosecha de tus fundos asignados "
+                    f"({lista or 'no tienes fundos asignados'}). {_enumerar(ajenos)} no "
+                    f"{'está' if len(ajenos) == 1 else 'están'} entre ellos: ese cambio lo informa su zonal o su productor.")
+    # El aviso dice SOLO lo que la persona informó en este mensaje (antes iba el detalle completo,
+    # que al corregir arrastraba todo lo anterior y llegaba como un historial ilegible).
+    aviso = _aviso_corto(aviso or detalle_ajuste or texto_usuario or "(sin detalle)")
+    if (rol_de(numero) or ROL_POR_DEFECTO) == "productor":
+        respuesta = _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuario, aviso, productores)
+        if respuesta is not None:
+            return respuesta
+        # Sin zonal que pueda confirmarlo: sigue el camino directo de siempre.
     es_correccion = bool(activo) and activo.get("estado") != "pendiente"
     es_espontaneo = not activo
     anula = es_correccion and resultado == "confirmado" and activo.get("estado") == "ajustado"
@@ -4883,13 +5027,15 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
             # 'espontaneo', para que quede en el mismo historial que el resto.
             cursor = conn.execute(
                 "INSERT INTO cuestionarios (numero, turno, mensaje, estado, respuesta, ajuste, "
-                "fecha_hora_respuesta) VALUES (?, 'espontaneo', ?, ?, ?, ?, datetime('now', 'localtime'))",
+                "fecha_hora_respuesta, productores) VALUES (?, 'espontaneo', ?, ?, ?, ?, "
+                "datetime('now', 'localtime'), ?)",
                 (
                     normalizar_numero(numero),
                     "(reporte espontáneo del usuario, sin cuestionario previo)",
                     resultado,
                     texto_usuario,
                     detalle_ajuste,
+                    json.dumps(productores, ensure_ascii=False) if productores else None,
                 )
             )
             cuestionario_id = cursor.lastrowid
@@ -4900,30 +5046,27 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         return "Tuve un problema registrando tu reporte. Intenta de nuevo en un momento."
 
     ajuste_anterior = (activo or {}).get("ajuste") or (activo or {}).get("respuesta") or "(sin detalle)"
-    # El aviso dice SOLO lo que la persona informó en este mensaje (antes iba el detalle completo,
-    # que al corregir arrastraba todo lo anterior y llegaba como un historial ilegible).
-    aviso = _aviso_corto(aviso or detalle_ajuste or texto_usuario or "(sin detalle)")
+    productores_aviso = productores or _productores_json(activo)
+    fecha_cuestionario = str((activo or {}).get("fecha_hora_envio") or date.today())[:10]
     avisados = None
     if resultado == "ajustado":
         avisados = notificar_ajuste_cuestionario(
             numero, aviso, es_correccion=es_correccion, texto_usuario=texto_usuario,
-            turno=activo["turno"] if activo else "espontaneo",
+            turno=activo["turno"] if activo else "espontaneo", productores=productores_aviso,
+            fecha=fecha_cuestionario,
         )
     elif anula:
         anulado = _aviso_corto(_ultimo_aviso(cuestionario_id) or ajuste_anterior, 200)
         avisados = notificar_ajuste_cuestionario(
             numero, aviso, anulacion=True, texto_usuario=texto_usuario, anulado=anulado,
-            turno=activo["turno"] if activo else "espontaneo",
+            turno=activo["turno"] if activo else "espontaneo", productores=productores_aviso,
+            fecha=fecha_cuestionario,
         )
-    try:
-        productores = json.loads(activo["productores"]) if activo and activo.get("productores") else None
-    except (TypeError, ValueError):
-        productores = None
     evento = ("reporte" if es_espontaneo else "anulado" if anula
               else "corregido" if es_correccion and resultado == "ajustado" else resultado)
     registrar_evento(
         evento, numero, turno=activo["turno"] if activo else "espontaneo",
-        fecha=(activo or {}).get("fecha_hora_envio") or date.today(), productores=productores,
+        fecha=(activo or {}).get("fecha_hora_envio") or date.today(), productores=productores_aviso,
         detalle=ajuste_anterior if anula else detalle_ajuste, texto_usuario=texto_usuario,
         avisados=avisados, cuestionario_id=cuestionario_id, aviso=aviso,
     )
@@ -4942,26 +5085,485 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         return "✅ Listo, dejé la proyección registrada como confirmada (sin ajustes)."
     return "✅ Proyección confirmada, quedó registrada. ¡Gracias!"
 
+# ---------------------------------------------------------------------------------------------
+# Circuito de aprobación (09-11-2026, pedido de Edson): el PRODUCTOR responde el cuestionario o
+# pide modificar una cosecha; el ZONAL responsable de ese fundo recibe "X avisa que …, ¿se
+# confirma?" y responde; recién con su confirmación se avisa a gerencia, admin (y EAS con avisos)
+# y a la planta. Confirmar lo previsto sin cambios no necesita aprobación.
+# ---------------------------------------------------------------------------------------------
+
+ESTADOS_SOLICITUD_ABIERTA = ("pendiente", "pendiente_plantilla")
+
+def zonales_responsables(fundos):
+    """Zonales que confirman lo que pide un productor de esos fundos: los que los tienen asignados
+    (por su zonal o a mano); si no hay, los zonales con acceso total. En modo prueba, los admin."""
+    if not ENVIOS_AUTOMATICOS_PRODUCCION:
+        return numeros_por_rol(("admin",))
+    zonales = numeros_por_rol(("zonal",))
+    especificos = [z for z in zonales if not z["acceso_total"] and any(
+        _fundo_coincide(fz, f) for fz in z["fundos"] for f in fundos)]
+    return especificos or [z for z in zonales if z["acceso_total"]]
+
+def _kg_cuestionario(cuestionario_id):
+    """Kilos previstos del cuestionario (los del evento 'enviado'), para la plantilla."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT kg_previstos FROM confirmaciones WHERE cuestionario_id = ? AND evento = 'enviado' "
+            "ORDER BY id LIMIT 1", (cuestionario_id,)
+        ).fetchone()
+        conn.close()
+        return (fila[0] or 0) if fila else 0
+    except Exception:
+        return 0
+
+def _leer_solicitud(solicitud_id):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.row_factory = sqlite3.Row
+    fila = conn.execute("SELECT * FROM aprobaciones WHERE id = ?", (solicitud_id,)).fetchone()
+    conn.close()
+    return dict(fila) if fila else None
+
+def _json_lista(texto):
+    try:
+        valor = json.loads(texto or "[]")
+        return valor if isinstance(valor, list) else []
+    except ValueError:
+        return []
+
+def _json_dict(texto):
+    try:
+        valor = json.loads(texto or "{}")
+        return valor if isinstance(valor, dict) else {}
+    except ValueError:
+        return {}
+
+def marcar_solicitud_entregada(solicitud_id, numero, cola=False):
+    """Anota que la solicitud ya le llegó a ese zonal (directo o al entregar la cola): desde ahí
+    aparece en su prompt. cola=True = se le acaba de entregar junto con un mensaje suyo."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute("SELECT entregas, estado FROM aprobaciones WHERE id = ?", (solicitud_id,)).fetchone()
+        if fila:
+            entregas = _json_dict(fila[0])
+            entregas[normalizar_numero(numero)] = {"hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "cola": cola}
+            estado = "pendiente" if fila[1] == "pendiente_plantilla" else fila[1]
+            conn.execute("UPDATE aprobaciones SET entregas = ?, estado = ? WHERE id = ?",
+                         (json.dumps(entregas), estado, solicitud_id))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error marcando entregada la solicitud {solicitud_id}: {str(e)}")
+
+def _descartar_en_cola(referencia):
+    """Lo que seguía en cola para esa referencia ya no corresponde (la solicitud se resolvió)."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.execute("UPDATE mensajes_pendientes SET entregado = 2, fecha_entrega = datetime('now', 'localtime') "
+                     "WHERE referencia = ? AND entregado = 0", (referencia,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error descartando mensajes en cola ({referencia}): {str(e)}")
+
+def aprobaciones_para(numero):
+    """Solicitudes de los últimos 3 días que esperan la respuesta de ese número y que ya le
+    llegaron (las que siguen en cola todavía no las ha visto)."""
+    if not numero:
+        return []
+    num = normalizar_numero(numero)
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        filas = [dict(f) for f in conn.execute(
+            "SELECT * FROM aprobaciones WHERE estado IN ('pendiente', 'pendiente_plantilla') "
+            "AND fecha_hora >= datetime('now', 'localtime', '-3 days') ORDER BY id"
+        )]
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo solicitudes pendientes: {str(e)}")
+        return []
+    resultado = []
+    for f in filas:
+        entrega = _json_dict(f["entregas"]).get(num)
+        if num in _json_lista(f["zonales"]) and entrega:
+            f["entrega"] = entrega
+            resultado.append(f)
+    return resultado
+
+def _texto_aprobaciones(pendientes, cuestionario_activo=None):
+    """Bloque del prompt con las solicitudes que el usuario (zonal) tiene por confirmar."""
+    ahora = datetime.now()
+    lineas = ["AJUSTES POR CONFIRMAR: productores de los fundos de este usuario pidieron estos cambios de "
+              "cosecha y esperan que él los confirme (el bot ya se los envió por WhatsApp):"]
+    for a in pendientes:
+        hora = datetime.strptime(a["entrega"]["hora"][:19], "%Y-%m-%d %H:%M:%S")
+        if a["tipo"] == "anulacion":
+            que = f"pide volver a lo previsto, sin su ajuste anterior ({_aviso_corto(a['ajuste_previo'] or '', 160)})"
+        else:
+            que = f"avisa: {a['aviso']}"
+        lineas.append(f"- Solicitud #{a['id']}, le llegó el {hora:%d-%m} a las {hora:%H:%M}: "
+                      f"{a['nombre_origen'] or a['numero_origen']} ({a['productores'] or 'sus fundos'}) {que}")
+        if a["entrega"].get("cola") and (ahora - hora).total_seconds() < 120:
+            lineas.append("  (se la acabo de entregar junto con este mensaje: el usuario todavía no la había visto, "
+                          "así que lo que escribió ahora NO es una respuesta a ella)")
+    lineas.append(
+        "Si el usuario responde a una de ellas (\"sí\", \"ok\", \"confirmo\", \"no\", \"no, son 8.000\", "
+        "\"no, viene igual\"), usa confirmar_ajuste_productor con su número de solicitud: \"confirmar\" (si da "
+        "otra cifra, es confirmar con SU versión en detalle_final y aviso) o \"rechazar\" (con el motivo en "
+        "comentario si lo dio). Si hay más de una y no queda claro a cuál responde, pregúntale.")
+    if cuestionario_activo and cuestionario_activo.get("estado") == "pendiente":
+        lineas.append(
+            f"Ojo: también tiene SU PROPIO cuestionario pendiente (enviado {str(cuestionario_activo.get('fecha_hora_envio'))[11:16]}). "
+            "Un «sí» o «confirmo» suelto responde al mensaje más reciente del bot entre los dos (compara las horas); "
+            "si llegaron con pocos minutos de diferencia o no queda claro, pregúntale a cuál se refiere antes de "
+            "registrar nada.")
+    lineas.append("Si escribe de otra cosa, atiéndelo normal y no insistas con estas solicitudes.")
+    return "\n".join(lineas)
+
+TIPO_AVISO_BOT = "aviso_bot"
+
+def anotar_aviso_en_historial(numero, texto):
+    """El bot le escribió a esa persona por su cuenta (una solicitud de ajuste, la respuesta de su
+    zonal): queda en su historial como un turno más, para que Claude lea el «sí» que venga después
+    como respuesta a ESE mensaje y no a lo último que conversaron. No abre la ventana de 24 h (ver
+    ventana_24h_abierta): esa la abre solo la persona al escribir."""
+    guardar_conversacion(normalizar_numero(numero), TIPO_AVISO_BOT,
+                         "(mensaje automático del Asistente, sin pregunta de la persona)", texto)
+
+def _avisar_persona(numero, mensaje, tipo, descripcion):
+    """Mensaje a una persona puntual (el productor que pidió, otro zonal): directo si su ventana de
+    24 h está abierta; si no, plantilla y cola."""
+    info = datos_numero(numero)
+    destinatario = {"numero": normalizar_numero(numero), "nombre": info.get("nombre"), "rol": info.get("rol")}
+    resultado = enviar_o_encolar(destinatario, mensaje, tipo, descripcion=descripcion)
+    if resultado == "directo":
+        anotar_aviso_en_historial(numero, mensaje)
+    return resultado != "error"
+
+def _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuario, aviso, productores):
+    """Camino de un productor. Devuelve el texto para él, o None si no hay zonal que pueda
+    confirmarlo (entonces se registra directo, como antes)."""
+    estado = (activo or {}).get("estado")
+    if resultado == "confirmado":
+        if estado == "ajuste_por_confirmar":
+            return retirar_solicitud(numero, activo, texto_usuario)
+        if estado != "ajustado":
+            return None  # confirmar lo previsto no necesita aprobación
+        tipo = "anulacion"  # tenía un ajuste firme y quiere volver a lo previsto
+    else:
+        tipo = "ajuste"
+    return solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle_ajuste, texto_usuario, productores)
+
+def solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle, texto_usuario, productores=None):
+    """El productor pide un cambio: queda como 'ajuste_por_confirmar' y se le pregunta al zonal
+    responsable del fundo. Devuelve el texto para el productor, o None si no hay zonal."""
+    num = normalizar_numero(numero)
+    fundos = productores or _productores_json(activo) or fundos_efectivos(num)
+    zonales = [z for z in zonales_responsables(fundos) if z["numero"] != num]
+    if not zonales:
+        logger.warning(f"Ajuste de {num} sin zonal que lo confirme (fundos {fundos}): se registra directo")
+        return None
+    quien = datos_numero(num).get("nombre") or num
+    turno = activo["turno"] if activo else "espontaneo"
+    fecha = str((activo or {}).get("fecha_hora_envio") or date.today())[:10]
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        if activo:
+            cid = activo["id"]
+            estado_previo, ajuste_previo = activo.get("estado"), activo.get("ajuste")
+            anterior = conn.execute(
+                "SELECT estado_previo, ajuste_previo FROM aprobaciones WHERE cuestionario_id = ? "
+                "AND estado IN ('pendiente', 'pendiente_plantilla') ORDER BY id DESC LIMIT 1", (cid,)
+            ).fetchone()
+            if anterior:  # corrige un pedido que aún no se resolvía: lo previo es lo de antes de ese pedido
+                estado_previo, ajuste_previo = anterior["estado_previo"], anterior["ajuste_previo"]
+            conn.execute(
+                "UPDATE cuestionarios SET estado = 'ajuste_por_confirmar', respuesta = ?, "
+                "fecha_hora_respuesta = datetime('now', 'localtime') WHERE id = ?", (texto_usuario, cid))
+        else:
+            estado_previo = ajuste_previo = None
+            cursor = conn.execute(
+                "INSERT INTO cuestionarios (numero, turno, mensaje, estado, respuesta, productores, "
+                "fecha_hora_respuesta) VALUES (?, 'espontaneo', ?, 'ajuste_por_confirmar', ?, ?, "
+                "datetime('now', 'localtime'))",
+                (num, "(reporte espontáneo del usuario, sin cuestionario previo)", texto_usuario,
+                 json.dumps(fundos, ensure_ascii=False)))
+            cid = cursor.lastrowid
+        reemplazadas = [f[0] for f in conn.execute(
+            "SELECT id FROM aprobaciones WHERE cuestionario_id = ? AND estado IN ('pendiente', 'pendiente_plantilla')",
+            (cid,))]
+        conn.execute(
+            "UPDATE aprobaciones SET estado = 'reemplazado', fecha_hora_resolucion = datetime('now', 'localtime') "
+            "WHERE cuestionario_id = ? AND estado IN ('pendiente', 'pendiente_plantilla')", (cid,))
+        cursor = conn.execute(
+            "INSERT INTO aprobaciones (fecha, tipo, estado, numero_origen, nombre_origen, cuestionario_id, turno, "
+            "productores, aviso, detalle, texto_usuario, estado_previo, ajuste_previo, zonales, entregas) "
+            "VALUES (?, ?, 'pendiente_plantilla', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')",
+            (fecha, tipo, num, quien, cid, turno, "; ".join(fundos), aviso, detalle, texto_usuario,
+             estado_previo, ajuste_previo, json.dumps([z["numero"] for z in zonales])))
+        sid = cursor.lastrowid
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error registrando la solicitud de ajuste de {num}: {str(e)}")
+        return "Tuve un problema registrando tu ajuste. Intenta de nuevo en un momento."
+    for anterior_id in reemplazadas:
+        _descartar_en_cola(f"aprobacion:{anterior_id}")
+
+    fundo_txt = _enumerar(fundos[:3]) + (" y otros" if len(fundos) > 3 else "")
+    if tipo == "anulacion":
+        cuerpo = (f"{quien} ({fundo_txt}) avisa que deja lo previsto sin cambios y anula su ajuste anterior "
+                  f"({_aviso_corto(ajuste_previo or '', 200)}).")
+    else:
+        cuerpo = f"{quien} ({fundo_txt}) avisa: {aviso}"
+    lineas = [f"🔔 {cuerpo}"]
+    escrito = " ".join(str(texto_usuario or "").split())
+    if escrito and len(escrito) <= 200 and escrito.lower() not in aviso.lower():
+        lineas.append(f"Escribió: «{escrito}»")
+    lineas.append("¿Se confirma? Respóndeme «sí», «no» (con el motivo) o la cifra correcta.")
+    origen = TURNO_AVISO.get(turno, "")
+    lineas.append(f"(Solicitud #{sid}{', corrige la anterior' if reemplazadas else ''}"
+                  f"{', ' + origen if origen else ''})")
+    mensaje = "\n".join(lineas)
+    kg = _kg_cuestionario(cid)
+    if not kg:  # aviso sin cuestionario: lo previsto hoy para esos fundos, para la plantilla
+        try:
+            kg = _totales_previstos(date.today(), fundos)[0]
+        except Exception:
+            kg = 0
+    llegaron = []
+    for z in zonales:
+        resultado = enviar_o_encolar(z, mensaje, "aprobacion", kg_plantilla=kg,
+                                     descripcion=f"{fundo_txt}: ajuste de {quien} por confirmar",
+                                     referencia=f"aprobacion:{sid}")
+        if resultado == "directo":
+            marcar_solicitud_entregada(sid, z["numero"])
+            anotar_aviso_en_historial(z["numero"], mensaje)
+        if resultado != "error":
+            llegaron.append(z)
+    registrar_evento(
+        "por_confirmar", num, turno=turno, fecha=fecha, productores=fundos,
+        detalle=detalle if tipo == "ajuste" else ajuste_previo, texto_usuario=texto_usuario,
+        avisados=len(llegaron), cuestionario_id=cid,
+        aviso=aviso if tipo == "ajuste" else f"Pide volver a lo previsto: {_aviso_corto(ajuste_previo or '', 160)}",
+    )
+    nombres = _enumerar([(z.get("nombre") or z["numero"]).split()[0] for z in zonales])
+    if not llegaron:
+        logger.error(f"Solicitud #{sid}: WhatsApp no aceptó el aviso a ningún zonal")
+        return (f"📝 Quedó registrado como *por confirmar*:\n{aviso}\nPero WhatsApp no aceptó el aviso a "
+                f"{nombres}: avísale tú o escríbele al equipo EAS.")
+    que = ("tu corrección" if reemplazadas else
+           "que vuelves a lo previsto" if tipo == "anulacion" else "tu ajuste")
+    return (f"📨 Le pedí a {nombres} que confirme {que}:\n{aviso}\n"
+            "Queda registrado como *por confirmar*; te aviso apenas responda.")
+
+def retirar_solicitud(numero, activo, texto_usuario):
+    """El productor deja sin efecto lo que pidió antes de que el zonal respondiera."""
+    num = normalizar_numero(numero)
+    cid = activo["id"]
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.row_factory = sqlite3.Row
+    fila = conn.execute(
+        "SELECT * FROM aprobaciones WHERE cuestionario_id = ? AND estado IN ('pendiente', 'pendiente_plantilla') "
+        "ORDER BY id DESC LIMIT 1", (cid,)).fetchone()
+    ap = dict(fila) if fila else {}
+    nuevo_estado = ap.get("estado_previo") if ap.get("estado_previo") in ("ajustado", "confirmado") else "confirmado"
+    conn.execute(
+        "UPDATE cuestionarios SET estado = ?, ajuste = ?, respuesta = ?, fecha_hora_respuesta = datetime('now', 'localtime') "
+        "WHERE id = ?", (nuevo_estado, ap.get("ajuste_previo") if nuevo_estado == "ajustado" else None, texto_usuario, cid))
+    if ap:
+        conn.execute("UPDATE aprobaciones SET estado = 'retirado', fecha_hora_resolucion = datetime('now', 'localtime') "
+                     "WHERE id = ?", (ap["id"],))
+    conn.commit()
+    conn.close()
+    avisados = []
+    if ap:
+        _descartar_en_cola(f"aprobacion:{ap['id']}")
+        quien = ap["nombre_origen"] or num
+        for z in _json_dict(ap["entregas"]):
+            if _avisar_persona(z, f"↩️ {quien} retiró su solicitud #{ap['id']} ({ap['aviso']}): ya no hay nada que confirmar.",
+                               "aprobacion_retirada", f"{quien} retiró su ajuste"):
+                avisados.append(datos_numero(z).get("nombre") or z)
+        registrar_evento("retirado", num, turno=ap["turno"], fecha=ap["fecha"],
+                         productores=[p for p in (ap["productores"] or "").split("; ") if p],
+                         texto_usuario=texto_usuario, avisados=len(avisados), cuestionario_id=cid,
+                         aviso=f"Retira su pedido: {ap['aviso']}")
+    queda = "Sigue vigente tu ajuste anterior." if nuevo_estado == "ajustado" else "Queda lo previsto, sin cambios."
+    a_quien = f" y le avisé a {_enumerar([n.split()[0] for n in avisados])}" if avisados else ""
+    return f"✅ Listo, retiré tu pedido de ajuste{a_quien}. {queda}"
+
+def resolver_solicitud_ajuste(numero, solicitud, decision, detalle_final=None, aviso=None, comentario=None,
+                              texto_usuario=None):
+    """El zonal confirma o rechaza lo que pidió un productor de sus fundos. Confirmar lo deja firme
+    en el cuestionario del productor y avisa a gerencia, admin, EAS con avisos y la planta;
+    rechazar lo deja como estaba y solo le avisa al productor."""
+    num = normalizar_numero(numero)
+    try:
+        solicitud = int(str(solicitud).lstrip("#"))
+    except (TypeError, ValueError):
+        return "ERROR: falta el número de la solicitud (#) que responde."
+    if decision not in ("confirmar", "rechazar"):
+        return "ERROR: decision debe ser 'confirmar' o 'rechazar'."
+    ap = _leer_solicitud(solicitud)
+    if not ap:
+        return f"No existe la solicitud #{solicitud}."
+    zonales = _json_lista(ap["zonales"])
+    if num not in zonales:
+        return f"La solicitud #{solicitud} no te corresponde: es de fundos que confirma otro zonal."
+    if ap["estado"] not in ESTADOS_SOLICITUD_ABIERTA:
+        texto = {"confirmado": f"ya la confirmó {ap['nombre_resolutor']}",
+                 "rechazado": f"ya la rechazó {ap['nombre_resolutor']}",
+                 "reemplazado": "el productor la reemplazó por una nueva",
+                 "retirado": "el productor la retiró"}.get(ap["estado"], ap["estado"])
+        return f"La solicitud #{solicitud} ya no está pendiente: {texto}."
+    nombre_zonal = datos_numero(num).get("nombre") or num
+    quien = ap["nombre_origen"] or ap["numero_origen"]
+    fundos = [p for p in (ap["productores"] or "").split("; ") if p]
+    cid = ap["cuestionario_id"]
+    anulacion = ap["tipo"] == "anulacion"
+    ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    if decision == "confirmar":
+        cambiado = bool((detalle_final or "").strip()) and not anulacion
+        final_detalle = ((detalle_final if cambiado else ap["detalle"]) or "").strip() or None
+        final_aviso = _aviso_corto((aviso or detalle_final) if cambiado else ap["aviso"])
+        if anulacion:
+            conn.execute("UPDATE cuestionarios SET estado = 'confirmado', ajuste = NULL WHERE id = ?", (cid,))
+        else:
+            conn.execute("UPDATE cuestionarios SET estado = 'ajustado', ajuste = ? WHERE id = ?",
+                         (f"{final_detalle or final_aviso} (confirmado por {nombre_zonal})", cid))
+        conn.execute(
+            "UPDATE aprobaciones SET estado = 'confirmado', resuelto_por = ?, nombre_resolutor = ?, "
+            "fecha_hora_resolucion = ?, respuesta = ?, comentario = ?, detalle_final = ?, aviso_final = ? WHERE id = ?",
+            (num, nombre_zonal, ahora, texto_usuario, comentario, final_detalle, final_aviso, solicitud))
+        conn.commit()
+        conn.close()
+        _descartar_en_cola(f"aprobacion:{solicitud}")
+        avisados = notificar_ajuste_cuestionario(
+            ap["numero_origen"], final_aviso, es_correccion=(ap["estado_previo"] == "ajustado" and not anulacion),
+            anulacion=anulacion, texto_usuario=ap["texto_usuario"],
+            anulado=_aviso_corto(ap["ajuste_previo"] or "", 200) if anulacion else None, turno=ap["turno"],
+            confirmado_por=nombre_zonal, productores=fundos, fecha=ap["fecha"], excluir={num},
+            original=ap["aviso"] if cambiado else None,
+        )
+        registrar_evento(
+            "aprobado", num, turno=ap["turno"], fecha=ap["fecha"], productores=fundos, detalle=final_detalle,
+            texto_usuario=texto_usuario, avisados=avisados, cuestionario_id=cid,
+            aviso=_aviso_corto(f"Confirma lo que avisó {quien}: "
+                               + ("vuelve a lo previsto" if anulacion else final_aviso)),
+        )
+        que = "que vuelvas a lo previsto" if anulacion else "tu ajuste"
+        mensaje = f"✅ {nombre_zonal} confirmó {que}{' con un cambio' if cambiado else ''}:\n{final_aviso}"
+        if comentario:
+            mensaje += f"\nComentario: {comentario}"
+        _avisar_persona(ap["numero_origen"], mensaje, "aprobacion_respuesta", f"respuesta de {nombre_zonal} a tu ajuste")
+        return (f"✅ Listo, confirmado{' con tu cambio' if cambiado else ''}: {final_aviso}\n"
+                f"Le avisé a {quien} y a {avisados} persona(s) de gerencia, admin, EAS y planta.")
+    # Rechazo: el cuestionario del productor vuelve a como estaba antes del pedido.
+    nuevo_estado = ap["estado_previo"] if ap["estado_previo"] in ("pendiente", "confirmado", "ajustado") else "rechazado"
+    conn.execute("UPDATE cuestionarios SET estado = ?, ajuste = ? WHERE id = ?",
+                 (nuevo_estado, ap["ajuste_previo"] if nuevo_estado == "ajustado" else None, cid))
+    conn.execute(
+        "UPDATE aprobaciones SET estado = 'rechazado', resuelto_por = ?, nombre_resolutor = ?, "
+        "fecha_hora_resolucion = ?, respuesta = ?, comentario = ? WHERE id = ?",
+        (num, nombre_zonal, ahora, texto_usuario, comentario, solicitud))
+    conn.commit()
+    conn.close()
+    _descartar_en_cola(f"aprobacion:{solicitud}")
+    registrar_evento(
+        "rechazado", num, turno=ap["turno"], fecha=ap["fecha"], productores=fundos, detalle=ap["detalle"],
+        texto_usuario=texto_usuario, avisados=1, cuestionario_id=cid,
+        aviso=_aviso_corto(f"No confirma lo que avisó {quien}: {ap['aviso']}"
+                           + (f" (motivo: {comentario})" if comentario else "")),
+    )
+    queda = {"ajustado": "Sigue vigente tu ajuste anterior.",
+             "pendiente": "Tu cuestionario sigue abierto: puedes responderlo de nuevo."}.get(
+                 nuevo_estado, "Queda lo previsto, sin cambios.")
+    que = "que vuelvas a lo previsto" if anulacion else "tu ajuste"
+    mensaje = f"❌ {nombre_zonal} no confirmó {que}: {ap['aviso']}"
+    if comentario:
+        mensaje += f"\nMotivo: {comentario}"
+    _avisar_persona(ap["numero_origen"], mensaje + f"\n{queda}", "aprobacion_respuesta",
+                    f"respuesta de {nombre_zonal} a tu ajuste")
+    for otro in _json_dict(ap["entregas"]):
+        if otro != num:
+            _avisar_persona(otro, f"ℹ️ {nombre_zonal} no confirmó la solicitud #{solicitud} de {quien}: no hay cambios.",
+                            "aprobacion_resuelta", f"solicitud de {quien} resuelta")
+    return f"Listo, quedó como no confirmado y le avisé a {quien}. Al resto no se le avisa porque no hay cambios."
+
 TURNO_AVISO = {"diario_am": "cuestionario de las 08:00", "diario_pm": "confirmación de las 15:00",
                "espontaneo": "sin cuestionario"}
 
+def plantas_de_productores(productores, fecha=None):
+    """Plantas a las que llega la fruta de esos productores: las de su Trisemanal de ese día o, si
+    no hay, las de su recepción de los últimos 30 días. Sirve para avisarle a la planta."""
+    productores = [p for p in (productores or []) if p]
+    if not productores:
+        return []
+    if isinstance(fecha, str):
+        try:
+            fecha = datetime.strptime(fecha[:10], "%Y-%m-%d").date()
+        except ValueError:
+            fecha = None
+    fecha = fecha or date.today()
+    conn = conectar_sql()
+    if not conn:
+        return []
+    try:
+        sql_f, params_f = _sql_fundos(productores)
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT DISTINCT LTRIM(RTRIM(Packing)) FROM {RECEPCION_SQL} AS Recepcion_Consolidada
+            WHERE [Base Origen] = ? AND CAST(Fecha AS DATE) = ? AND KgsRecepcionados IS NOT NULL
+              AND Packing IS NOT NULL AND {sql_f}
+        """, [BASE_ORIGEN_CUESTIONARIO, fecha.strftime("%Y-%m-%d"), *params_f])
+        plantas = [f[0] for f in cursor.fetchall() if f[0]]
+        if not plantas:
+            cursor.execute(f"""
+                SELECT DISTINCT LTRIM(RTRIM(Packing)) FROM {RECEPCION_SQL} AS Recepcion_Consolidada
+                WHERE [Base Origen] = ? AND CAST(Fecha AS DATE) BETWEEN ? AND ?
+                  AND Packing IS NOT NULL AND {sql_f}
+            """, [BASE_ORIGEN_REAL, (fecha - timedelta(days=30)).strftime("%Y-%m-%d"),
+                  fecha.strftime("%Y-%m-%d"), *params_f])
+            plantas = [f[0] for f in cursor.fetchall() if f[0]]
+        return plantas
+    except Exception as e:
+        logger.error(f"Error buscando las plantas de {productores}: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
 def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False, anulacion=False,
-                                  texto_usuario=None, anulado=None, turno=None):
-    """Aviso inmediato cuando alguien ajusta su proyección (o anula un ajuste anterior):
-    siempre al admin, a gerencia y EAS si tienen las notificaciones activadas, y a los
-    zonales que tengan asignado alguno de los fundos de quien reporta (un zonal solo se
-    entera de lo suyo). Es corto: SOLO lo que la persona informó en este mensaje (`detalle`
-    = el aviso), lo que escribió si es breve, y cómo pedir el historial. Devuelve a cuántas
-    personas les llegó."""
+                                  texto_usuario=None, anulado=None, turno=None, confirmado_por=None,
+                                  productores=None, fecha=None, excluir=(), original=None):
+    """Aviso inmediato cuando un ajuste queda firme (o se anula uno anterior): siempre al admin,
+    a gerencia y EAS si tienen las notificaciones activadas, a los zonales que tengan asignado
+    alguno de esos fundos (un zonal solo se entera de lo suyo) y, desde el 09-11-2026, a las
+    plantas a las que llega esa fruta. Si lo pidió un productor, el aviso sale recién cuando su
+    zonal lo confirma (confirmado_por). Es corto: SOLO lo que se informó en este mensaje
+    (`detalle` = el aviso), lo que escribió si es breve, y cómo pedir el historial. Devuelve a
+    cuántas personas les llegó."""
     try:
         num = normalizar_numero(numero_origen)
         info = next((n for n in listar_numeros_permitidos() if n["numero"] == num), None)
         quien = (info.get("nombre") if info else None) or num
-        fundos_origen = fundos_efectivos(num)
+        fundos_origen = [p for p in (productores or []) if p] or fundos_efectivos(num)
         hora = datetime.now().strftime("%H:%M")
         origen = TURNO_AVISO.get(turno or "", "")
         cuando = f" ({origen}, {hora})" if origen else f" ({hora})"
-        if anulacion:
+        nombre_pila = (quien or "").split()[0] if quien and not quien.isdigit() else quien
+        if confirmado_por and anulacion:
+            lineas = [f"↩️ {confirmado_por} confirmó que {quien} anula su ajuste{cuando}: queda lo previsto sin cambios."]
+            if anulado:
+                lineas.append(f"Ya no corre: {anulado}")
+        elif confirmado_por:
+            verbo = "la corrección" if es_correccion else "el ajuste"
+            lineas = [f"✅ {confirmado_por} confirmó {verbo} que avisó {quien}{cuando}:", detalle]
+            if original:
+                lineas.append(f"{nombre_pila} había informado: {original}")
+        elif anulacion:
             lineas = [f"↩️ {quien} anuló su ajuste{cuando}: deja lo previsto sin cambios."]
             if anulado:
                 lineas.append(f"Ya no corre: {anulado}")
@@ -4970,23 +5572,33 @@ def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False, a
         else:
             lineas = [f"📝 {quien} reportó un ajuste{cuando}:", detalle]
         escrito = " ".join(str(texto_usuario or "").split())
-        if escrito and len(escrito) <= 200 and escrito.lower() not in detalle.lower():
+        if escrito and len(escrito) <= 200 and escrito.lower() not in detalle.lower() and not original:
             lineas.append(f"Escribió: «{escrito}»")
-        nombre_pila = (quien or "").split()[0] if quien and not quien.isdigit() else quien
         lineas.append(f"Para ver todo lo que ha confirmado o cambiado, pídeme «historial de {nombre_pila}».")
         mensaje = "\n".join(lineas)
 
         destinatarios = destinatarios_envios(("eas", "admin", "gerencia"))
         if ENVIOS_AUTOMATICOS_PRODUCCION:
+            ya = {d["numero"] for d in destinatarios}
             # Zonales: solo los que comparten fundo con quien reporta.
             for zonal in numeros_por_rol(("zonal",)):
                 comparte = any(
                     _fundo_coincide(f_zonal, f_origen)
                     for f_zonal in zonal["fundos"] for f_origen in fundos_origen
                 )
-                if comparte and zonal["numero"] not in {d["numero"] for d in destinatarios}:
+                if comparte and zonal["numero"] not in ya:
                     destinatarios.append(zonal)
-        destinatarios = [d for d in destinatarios if d["numero"] != num]
+                    ya.add(zonal["numero"])
+            # Plantas: las que reciben la fruta de esos fundos (Trisemanal del día o recepción reciente).
+            plantas_usuarios = numeros_por_rol(("planta",))
+            if plantas_usuarios:
+                destino = {_normalizar_nombre(p) for p in plantas_de_productores(fundos_origen, fecha)}
+                for p in plantas_usuarios:
+                    if p["numero"] not in ya and destino & {_normalizar_nombre(x) for x in plantas_de(p["numero"])}:
+                        destinatarios.append(p)
+                        ya.add(p["numero"])
+        excluir = {normalizar_numero(x) for x in (excluir or ())}
+        destinatarios = [d for d in destinatarios if d["numero"] != num and d["numero"] not in excluir]
         # Solo se registran los que Meta aceptó: antes se anotaba el aviso como enviado
         # aunque el envío hubiera fallado, y el panel mostraba entregas que nunca ocurrieron.
         aceptados = [d for d in destinatarios if enviar_whatsapp(d["numero"], mensaje)]
@@ -5146,15 +5758,15 @@ def _totales_previstos(fecha, fundos):
     total_bultos = sum((f[4] or 0) for f in filas)
     return total_kg, total_bultos
 
-def encolar_mensaje_pendiente(numero, tipo, mensaje, cuestionario_id=None):
+def encolar_mensaje_pendiente(numero, tipo, mensaje, cuestionario_id=None, referencia=None):
     """Guarda un mensaje que no se pudo enviar por la ventana de 24 h, para entregarlo
     apenas la persona responda a la plantilla."""
     try:
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.execute(
-            "INSERT INTO mensajes_pendientes (numero, tipo, mensaje, cuestionario_id) "
-            "VALUES (?, ?, ?, ?)",
-            (normalizar_numero(numero), tipo, mensaje, cuestionario_id)
+            "INSERT INTO mensajes_pendientes (numero, tipo, mensaje, cuestionario_id, referencia) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (normalizar_numero(numero), tipo, mensaje, cuestionario_id, referencia)
         )
         conn.commit()
         conn.close()
@@ -5165,12 +5777,13 @@ def encolar_mensaje_pendiente(numero, tipo, mensaje, cuestionario_id=None):
 
 def entregar_mensajes_pendientes(numero):
     """La persona nos escribió, así que la ventana de 24 h está abierta: se le entregan los
-    mensajes que habían quedado en cola (del más antiguo al más nuevo). Devuelve cuántos."""
+    mensajes que habían quedado en cola (del más antiguo al más nuevo). Devuelve cuántos.
+    entregado: 0 = en cola, 1 = entregado, 2 = descartado (ya no correspondía)."""
     try:
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.row_factory = sqlite3.Row
         filas = conn.execute(
-            "SELECT id, tipo, mensaje, cuestionario_id FROM mensajes_pendientes "
+            "SELECT id, tipo, mensaje, cuestionario_id, referencia FROM mensajes_pendientes "
             "WHERE numero = ? AND entregado = 0 "
             "AND fecha_hora >= datetime('now', 'localtime', '-3 days') ORDER BY id",
             (normalizar_numero(numero),)
@@ -5180,7 +5793,14 @@ def entregar_mensajes_pendientes(numero):
             return 0
         entregados = 0
         for fila in filas:
-            if not enviar_whatsapp(numero, fila["mensaje"]):
+            referencia = fila["referencia"] or ""
+            if referencia.startswith("informe:"):
+                # El informe diario se arma al entregarlo, con las cifras de ese momento.
+                _, tipo_informe, dia = referencia.split(":", 2)
+                ok = enviar_informe_diario_a(numero, tipo_informe, datetime.strptime(dia, "%Y-%m-%d").date()) != "error"
+            else:
+                ok = enviar_whatsapp(numero, fila["mensaje"])
+            if not ok:
                 logger.error(f"No pude entregar el mensaje en cola {fila['id']} a {numero}")
                 continue
             conn = sqlite3.connect(DB_LOCAL_PATH)
@@ -5197,6 +5817,10 @@ def entregar_mensajes_pendientes(numero):
                 )
             conn.commit()
             conn.close()
+            if referencia.startswith("aprobacion:"):
+                marcar_solicitud_entregada(int(referencia.split(":")[1]), numero, cola=True)
+            if (fila["tipo"] or "").startswith("aprobacion"):
+                anotar_aviso_en_historial(numero, fila["mensaje"])
             entregados += 1
             logger.info(f"Entregado a {numero} el mensaje en cola de tipo '{fila['tipo']}'")
         return entregados
@@ -5204,7 +5828,8 @@ def entregar_mensajes_pendientes(numero):
         logger.error(f"Error entregando mensajes pendientes: {str(e)}")
         return 0
 
-def enviar_o_encolar(destinatario, mensaje, tipo, kg_plantilla=0, cuestionario_id=None, descripcion=None):
+def enviar_o_encolar(destinatario, mensaje, tipo, kg_plantilla=0, cuestionario_id=None, descripcion=None,
+                     referencia=None):
     """Envía el mensaje si la ventana de 24 h está abierta; si no, manda la plantilla de
     reenganche y lo deja en cola. Devuelve 'directo', 'plantilla' o 'error'."""
     numero = destinatario["numero"]
@@ -5216,7 +5841,7 @@ def enviar_o_encolar(destinatario, mensaje, tipo, kg_plantilla=0, cuestionario_i
     )
     if not ok:
         return "error"
-    encolar_mensaje_pendiente(numero, tipo, mensaje, cuestionario_id=cuestionario_id)
+    encolar_mensaje_pendiente(numero, tipo, mensaje, cuestionario_id=cuestionario_id, referencia=referencia)
     return "plantilla"
 
 def _ajuste_registrado_hoy(numero, fecha=None):
@@ -5346,11 +5971,14 @@ def _responsables_del_dia(fecha):
     conn = sqlite3.connect(DB_LOCAL_PATH)
     conn.row_factory = sqlite3.Row
     filas = conn.execute(
-        "SELECT c.numero, c.estado, c.ajuste, c.productores, n.nombre, n.acceso_total "
+        "SELECT c.id, c.numero, c.estado, c.ajuste, c.productores, n.nombre, n.acceso_total "
         "FROM cuestionarios c LEFT JOIN numeros_permitidos n ON n.numero = c.numero "
         "WHERE c.turno = 'diario_pm' AND date(c.fecha_hora_envio) = ? ORDER BY c.id",
         (fecha.strftime("%Y-%m-%d"),)
     ).fetchall()
+    # Lo que pidió un productor y su zonal todavía no confirma.
+    pedidos = {f[0]: f[1] for f in conn.execute(
+        "SELECT cuestionario_id, aviso FROM aprobaciones WHERE estado IN ('pendiente', 'pendiente_plantilla') ORDER BY id")}
     conn.close()
     responsables = []
     for f in filas:
@@ -5368,22 +5996,23 @@ def _responsables_del_dia(fecha):
             fundos = fundos_efectivos(f["numero"])
             cubre = lambda p, fundos=fundos: any(_fundo_coincide(x, p) for x in fundos)
         responsables.append({"nombre": f["nombre"] or f["numero"], "estado": f["estado"], "ajuste": f["ajuste"],
-                             "cubre": cubre, "especifico": not f["acceso_total"]})
+                             "cubre": cubre, "especifico": not f["acceso_total"], "pedido": pedidos.get(f["id"])})
     return responsables
 
 def _estado_productor(productor, responsables):
     """('confirmado' | 'ajustado' | 'pendiente' | 'sin_cuestionario', responsables que cuentan)."""
     candidatos = [r for r in responsables if r["cubre"](productor)]
     candidatos = [r for r in candidatos if r["especifico"]] or candidatos
-    for estado in ("ajustado", "confirmado"):
+    for estado in ("ajustado", "ajuste_por_confirmar", "confirmado"):
         quienes = [r for r in candidatos if r["estado"] == estado]
         if quienes:
-            return estado, quienes
+            return ("por_confirmar" if estado == "ajuste_por_confirmar" else estado), quienes
     return ("pendiente", candidatos) if candidatos else ("sin_cuestionario", [])
 
 GRUPOS_RESUMEN_PLANTA = (
     ("confirmado", "✅ Confirmado"),
     ("ajustado", "📝 Con ajuste"),
+    ("por_confirmar", "⏳ Ajuste por confirmar (zonal)"),
     ("pendiente", "⏳ Sin confirmar"),
     ("sin_cuestionario", "❔ Sin zonal que confirme"),
 )
@@ -5436,6 +6065,14 @@ def construir_resumen_planta(fecha=None, plantas=None, nombre=None):
                             if len(ajuste) > 600:
                                 ajuste = ajuste[:600].rsplit(" ", 1)[0] + "…"
                             lineas.append(f"• {r['nombre']} informó: {ajuste}")
+            if estado == "por_confirmar":
+                vistos = set()
+                for _, _, quienes in grupos[estado]:
+                    for r in quienes:
+                        if (r["nombre"], r["pedido"]) not in vistos:
+                            vistos.add((r["nombre"], r["pedido"]))
+                            lineas.append(f"• {r['nombre']} pidió (falta que confirme su zonal): "
+                                          f"{r['pedido'] or r['ajuste'] or '(sin detalle)'}")
             if estado == "pendiente":
                 faltan = sorted({r["nombre"] for _, _, quienes in grupos[estado] for r in quienes})
                 lineas.append(f"Falta que confirme: {', '.join(faltan)}")
@@ -5443,6 +6080,7 @@ def construir_resumen_planta(fecha=None, plantas=None, nombre=None):
     lineas.append("Las cifras son las de la Trisemanal; los ajustes son lo que informaron los zonales "
                   "y todavía no cambian la base.")
     resumen = (f"{conteo['confirmado']} confirmados, {conteo['ajustado']} con ajuste, "
+               f"{conteo['por_confirmar']} por confirmar, "
                f"{conteo['pendiente']} sin confirmar, {conteo['sin_cuestionario']} sin zonal")
     return "\n".join(lineas).strip(), kg_total, resumen
 
@@ -5898,12 +6536,20 @@ def iniciar_scheduler():
     scheduler.add_job(enviar_alerta_desviaciones, "cron", day_of_week=ALERTA_SEMANAL_DIA, hour=h_al, minute=m_al, id="alerta_semanal")
     h_pl, m_pl = _hora_cron(RESUMEN_PLANTAS_HORA, (18, 0))
     scheduler.add_job(enviar_resumen_plantas, "cron", hour=h_pl, minute=m_pl, id="resumen_plantas")
+    informes = "apagados"
+    if INFORMES_DIARIOS_HORA.strip():
+        h_inf, m_inf = _hora_cron(INFORMES_DIARIOS_HORA, (10, 30))
+        # Arma y sube varios PDF: se le da margen por si el servidor estaba ocupado justo a esa hora.
+        scheduler.add_job(enviar_informes_diarios, "cron", hour=h_inf, minute=m_inf, id="informes_diarios",
+                          misfire_grace_time=900)
+        informes = f"{h_inf:02d}:{m_inf:02d}"
     scheduler.start()
     modo = "PRODUCCIÓN" if ENVIOS_AUTOMATICOS_PRODUCCION else "PRUEBA (solo números admin)"
     logger.info(
         f"Scheduler iniciado en modo {modo}: cuestionario diario {h_am:02d}:{m_am:02d} y "
         f"confirmación {h_pm:02d}:{m_pm:02d}, resumen semanal {RESUMEN_SEMANAL_DIA} {h_sem:02d}:{m_sem:02d}, "
-        f"alerta desviaciones {ALERTA_SEMANAL_DIA} {h_al:02d}:{m_al:02d}, resumen a plantas {h_pl:02d}:{m_pl:02d}"
+        f"alerta desviaciones {ALERTA_SEMANAL_DIA} {h_al:02d}:{m_al:02d}, resumen a plantas {h_pl:02d}:{m_pl:02d}, "
+        f"informes diarios {informes}"
     )
 
 # ============================================================================
@@ -7493,15 +8139,28 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
     usuario (y las tablas de embarques si el perfil las ve), que se ejecuta aquí, así las cifras salen de
     la base y no del modelo, con pivote y gráfico opcionales. Si ninguna sección pide
     gráfico, la primera lleva el de totales."""
+    informe, error = armar_informe_personalizado(
+        titulo, secciones, subtitulo=subtitulo, resumen=resumen, consulta_kpis=consulta_kpis,
+        alcance=alcance, embarques=embarques, confirmaciones=confirmaciones, fuente_kpis=fuente_kpis,
+        bases=bases)
+    if error:
+        return error
+    return enviar_informe(numero_destino, formato, informe)
+
+def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None, consulta_kpis=None,
+                                alcance=None, embarques=False, confirmaciones=False, fuente_kpis=None,
+                                bases=BASES_LECTURA["ambas"], omitir_vacias=False):
+    """Ejecuta las consultas y arma el informe (sin enviarlo): (informe, None) o (None, error).
+    omitir_vacias=True deja fuera las secciones sin filas (informes automáticos)."""
     if not secciones:
-        return "ERROR: el informe necesita al menos una sección con su consulta_sql."
+        return None, "ERROR: el informe necesita al menos una sección con su consulta_sql."
     notas = _notas_de_fuente([consulta_kpis] + [s.get("consulta_sql") for s in secciones])
     informe = {"titulo": titulo or "Informe de cosecha", "subtitulo": subtitulo,
                "resumen": resumen, "kpis": [], "secciones": [], "notas": notas}
     if consulta_kpis:
         resultado, error = _consulta_informe(consulta_kpis, fuente_kpis, alcance, 1, embarques, confirmaciones, bases)
         if error:
-            return f"ERROR en consulta_kpis: {error} No envié nada; corrígela y vuelve a intentarlo."
+            return None, f"ERROR en consulta_kpis: {error} No envié nada; corrígela y vuelve a intentarlo."
         if resultado["filas"]:
             for columna, valor in zip(resultado["columnas"], resultado["filas"][0]):
                 valor = _valor_normalizado(valor)
@@ -7519,7 +8178,7 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
         resultado, error = _consulta_informe(seccion.get("consulta_sql"), seccion.get("fuente"), alcance,
                                              MAX_FILAS_INFORME, embarques, confirmaciones, bases)
         if error:
-            return f"ERROR en la sección '{nombre}': {error} No envié nada; corrige la consulta y vuelve a intentarlo."
+            return None, f"ERROR en la sección '{nombre}': {error} No envié nada; corrige la consulta y vuelve a intentarlo."
         encabezados = resultado["columnas"]
         filas = [[_valor_normalizado(v) for v in f] for f in resultado["filas"]]
         # La base guarda las especies en inglés; en el informe van en español.
@@ -7533,7 +8192,7 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
                 encabezados, filas = _pivotear(encabezados, filas, seccion["pivote"])
                 pivoteada = True
             except ValueError as e:
-                return f"ERROR en la sección '{nombre}': {e}"
+                return None, f"ERROR en la sección '{nombre}': {e}"
         # Si la consulta ya trae su fila de total (primera columna de texto = "TOTAL"), esa
         # es la fila de total: queda al pie, en negrita y fuera del gráfico. Así los promedios
         # ponderados (USD/caja eq) del total salen de la base y no de sumar promedios.
@@ -7562,13 +8221,15 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
         if resultado["truncado"]:
             nota = ((nota + " ") if nota else "") + (
                 f"Se muestran las primeras {MAX_FILAS_INFORME} filas; resume más la consulta para ver todo.")
+        if omitir_vacias and not filas:
+            continue
         informe["secciones"].append({"titulo": nombre, "encabezados": encabezados, "filas": filas,
                                      "total": total, "grafico": dibujo, "nota": nota})
-    return enviar_informe(numero_destino, formato, informe)
+    return informe, None
 
-def enviar_documento(numero_destino, contenido, nombre_archivo, mime, descripcion=""):
-    """Sube el archivo a Meta y lo manda como documento. Igual que el texto libre, necesita
-    la ventana de 24 h abierta: los archivos no se pueden mandar dentro de una plantilla."""
+def subir_media(contenido, nombre_archivo, mime):
+    """Sube un archivo a Meta y devuelve su media id (o None). El mismo id sirve para mandarlo a
+    varias personas: el informe diario se sube una vez por versión, no una vez por persona."""
     try:
         subida = requests.post(
             f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/media",
@@ -7578,8 +8239,15 @@ def enviar_documento(numero_destino, contenido, nombre_archivo, mime, descripcio
         )
         if subida.status_code != 200:
             logger.error(f"No pude subir {nombre_archivo} a Meta: {subida.status_code} {subida.text[:300]}")
-            return False
-        media_id = subida.json().get("id")
+            return None
+        return subida.json().get("id")
+    except Exception as e:
+        logger.error(f"Error subiendo {nombre_archivo}: {str(e)}")
+        return None
+
+def enviar_documento_media(numero_destino, media_id, nombre_archivo, descripcion=""):
+    """Manda como documento un archivo ya subido a Meta. Necesita la ventana de 24 h abierta."""
+    try:
         envio = requests.post(
             f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages",
             headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"},
@@ -7599,6 +8267,14 @@ def enviar_documento(numero_destino, contenido, nombre_archivo, mime, descripcio
     except Exception as e:
         logger.error(f"Error enviando documento: {str(e)}")
         return False
+
+def enviar_documento(numero_destino, contenido, nombre_archivo, mime, descripcion=""):
+    """Sube el archivo a Meta y lo manda como documento. Igual que el texto libre, necesita
+    la ventana de 24 h abierta: los archivos no se pueden mandar dentro de una plantilla."""
+    media_id = subir_media(contenido, nombre_archivo, mime)
+    if not media_id:
+        return False
+    return enviar_documento_media(numero_destino, media_id, nombre_archivo, descripcion)
 
 def _nombre_archivo(base, extension):
     limpio = "".join(c if c.isalnum() or c in " -_" else "" for c in base).strip()
@@ -7644,6 +8320,341 @@ def enviar_informe(numero_destino, formato, informe):
             f"{k['etiqueta']} {_texto_kpi(k)}" for k in informe["kpis"]))
     return ". ".join(partes) + "."
 
+# ============================================================================
+# INFORMES DIARIOS DE COSECHA Y DE PROCESOS
+# ============================================================================
+# Son los dos informes que Jerónimo armó con el bot el 09-11-2026 ("Informe diario de cosecha" e
+# "Informe diario de procesos"), con las fechas y la temporada calculadas cada día. Las consultas
+# son fijas (no pasan por Claude) y corren con el alcance y las bases de quien recibe el informe:
+# un productor ve sus fundos, una planta su planta, y el de procesos va solo a quien tiene
+# habilitado Packing. La sección de confirmaciones va solo a admin, EAS y gerencia.
+
+TIPOS_INFORME_DIARIO = ("cosecha", "procesos")
+_INF_PLANTA = "REPLACE(Packing,'PLANTA ','')"
+_INF_PRODUCTOR = ("CASE WHEN Productor='SANTA ANA' THEN 'SANTA ANA DE HUIQUE' "
+                  "WHEN Productor='AGRICOLA EL CARMELO LTDA' THEN 'AGRÍCOLA EL CARMELO LTDA' ELSE Productor END")
+_INF_VARIEDAD = "CASE WHEN Variedad IN ('RAINIER','ROYAL RAINIER') THEN 'RAINIER' ELSE Variedad END"
+_INF_ESPECIE = ("CASE Especie WHEN 'CHERRY' THEN 'Cereza' WHEN 'PEACH' THEN 'Durazno' WHEN 'NECTARINE' THEN "
+                "'Nectarín' WHEN 'APRICOT' THEN 'Damasco' WHEN 'BLUEBERRY' THEN 'Arándano' ELSE Especie END")
+_INF_ORDEN_PLANTA = "CASE Planta WHEN 'LISONJERA' THEN 1 ELSE 2 END"
+_INF_ORDEN_CALIBRE = ("CASE Calibre WHEN '4J' THEN 1 WHEN '4JD' THEN 2 WHEN '3J' THEN 3 WHEN '3JD' THEN 4 "
+                      "WHEN '2J' THEN 5 WHEN '2JD' THEN 6 WHEN 'J' THEN 7 WHEN 'JD' THEN 8 WHEN 'XL' THEN 9 "
+                      "WHEN 'XLD' THEN 10 WHEN 'L' THEN 11 WHEN 'LD' THEN 12 ELSE 13 END")
+KPI_KG_HOY = "Trisemanal hoy (kg)"
+
+def _suma_si(condicion, columna="KgsRecepcionados"):
+    return f"SUM(CASE WHEN {condicion} THEN {columna} ELSE 0 END)"
+
+def _fechas_informe(fecha):
+    hoy, ayer = fecha, fecha - timedelta(days=1)
+    # Fechas como AAAAMMDD: el servidor está en castellano y así no hay ambigüedad día/mes.
+    return (hoy, ayer, temporada_de(hoy), hoy.strftime("%Y%m%d"), ayer.strftime("%Y%m%d"),
+            hoy.strftime("%d-%m"), ayer.strftime("%d-%m"))
+
+def spec_informe_cosecha(fecha):
+    hoy, ayer, t, H, A, hd, ad = _fechas_informe(fecha)
+    real, pre, tri = BASE_ORIGEN_REAL, BASE_ORIGEN_ESTIM_PRIMAVERA, BASE_ORIGEN_TRISEMANAL
+    corte = f"Temporada={t} AND CAST(Fecha AS DATE)<='{A}'"
+    rt, pt = _suma_si(f"[Base Origen]='{real}' AND {corte}"), _suma_si(f"[Base Origen]='{pre}' AND {corte}")
+    ra, ta = (_suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{A}'"),
+              _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{A}'"))
+    th = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{H}'")
+    thc = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{H}'", "CajasEq")
+    rh = _suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{H}'")
+    kpis = (f"SELECT ROUND({rt},0) AS [Real temporada al {ad} (kg)], ROUND({pt},0) AS [Precosecha al {ad} (kg)], "
+            f"ROUND(100.0*{rt}/NULLIF({pt},0),1) AS [% avance vs Precosecha], ROUND({ra},0) AS [Real ayer {ad} (kg)], "
+            f"ROUND({ta},0) AS [Trisemanal ayer {ad} (kg)], ROUND({ra}-{ta},0) AS [Diferencia ayer vs Trisemanal (kg)], "
+            f"ROUND({th},0) AS [{KPI_KG_HOY}], ROUND({thc},0) AS [Trisemanal hoy (cajas eq)], "
+            f"ROUND({rh},0) AS [Real hoy parcial (kg)] FROM datos")
+    grupo = f"{_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}"
+    s_r = _suma_si(f"[Base Origen]='{real}'")
+    s_p = _suma_si(f"[Base Origen]='{pre}'")
+    s_t = _suma_si(f"[Base Origen]='{tri}'")
+    secciones = [
+        {"titulo": f"1. Avance de la temporada por planta (corte {ad})", "bases": ("datos",),
+         "consulta_sql": (
+             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {s_r} AS R, {s_p} AS P FROM datos WHERE {corte} "
+             f"AND [Base Origen] IN ('{real}','{pre}') GROUP BY {_INF_PLANTA}) "
+             "SELECT Planta, [Real kg], [Precosecha kg], [% avance] FROM (SELECT Planta, ROUND(R,0) AS [Real kg], "
+             f"ROUND(P,0) AS [Precosecha kg], ROUND(100.0*R/NULLIF(P,0),1) AS [% avance], {_INF_ORDEN_PLANTA} AS O "
+             "FROM b WHERE R<>0 OR P<>0 UNION ALL SELECT 'TOTAL', ROUND(SUM(R),0), ROUND(SUM(P),0), "
+             "ROUND(100.0*SUM(R)/NULLIF(SUM(P),0),1), 9 FROM b) x ORDER BY O, [Real kg] DESC"),
+         "grafico": {"tipo": "barras", "categoria": "Planta", "valores": ["Real kg", "Precosecha kg"],
+                     "titulo": "Real vs Precosecha por planta (kg)"}},
+        {"titulo": f"2. Llegadas de la temporada por productor y variedad (corte {ad})", "bases": ("datos",),
+         "consulta_sql": (
+             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+             f"{s_r} AS R, {s_p} AS P FROM datos WHERE {corte} AND [Base Origen] IN ('{real}','{pre}') GROUP BY {grupo}) "
+             "SELECT Planta, Productor, Variedad, [Real kg], [Precosecha kg], [% avance] FROM (SELECT Planta, Productor, "
+             "Variedad, ROUND(R,0) AS [Real kg], ROUND(P,0) AS [Precosecha kg], ROUND(100.0*R/NULLIF(P,0),1) AS [% avance], "
+             f"0 AS S, {_INF_ORDEN_PLANTA} AS O FROM b WHERE R<>0 OR P<>0 UNION ALL SELECT 'TOTAL','','',ROUND(SUM(R),0),"
+             "ROUND(SUM(P),0),ROUND(100.0*SUM(R)/NULLIF(SUM(P),0),1),1,9 FROM b) x ORDER BY S, O, [Real kg] DESC"),
+         "grafico": {"tipo": "ninguno"},
+         "nota": "Rainier incluye Royal Rainier. % avance vacío = sin Precosecha cargada para esa línea."},
+        {"titulo": f"3. Llegadas de ayer {ad}: Trisemanal vs real", "bases": ("datos",),
+         "consulta_sql": (
+             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+             f"{s_t} AS T, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{A}' AND [Base Origen] IN ('{tri}','{real}') "
+             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Trisemanal kg], [Real kg], [Diferencia kg] FROM ("
+             "SELECT Planta, Productor, Variedad, ROUND(T,0) AS [Trisemanal kg], ROUND(R,0) AS [Real kg], "
+             "ROUND(R-T,0) AS [Diferencia kg], 0 AS S FROM b WHERE T<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','',"
+             "ROUND(SUM(T),0),ROUND(SUM(R),0),ROUND(SUM(R-T),0),1 FROM b) x ORDER BY S, [Real kg] DESC, [Trisemanal kg] DESC"),
+         "grafico": {"tipo": "ninguno"}},
+        {"titulo": f"4. Hoy {hd}: Trisemanal, Precosecha y real parcial", "bases": ("datos",),
+         "consulta_sql": (
+             f"WITH b AS (SELECT {_INF_ESPECIE} AS Especie, {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, "
+             f"{_INF_VARIEDAD} AS Variedad, {s_t} AS T, {_suma_si(f'[Base Origen]={chr(39)}{tri}{chr(39)}', 'CajasEq')} AS C, "
+             f"{s_p} AS P, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{H}' AND [Base Origen] IN ('{tri}','{pre}','{real}') "
+             f"GROUP BY Especie, {grupo}) SELECT Especie, Planta, Productor, Variedad, [Trisemanal kg], "
+             "[Trisemanal cajas eq], [Precosecha kg], [Real hoy kg] FROM (SELECT Especie, Planta, Productor, Variedad, "
+             "ROUND(T,0) AS [Trisemanal kg], ROUND(C,0) AS [Trisemanal cajas eq], ROUND(P,0) AS [Precosecha kg], "
+             "ROUND(R,0) AS [Real hoy kg], 0 AS S, CASE Especie WHEN 'Cereza' THEN 1 ELSE 2 END AS OE, "
+             "CASE Planta WHEN 'LISONJERA' THEN 1 WHEN 'EL CARMELO' THEN 2 ELSE 3 END AS OP FROM b "
+             "WHERE T<>0 OR P<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','','',ROUND(SUM(T),0),ROUND(SUM(C),0),"
+             "ROUND(SUM(P),0),ROUND(SUM(R),0),1,9,9 FROM b) x ORDER BY S, OE, Especie, OP, Planta, [Trisemanal kg] DESC"),
+         "grafico": {"tipo": "ninguno"},
+         "nota": "Real hoy = recepción registrada hasta la hora de generación del informe (parcial)."},
+        {"titulo": f"5. Confirmaciones y ajustes ({ad} y {hd})", "fuente": "confirmaciones",
+         "consulta_sql": (
+             "SELECT substr(c.fecha_hora,9,2)||'-'||substr(c.fecha_hora,6,2)||' '||substr(c.fecha_hora,12,5) AS Hora, "
+             "c.nombre AS Quien, substr(c.fecha,9,2)||'-'||substr(c.fecha,6,2) AS Para, "
+             "CASE c.evento WHEN 'enviado' THEN 'Sin respuesta' WHEN 'confirmado' THEN 'Confirmado' "
+             "WHEN 'ajustado' THEN 'Ajustado' WHEN 'corregido' THEN 'Corregido' WHEN 'anulado' THEN 'Anulado' "
+             "WHEN 'reporte' THEN 'Aviso' WHEN 'por_confirmar' THEN 'Por confirmar (zonal)' "
+             "WHEN 'aprobado' THEN 'Confirmado por zonal' WHEN 'rechazado' THEN 'No confirmado por zonal' "
+             "WHEN 'retirado' THEN 'Retirado' ELSE c.evento END AS Estado, "
+             "(SELECT e.kg_previstos FROM confirmaciones e WHERE e.cuestionario_id = c.cuestionario_id "
+             "AND e.evento = 'enviado' ORDER BY e.id LIMIT 1) AS [Previsto kg], "
+             "CASE WHEN c.evento IN ('enviado','confirmado') THEN '' ELSE COALESCE(c.aviso, c.detalle, '') END AS Detalle "
+             "FROM confirmaciones c WHERE c.evento <> 'resumen_planta' AND c.cuestionario_id IS NOT NULL "
+             "AND c.id = (SELECT MAX(x.id) FROM confirmaciones x WHERE x.cuestionario_id = c.cuestionario_id "
+             f"AND x.evento <> 'resumen_planta') AND c.fecha BETWEEN '{ayer.isoformat()}' AND '{hoy.isoformat()}' "
+             "ORDER BY c.fecha, c.id"),
+         "total": False, "grafico": {"tipo": "ninguno"},
+         "nota": "Último estado de cada cuestionario o reporte, según el día al que se refiere."},
+    ]
+    return {"titulo": f"Informe diario de cosecha – {DIAS_SEMANA[hoy.weekday()]} {hoy:%d-%m-%Y}",
+            "subtitulo": (f"Temporada {t} · kilos · real de la temporada con corte al {ad} · hoy con real parcial "
+                          f"a las {datetime.now():%H:%M} · Precosecha = Estim Primavera"),
+            "consulta_kpis": kpis, "secciones": secciones}
+
+def spec_informe_procesos(fecha):
+    hoy, ayer, t, H, A, hd, ad = _fechas_informe(fecha)
+    pk, tp, real = "Packing Planta", "Trisem Proceso", BASE_ORIGEN_REAL
+    corte = f"Temporada={t} AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{A}'"
+    vt = _suma_si(f"[Base Origen]='{pk}' AND Temporada={t} AND CAST(Fecha AS DATE)<='{A}'", "KgsVaciados")
+    ct = _suma_si(f"[Base Origen]='{pk}' AND Temporada={t} AND CAST(Fecha AS DATE)<='{A}'", "CajasEq")
+    et = _suma_si(f"[Base Origen]='{pk}' AND Temporada={t} AND CAST(Fecha AS DATE)<='{A}'", "KgsEmbalados")
+    va = _suma_si(f"[Base Origen]='{pk}' AND CAST(Fecha AS DATE)='{A}'", "KgsVaciados")
+    ph = _suma_si(f"[Base Origen]='{tp}' AND CAST(Fecha AS DATE)='{H}'", "KgsVaciados")
+    phc = _suma_si(f"[Base Origen]='{tp}' AND CAST(Fecha AS DATE)='{H}'", "CajasEq")
+    vh = _suma_si(f"[Base Origen]='{pk}' AND CAST(Fecha AS DATE)='{H}'", "KgsVaciados")
+    kpis = (f"SELECT ROUND({vt},0) AS [Procesado temporada al {ad} (kg)], ROUND({ct},0) AS [Cajas eq temporada], "
+            f"ROUND(100.0*{et}/NULLIF({vt},0),1) AS [% embalaje temporada], ROUND({va},0) AS [Procesado ayer {ad} (kg)], "
+            f"ROUND({ph},0) AS [Programa hoy (kg)], ROUND({phc},0) AS [Programa hoy (cajas eq)], "
+            f"ROUND({vh},0) AS [Procesado hoy parcial (kg)] FROM packing")
+    grupo = f"{_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}"
+    campos_dia = (f"{_suma_si(f'[Base Origen]={chr(39)}{tp}{chr(39)}', 'KgsVaciados')} AS T, "
+                  f"{_suma_si(f'[Base Origen]={chr(39)}{tp}{chr(39)}', 'CajasEq')} AS TC, "
+                  f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsVaciados')} AS V, "
+                  f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsEmbalados')} AS E, "
+                  f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'CajasEq')} AS C")
+
+    def seccion_dia(dia):
+        return (f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+                f"{campos_dia} FROM packing WHERE CAST(Fecha AS DATE)='{dia}' AND [Base Origen] IN ('{tp}','{pk}') "
+                f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Programa kg], [Programa cajas eq], "
+                "[Procesado kg], [Cajas eq embaladas], [% embalaje] FROM (SELECT Planta, Productor, Variedad, "
+                "ROUND(T,0) AS [Programa kg], ROUND(TC,0) AS [Programa cajas eq], ROUND(V,0) AS [Procesado kg], "
+                "ROUND(C,0) AS [Cajas eq embaladas], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, "
+                f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL','','',ROUND(SUM(T),0),ROUND(SUM(TC),0),"
+                "ROUND(SUM(V),0),ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x "
+                "ORDER BY S, O, [Programa kg] DESC")
+
+    secciones = [
+        {"titulo": f"1. Proceso de la temporada por planta (corte {ad})", "bases": ("packing",),
+         "consulta_sql": (
+             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, SUM(KgsVaciados) AS V, SUM(KgsEmbalados) AS E, "
+             f"SUM(CajasEq) AS C FROM packing WHERE {corte} GROUP BY {_INF_PLANTA}) SELECT Planta, [Procesado kg], "
+             "[Embalado kg], [Cajas eq], [% embalaje] FROM (SELECT Planta, ROUND(V,0) AS [Procesado kg], "
+             "ROUND(E,0) AS [Embalado kg], ROUND(C,0) AS [Cajas eq], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], "
+             f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL', ROUND(SUM(V),0), ROUND(SUM(E),0), "
+             "ROUND(SUM(C),0), ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1), 9 FROM b) x ORDER BY O, [Procesado kg] DESC"),
+         "grafico": {"tipo": "barras", "categoria": "Planta", "valores": ["Procesado kg", "Embalado kg"],
+                     "titulo": "Procesado vs embalado por planta (kg)"}},
+        {"titulo": f"2. Proceso de la temporada por productor y variedad (corte {ad})", "bases": ("packing",),
+         "consulta_sql": (
+             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+             f"SUM(KgsVaciados) AS V, SUM(KgsEmbalados) AS E, SUM(CajasEq) AS C FROM packing WHERE {corte} "
+             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Procesado kg], [Cajas eq], [% embalaje] FROM ("
+             "SELECT Planta, Productor, Variedad, ROUND(V,0) AS [Procesado kg], ROUND(C,0) AS [Cajas eq], "
+             f"ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, {_INF_ORDEN_PLANTA} AS O FROM b UNION ALL "
+             "SELECT 'TOTAL','','',ROUND(SUM(V),0),ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x "
+             "ORDER BY S, O, [Procesado kg] DESC"),
+         "grafico": {"tipo": "ninguno"},
+         "nota": "Rainier incluye Royal Rainier. % embalaje = kg embalados / kg vaciados."},
+        {"titulo": f"3. Proceso de ayer {ad}: programa vs real", "bases": ("packing",),
+         "consulta_sql": seccion_dia(A), "grafico": {"tipo": "ninguno"}},
+        {"titulo": f"4. Hoy {hd}: programa vs procesado (parcial)", "bases": ("packing",),
+         "consulta_sql": seccion_dia(H), "grafico": {"tipo": "ninguno"},
+         "nota": "Procesado = registrado hasta la hora de generación del informe (parcial). El embalado del día se "
+                 "registra con desfase, por eso su % puede salir bajo."},
+        {"titulo": "5. Fruta recibida pendiente de proceso (cereza, corte hoy)", "bases": ("datos", "packing"),
+         "consulta_sql": (
+             f"WITH r AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+             f"SUM(KgsRecepcionados) AS Rec, 0.0 AS Vac FROM datos WHERE Temporada={t} AND Especie='CHERRY' "
+             f"AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{H}' GROUP BY {grupo} UNION ALL "
+             f"SELECT {_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}, 0.0, SUM(KgsVaciados) FROM packing "
+             f"WHERE Temporada={t} AND Especie='CHERRY' AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{H}' "
+             f"GROUP BY {grupo}), g AS (SELECT Planta, Productor, Variedad, SUM(Rec) AS Rec, SUM(Vac) AS Vac FROM r "
+             "GROUP BY Planta, Productor, Variedad) SELECT Planta, Productor, Variedad, [Recibido kg], [Procesado kg], "
+             "[Pendiente kg] FROM (SELECT Planta, Productor, Variedad, ROUND(Rec,0) AS [Recibido kg], "
+             f"ROUND(Vac,0) AS [Procesado kg], ROUND(Rec-Vac,0) AS [Pendiente kg], 0 AS S, {_INF_ORDEN_PLANTA} AS O "
+             "FROM g WHERE ABS(Rec-Vac)>=1 UNION ALL SELECT 'TOTAL','','',ROUND(SUM(Rec),0),ROUND(SUM(Vac),0),"
+             "ROUND(SUM(Rec-Vac),0),1,9 FROM g WHERE ABS(Rec-Vac)>=1) x ORDER BY S, O, [Pendiente kg] DESC"),
+         "grafico": {"tipo": "ninguno"},
+         "nota": "Recibido (recepción en planta) menos procesado (kg vaciados), acumulado de la temporada; "
+                 "solo líneas con saldo."},
+        {"titulo": f"6. Embalado por calibre (cereza, corte {ad})", "bases": ("packing",),
+         "consulta_sql": (
+             f"SELECT Calibre, [Embalado ayer {ad} kg], [Embalado temporada kg], [Cajas eq temporada], [% temporada] "
+             "FROM (SELECT ISNULL(Calibre,'TOTAL') AS Calibre, "
+             f"ROUND({_suma_si(f'CAST(Fecha AS DATE)={chr(39)}{A}{chr(39)}', 'KgsEmbalados')},0) AS [Embalado ayer {ad} kg], "
+             "ROUND(SUM(KgsEmbalados),0) AS [Embalado temporada kg], ROUND(SUM(CajasEq),0) AS [Cajas eq temporada], "
+             "ROUND(100.0*SUM(KgsEmbalados)/NULLIF((SELECT SUM(KgsEmbalados) FROM packing WHERE "
+             f"{corte} AND Especie='CHERRY'),0),1) AS [% temporada], GROUPING(Calibre) AS G, {_INF_ORDEN_CALIBRE} AS O "
+             f"FROM packing WHERE {corte} AND Especie='CHERRY' GROUP BY Calibre WITH ROLLUP) x "
+             "WHERE [Embalado temporada kg]<>0 ORDER BY G, O"),
+         "grafico": {"tipo": "barras", "categoria": "Calibre", "valores": ["Embalado temporada kg"],
+                     "titulo": "Embalado de la temporada por calibre (kg)"}},
+    ]
+    return {"titulo": f"Informe diario de procesos – {DIAS_SEMANA[hoy.weekday()]} {hoy:%d-%m-%Y}",
+            "subtitulo": (f"Temporada {t} · kilos vaciados y cajas eq · temporada con corte al {ad} · hoy con proceso "
+                          f"parcial a las {datetime.now():%H:%M} · Programa = Trisem Proceso"),
+            "consulta_kpis": kpis, "secciones": secciones}
+
+def _permisos_informe_diario(numero):
+    """(alcance, bases, confirmaciones) con que se arma el informe diario de ese número."""
+    return alcance_de(numero), bases_de(numero), puede_ver_confirmaciones(numero)
+
+def armar_informe_diario(tipo, fecha, numero, permisos=None):
+    """(informe, None) o (None, motivo) para ese número, con su alcance y sus bases."""
+    alcance, bases, confirmaciones = permisos or _permisos_informe_diario(numero)
+    if alcance is not None and not alcance:
+        return None, "sin fundos ni planta asignados"
+    if ("datos" if tipo == "cosecha" else "packing") not in bases:
+        return None, f"no tiene habilitada la base de {'cosecha' if tipo == 'cosecha' else 'packing'}"
+    spec = spec_informe_cosecha(fecha) if tipo == "cosecha" else spec_informe_procesos(fecha)
+    secciones = [s for s in spec["secciones"] if set(s.get("bases", ())) <= set(bases)
+                 and (s.get("fuente") != "confirmaciones" or confirmaciones)]
+    informe, error = armar_informe_personalizado(
+        spec["titulo"], secciones, subtitulo=spec["subtitulo"], consulta_kpis=spec["consulta_kpis"],
+        alcance=alcance, embarques=0, confirmaciones=confirmaciones, bases=bases, omitir_vacias=True)
+    if error:
+        logger.error(f"Informe diario de {tipo} para {numero}: {error}")
+        return None, error
+    if not informe["secciones"]:
+        return None, "sin datos"
+    return informe, None
+
+def _pdf_informe_diario(informe):
+    _preparar_informe(informe)
+    return generar_pdf_informe(informe), _nombre_archivo(informe["titulo"], "pdf")
+
+def _kpi_valor(informe, etiqueta):
+    return next((k["valor"] for k in informe.get("kpis", []) if k["etiqueta"] == etiqueta), 0) or 0
+
+def enviar_informe_diario_a(numero, tipo, fecha):
+    """Arma y manda un informe diario a una persona (al entregar la cola). 'enviado',
+    'sin_datos' o 'error'."""
+    informe, motivo = armar_informe_diario(tipo, fecha, numero)
+    if not informe:
+        logger.info(f"Informe diario de {tipo} para {numero}: no se envía ({motivo})")
+        return "sin_datos"
+    contenido, nombre = _pdf_informe_diario(informe)
+    ok = enviar_documento(numero, contenido, nombre, FORMATOS_ARCHIVO["pdf"][1], descripcion=informe["titulo"])
+    return "enviado" if ok else "error"
+
+def enviar_informes_diarios(fecha=None, numeros=None):
+    """Job diario (INFORMES_DIARIOS_HORA): el informe de cosecha y el de procesos a todos los
+    usuarios de INFORMES_DIARIOS_PERFILES, cada uno con su alcance y sus bases. Cada versión
+    distinta del PDF se arma y se sube una sola vez. Con la ventana de 24 h cerrada va la
+    plantilla y el informe queda en cola (se arma de nuevo al entregarlo). En modo prueba va
+    solo a los admin. numeros = solo a esos (para probar)."""
+    if base_desconectada():
+        logger.warning("Base desconectada (modo mantención): no se envían los informes diarios")
+        return
+    try:
+        fecha = fecha or date.today()
+        if numeros:
+            buscados = {normalizar_numero(n) for n in numeros}
+            destinatarios = [d for d in numeros_por_rol(ROLES_VALIDOS) if d["numero"] in buscados]
+        elif ENVIOS_AUTOMATICOS_PRODUCCION:
+            destinatarios = numeros_por_rol(INFORMES_DIARIOS_PERFILES)
+        else:
+            destinatarios = numeros_por_rol(("admin",))
+        versiones = {}
+        cuenta = {"documentos": 0, "personas_directo": 0, "personas_plantilla": 0, "sin_informe": 0, "errores": 0}
+        recibieron = {tipo: [] for tipo in TIPOS_INFORME_DIARIO}
+        for d in destinatarios:
+            num = d["numero"]
+            permisos = _permisos_informe_diario(num)
+            alcance, bases, confirmaciones = permisos
+            archivos = []
+            for tipo in TIPOS_INFORME_DIARIO:
+                clave = (tipo, type(alcance).__name__, tuple(alcance) if alcance is not None else None,
+                         tuple(bases), confirmaciones)
+                if clave not in versiones:
+                    informe, motivo = armar_informe_diario(tipo, fecha, num, permisos)
+                    version = None
+                    if informe:
+                        contenido, nombre = _pdf_informe_diario(informe)
+                        media_id = subir_media(contenido, nombre, FORMATOS_ARCHIVO["pdf"][1])
+                        version = {"media_id": media_id, "nombre": nombre, "titulo": informe["titulo"],
+                                   "kg": _kpi_valor(informe, KPI_KG_HOY)}
+                    versiones[clave] = version
+                if versiones[clave]:
+                    archivos.append((tipo, versiones[clave]))
+            if not archivos:
+                cuenta["sin_informe"] += 1
+                continue
+            if ventana_24h_abierta(num):
+                enviados = [t for t, a in archivos
+                            if a["media_id"] and enviar_documento_media(num, a["media_id"], a["nombre"], a["titulo"])]
+                cuenta["documentos"] += len(enviados)
+                cuenta["errores"] += len(archivos) - len(enviados)
+                if enviados:
+                    cuenta["personas_directo"] += 1
+                for t in enviados:
+                    recibieron[t].append(d)
+                continue
+            nombres = " y ".join(t for t, _ in archivos)
+            kg = next((a["kg"] for t, a in archivos if t == "cosecha"), 0)
+            ok = enviar_plantilla_cuestionario(
+                num, d.get("nombre"), kg, descripcion=f"el informe diario de {nombres} (respóndeme para recibirlo)")
+            if not ok:
+                cuenta["errores"] += 1
+                continue
+            conn = sqlite3.connect(DB_LOCAL_PATH)
+            # Un informe nuevo deja obsoleto el que seguía en cola del día anterior.
+            conn.execute("UPDATE mensajes_pendientes SET entregado = 2, fecha_entrega = datetime('now', 'localtime') "
+                         "WHERE numero = ? AND tipo LIKE 'informe_diario%' AND entregado = 0", (num,))
+            conn.commit()
+            conn.close()
+            for t, a in archivos:
+                encolar_mensaje_pendiente(num, f"informe_diario_{t}", f"({a['titulo']})",
+                                          referencia=f"informe:{t}:{fecha.isoformat()}")
+                recibieron[t].append(d)
+            cuenta["personas_plantilla"] += 1
+        for tipo, personas in recibieron.items():
+            if personas:
+                registrar_alerta_enviada(f"informe_diario_{tipo}", f"Informe diario de {tipo} del {fecha:%d-%m-%Y}", personas)
+        logger.info(f"Informes diarios {fecha}: {cuenta}")
+        return cuenta
+    except Exception as e:
+        logger.exception(f"Error en los informes diarios: {str(e)}")
+        return {"error": str(e)}
+
 def ventana_24h_abierta(numero):
     """¿La persona escribió al bot en las últimas 24 h? Si sí, se le puede mandar texto libre
     (con la tabla); si no, hay que usar una plantilla o Meta rechaza el envío con 131047."""
@@ -7651,7 +8662,9 @@ def ventana_24h_abierta(numero):
         conn = sqlite3.connect(DB_LOCAL_PATH)
         fila = conn.execute(
             "SELECT 1 FROM conversaciones WHERE numero_sender = ? "
-            "AND fecha_hora >= datetime('now', 'localtime', '-1 day') LIMIT 1",
+            "AND fecha_hora >= datetime('now', 'localtime', '-1 day') "
+            # Los avisos que el bot anota en el historial no cuentan: la ventana la abre la persona.
+            "AND COALESCE(tipo_mensaje, '') <> 'aviso_bot' LIMIT 1",
             (normalizar_numero(numero),)
         ).fetchone()
         conn.close()
@@ -8353,6 +9366,56 @@ async def admin_resumen_plantas(clave: str, solo_ver: bool = False, fecha: str =
         return {"status": "ok", "texto": texto or "(sin previsto ese día: no se enviaría nada)",
                 "kg": kg, "conteo": conteo}
     return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_resumen_plantas(fecha=dia)}
+
+@app.get("/admin/informes_diarios")
+def admin_informes_diarios(clave: str, fecha: str = None, numero: str = None, solo_ver: bool = False):
+    """
+    Dispara los informes diarios de cosecha y procesos (mismo envío que el job, respeta el modo
+    prueba/producción). numero=569... los manda solo a ese usuario. Con solo_ver=true arma los PDF
+    de ese número (o del admin) SIN enviarlos y los deja en la carpeta temporal del servidor.
+    Uso: .../admin/informes_diarios?clave=...&solo_ver=true&numero=569...
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    try:
+        dia = _parsear_fecha_param(fecha)
+    except ValueError:
+        return JSONResponse({"status": "error", "error": "fecha debe ser YYYY-MM-DD"}, status_code=400)
+    dia = dia or date.today()
+    if solo_ver:
+        objetivo = normalizar_numero(numero) if numero else next(
+            (d["numero"] for d in numeros_por_rol(("admin",))), None)
+        if not objetivo or not numero_esta_permitido(objetivo):
+            return JSONResponse({"status": "error", "error": "numero no está en la lista"}, status_code=400)
+        archivos = {}
+        for tipo in TIPOS_INFORME_DIARIO:
+            informe, motivo = armar_informe_diario(tipo, dia, objetivo)
+            if not informe:
+                archivos[tipo] = {"enviaria": False, "motivo": motivo}
+                continue
+            contenido, nombre = _pdf_informe_diario(informe)
+            ruta = os.path.join(tempfile.gettempdir(), nombre)
+            with open(ruta, "wb") as archivo:
+                archivo.write(contenido)
+            archivos[tipo] = {"enviaria": True, "archivo": ruta, "secciones": [s["titulo"] for s in informe["secciones"]],
+                              "cifras": {k["etiqueta"]: k["valor"] for k in informe["kpis"]}}
+        return {"status": "ok", "numero": objetivo, "informes": archivos}
+    numeros = [numero] if numero else None
+    return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_informes_diarios(fecha=dia, numeros=numeros)}
+
+@app.get("/admin/aprobaciones")
+def admin_aprobaciones(clave: str, limit: int = 30):
+    """Últimas solicitudes de ajuste de productores y lo que respondió su zonal."""
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.row_factory = sqlite3.Row
+    filas = [dict(f) for f in conn.execute(
+        "SELECT id, fecha_hora, fecha, tipo, estado, nombre_origen, productores, aviso, zonales, entregas, "
+        "nombre_resolutor, fecha_hora_resolucion, comentario, aviso_final FROM aprobaciones ORDER BY id DESC LIMIT ?",
+        (max(1, min(limit, 200)),))]
+    conn.close()
+    return {"total": len(filas), "solicitudes": filas}
 
 @app.get("/admin/cuestionario/respuestas")
 async def admin_respuestas_cuestionario(clave: str, limit: int = 30):
