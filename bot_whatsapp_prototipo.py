@@ -357,6 +357,28 @@ def inicializar_db_local():
             aviso_final TEXT
         )
     """)
+    # Kilos que pidió el productor, por productor y variedad: quedan firmes si el zonal confirma.
+    if "kilos" not in [fila[1] for fila in conn.execute("PRAGMA table_info(aprobaciones)")]:
+        conn.execute("ALTER TABLE aprobaciones ADD COLUMN kilos TEXT")
+    # Kilos que informan o confirman los zonales para cada día de cosecha, por productor y variedad
+    # (desde el 09-11-2026: columna «Confirmado kg» del informe diario de cosecha). No se edita:
+    # vale el último lote (lo registrado de una vez) de cada día, productor y variedad.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kilos_confirmados (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fecha_hora TEXT DEFAULT (datetime('now', 'localtime')),
+            fecha TEXT,
+            lote INTEGER,
+            numero TEXT,
+            nombre TEXT,
+            productor TEXT,
+            variedad TEXT,
+            planta TEXT,
+            kg REAL,
+            origen TEXT,
+            cuestionario_id INTEGER
+        )
+    """)
     if not conn.execute("SELECT COUNT(*) FROM confirmaciones").fetchone()[0]:
         # Primera vez: se carga lo que ya había en `cuestionarios` (cada envío y la última
         # respuesta de cada uno; las correcciones anteriores no quedaron guardadas).
@@ -3773,6 +3795,22 @@ def _herramienta_informe(nivel, confirmaciones, bases=("datos", "packing")):
 # Esta herramienta está SIEMPRE disponible (ver procesar_mensaje): el usuario puede reportar
 # un ajuste de proyección cuando ocurre, no solo mientras haya un cuestionario vigente. Si hay
 # cuestionario vigente actualiza esa respuesta; si no, queda como reporte espontáneo.
+# Kilos por productor, variedad y día: son la columna «Confirmado kg» del informe diario de cosecha.
+_ESQUEMA_KILOS = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "fecha": {"type": "string", "description": "Día de cosecha al que se refiere, AAAA-MM-DD (hoy, mañana u otro día)."},
+            "productor": {"type": "string", "description": "Nombre EXACTO de la lista de productores."},
+            "variedad": {"type": "string", "description": "Nombre EXACTO de la lista de variedades; vacío si no la dice."},
+            "kg": {"type": "number", "description": "Kilos que se cosechan ese día: el total, no la diferencia. 0 = no cosecha."},
+            "planta": {"type": "string", "description": "Planta de destino, solo si la dice (ej. 'LISONJERA', 'EL CARMELO')."},
+        },
+        "required": ["fecha", "productor", "kg"],
+    },
+}
+
 TOOL_REGISTRAR_CUESTIONARIO = {
     "name": "registrar_respuesta_cuestionario",
     "description": "Registra que el usuario REPORTA un cambio en su proyección de cosecha, para avisar al equipo EAS. Usar SIEMPRE que el usuario informe (no que pregunte) que va a cosechar más o menos de lo proyectado, que algo viene atrasado o adelantado, o cualquier novedad de campo que afecte lo esperado: 'la boreal viene con 2.000 kilos menos', 'serán unos 10.000 kg menos de tiffany', 'la garcica se atrasó una semana', 'es solo una corrección para avisar a los EAS'. También registra la respuesta al cuestionario de proyección cuando hay uno vigente ('confirmo', 'ok') y corrige una respuesta anterior ('mejor serán 10 mil más'), reemplazando por completo lo registrado antes. NO usar cuando el usuario PREGUNTA por datos ('cuánto se cosechó de boreal', 'cuál es el estimado') — eso son consultas, no reportes.",
@@ -3796,6 +3834,10 @@ TOOL_REGISTRAR_CUESTIONARIO = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Productores/fundos a los que se refiere lo que informa, con el nombre EXACTO de la lista de productores (ej. ['AGRICOLA EL CONDOR LTDA']). Ponlo siempre que el usuario nombre un fundo o que se deduzca de su cuestionario; déjalo vacío solo si confirma o ajusta todo su cuestionario sin distinguir fundos. Con él se valida que sea un fundo suyo y se sabe a qué zonal y a qué planta avisar."
+            },
+            "kilos": {
+                **_ESQUEMA_KILOS,
+                "description": "Cómo queda la cosecha EN KILOS: una línea por productor y variedad y por cada día al que se refiere lo que informa (hoy, mañana u otro). Es la columna «Confirmado kg» del informe diario. Ponla SIEMPRE que dé kilos, también al corregir (repite las líneas de ese día como quedan). Ej.: 'mañana Santa Ana 10.000 de Santina y Cóndor 12.000' → dos líneas con la fecha de mañana (la del Cóndor sin variedad si no la dice). 'Santa Amelia no cosecha' → kg 0. Si solo da bins, cajas u otra unidad sin decir los kilos, no pongas esa línea (no conviertas). Si confirma lo previsto sin cambios, déjala vacía: se toma la Trisemanal de su cuestionario."
             }
         },
         "required": ["resultado", "aviso"]
@@ -3814,7 +3856,8 @@ TOOL_CONFIRMAR_AJUSTE = {
             "decision": {"type": "string", "enum": ["confirmar", "rechazar"]},
             "detalle_final": {"type": "string", "description": "Solo si el zonal cambia lo que pidió el productor: cómo queda el ajuste, con variedad, cifra y día."},
             "aviso": {"type": "string", "description": "Solo si el zonal cambia lo pedido: lo que se avisa en una o dos líneas (máx. 250 caracteres), ej. 'LAPINS: la cosecha de hoy 09-11 cambia a 8.000 kg'."},
-            "comentario": {"type": "string", "description": "Motivo o comentario del zonal (sobre todo al rechazar), para contárselo al productor."}
+            "comentario": {"type": "string", "description": "Motivo o comentario del zonal (sobre todo al rechazar), para contárselo al productor."},
+            "kilos": {**_ESQUEMA_KILOS, "description": "Solo si el zonal da otra cifra: cómo queda en kilos, una línea por productor, variedad y día (como en registrar_respuesta_cuestionario)."}
         },
         "required": ["solicitud", "decision"]
     },
@@ -4358,6 +4401,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             texto_usuario=texto_usuario,
             aviso=tool_input.get("aviso"),
             productores=tool_input.get("productores") or None,
+            kilos=tool_input.get("kilos") or None,
         )
 
     if tool_name == "confirmar_ajuste_productor":
@@ -4365,6 +4409,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             numero_sender, tool_input.get("solicitud"), tool_input.get("decision"),
             detalle_final=tool_input.get("detalle_final") or None, aviso=tool_input.get("aviso") or None,
             comentario=tool_input.get("comentario") or None, texto_usuario=texto_usuario,
+            kilos=tool_input.get("kilos") or None,
         )
 
     if tool_name == "consultar_sql":
@@ -4974,8 +5019,141 @@ def _productores_json(cuestionario):
     except (TypeError, ValueError):
         return None
 
+# ---------------------------------------------------------------------------------------------
+# Kilos confirmados (09-11-2026, pedido de Edson: columna «Confirmado kg» del informe diario de
+# cosecha). Cada reporte trae, además del texto, los kilos por productor y variedad de cada día al
+# que se refiere; «confirmo» sin cambios toma la Trisemanal de su cuestionario. Vale el último lote
+# de cada día, productor y variedad (un lote = lo que se registró de una vez).
+# ---------------------------------------------------------------------------------------------
+
+def _a_fecha(valor):
+    """date de un 'AAAA-MM-DD…' (o de un date); hoy si no se puede leer."""
+    if isinstance(valor, datetime):
+        return valor.date()
+    if isinstance(valor, date):
+        return valor
+    try:
+        return datetime.strptime(str(valor)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return date.today()
+
+def _variedad_informe(variedad):
+    """La variedad como la agrupa el informe diario (Royal Rainier va con Rainier)."""
+    v = _normalizar_nombre(variedad)
+    return "RAINIER" if v in ("RAINIER", "ROYAL RAINIER") else v
+
+def _planta_informe(planta):
+    p = _normalizar_nombre(planta)
+    return p[len("PLANTA "):] if p.startswith("PLANTA ") else p
+
+def _planta_coincide(a, b):
+    a, b = _planta_informe(a), _planta_informe(b)
+    return bool(a and b) and (a in b or b in a)
+
+def _limpiar_kilos(kilos, fecha_defecto):
+    """Las líneas de kilos que manda Claude, validadas: fecha AAAA-MM-DD (la del cuestionario si no
+    viene; fuera si está a más de 14 días), nombres como en la base y kg >= 0."""
+    productores = _productores_conocidos_normalizados()
+    claves = {_clave_fundo(p): p for p in PRODUCTORES_CONOCIDOS}
+    variedades = {_normalizar_nombre(v): v for v in VARIEDADES_CONOCIDAS}
+    limpias = []
+    for linea in kilos or []:
+        if not isinstance(linea, dict):
+            continue
+        productor = " ".join(str(linea.get("productor") or "").split())
+        try:
+            kg = float(linea.get("kg"))
+        except (TypeError, ValueError):
+            continue
+        if not productor or kg < 0:
+            continue
+        fecha = _a_fecha(linea.get("fecha")) if linea.get("fecha") else fecha_defecto
+        if abs((fecha - date.today()).days) > 14:
+            continue
+        variedad = " ".join(str(linea.get("variedad") or "").split())
+        limpias.append({
+            "fecha": fecha.isoformat(),
+            "productor": productores.get(_normalizar_nombre(productor)) or claves.get(_clave_fundo(productor)) or productor,
+            "variedad": variedades.get(_normalizar_nombre(variedad), variedad) if variedad else "",
+            "planta": " ".join(str(linea.get("planta") or "").split()),
+            "kg": kg,
+        })
+    return limpias
+
+def guardar_kilos(numero, lineas, origen, cuestionario_id=None, nombre=None, respetar_otros=False):
+    """Guarda un lote de kilos confirmados. respetar_otros=True (confirmar lo previsto sin cambios):
+    no pisa lo que otra persona ya informó para ese día, productor y variedad."""
+    if not lineas:
+        return 0
+    num = normalizar_numero(numero)
+    nombre = nombre or datos_numero(num).get("nombre") or num
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        if respetar_otros:
+            fechas = sorted({l["fecha"] for l in lineas})
+            ocupadas = {(f, _clave_fundo(p), _variedad_informe(v)) for f, p, v in conn.execute(
+                f"SELECT fecha, productor, variedad FROM kilos_confirmados WHERE numero <> ? "
+                f"AND fecha IN ({','.join('?' * len(fechas))})", [num] + fechas)}
+            lineas = [l for l in lineas
+                      if (l["fecha"], _clave_fundo(l["productor"]), _variedad_informe(l["variedad"])) not in ocupadas
+                      and (l["fecha"], _clave_fundo(l["productor"]), "") not in ocupadas]
+        if lineas:
+            lote = conn.execute("SELECT COALESCE(MAX(lote), 0) + 1 FROM kilos_confirmados").fetchone()[0]
+            conn.executemany(
+                "INSERT INTO kilos_confirmados (fecha, lote, numero, nombre, productor, variedad, planta, kg, origen, "
+                "cuestionario_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [(l["fecha"], lote, num, nombre, l["productor"], l["variedad"], l["planta"], l["kg"], origen,
+                  cuestionario_id) for l in lineas])
+            conn.commit()
+        conn.close()
+        return len(lineas)
+    except Exception as e:
+        logger.error(f"Error guardando los kilos confirmados de {num}: {str(e)}")
+        return 0
+
+def _trisemanal_por_variedad(fecha, fundos=None):
+    """La Trisemanal de ese día por productor, variedad y planta, como líneas de kilos (para
+    'confirmo' sin cambios). fundos None = todos; lista vacía = ninguno."""
+    if fundos is not None and not [f for f in fundos if f]:
+        return []
+    conn = conectar_sql()
+    if not conn:
+        return []
+    try:
+        condiciones = ["[Base Origen] = ?", "CAST(Fecha AS DATE) = ?", "KgsRecepcionados IS NOT NULL"]
+        params = [BASE_ORIGEN_CUESTIONARIO, fecha.strftime("%Y-%m-%d")]
+        if fundos is not None:
+            sql_fundos, params_fundos = _sql_fundos([f for f in fundos if f])
+            condiciones.append(sql_fundos)
+            params.extend(params_fundos)
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT Productor, Variedad, Packing, SUM(KgsRecepcionados)
+            FROM {RECEPCION_SQL} AS Recepcion_Consolidada
+            WHERE {" AND ".join(condiciones)}
+            GROUP BY Productor, Variedad, Packing
+            HAVING SUM(KgsRecepcionados) > 0
+        """, params)
+        return [{"fecha": fecha.isoformat(), "productor": (p or "").strip(), "variedad": (v or "").strip(),
+                 "planta": (pk or "").strip(), "kg": float(kg or 0)} for p, v, pk, kg in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Error leyendo la Trisemanal por variedad: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
+def _fundos_del_cuestionario(numero, activo, productores=None):
+    """Fundos que cubre lo que confirma esa persona: los que nombró, los de su cuestionario o los
+    que confirma (None = todos)."""
+    if productores:
+        return list(productores)
+    lista = _productores_json(activo)
+    if lista is not None:
+        return lista
+    return fundos_que_confirma(numero)
+
 def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, texto_usuario=None, aviso=None,
-                                     productores=None):
+                                     productores=None, kilos=None):
     """Registra (o corrige) la respuesta del cuestionario vigente del número. Mientras el
     cuestionario esté dentro de sus 24 h se puede responder de nuevo: la corrección REEMPLAZA
     lo registrado y vuelve a avisar al EAS. Si había un ajuste y la persona vuelve a lo
@@ -4996,19 +5174,23 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         # "confirmo" sin cuestionario que confirmar no tiene qué registrar.
         return "No tienes ningún cuestionario de proyección vigente para confirmar."
     productores = [str(p).strip() for p in (productores or []) if p and str(p).strip()]
+    kilos = _limpiar_kilos(kilos, _a_fecha((activo or {}).get("fecha_hora_envio")))
+    nombrados = productores + [p for p in dict.fromkeys(k["productor"] for k in kilos) if p not in productores]
     propios = fundos_que_confirma(numero)
-    if productores and propios is not None:
-        ajenos = [p for p in productores if not any(_fundo_coincide(f, p) for f in propios)]
+    if nombrados and propios is not None:
+        ajenos = [p for p in nombrados if not any(_fundo_coincide(f, p) for f in propios)]
         if ajenos:
             lista = _enumerar(propios[:10]) + ("…" if len(propios) > 10 else "")
             return (f"No registré nada: solo puedes confirmar o ajustar la cosecha de tus fundos asignados "
                     f"({lista or 'no tienes fundos asignados'}). {_enumerar(ajenos)} no "
                     f"{'está' if len(ajenos) == 1 else 'están'} entre ellos: ese cambio lo informa su zonal o su productor.")
+    productores = productores or nombrados
     # El aviso dice SOLO lo que la persona informó en este mensaje (antes iba el detalle completo,
     # que al corregir arrastraba todo lo anterior y llegaba como un historial ilegible).
     aviso = _aviso_corto(aviso or detalle_ajuste or texto_usuario or "(sin detalle)")
     if (rol_de(numero) or ROL_POR_DEFECTO) == "productor":
-        respuesta = _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuario, aviso, productores)
+        respuesta = _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuario, aviso, productores,
+                                         kilos)
         if respuesta is not None:
             return respuesta
         # Sin zonal que pueda confirmarlo: sigue el camino directo de siempre.
@@ -5047,9 +5229,20 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         logger.error(f"Error registrando respuesta de cuestionario: {str(e)}")
         return "Tuve un problema registrando tu reporte. Intenta de nuevo en un momento."
 
+    if kilos:
+        guardar_kilos(numero, kilos, "informado", cuestionario_id)
+    elif resultado == "confirmado" and activo:
+        guardar_kilos(numero, _trisemanal_por_variedad(_a_fecha(activo.get("fecha_hora_envio")),
+                                                       _fundos_del_cuestionario(numero, activo, productores)),
+                      "trisemanal", cuestionario_id, respetar_otros=True)
     ajuste_anterior = (activo or {}).get("ajuste") or (activo or {}).get("respuesta") or "(sin detalle)"
     productores_aviso = productores or _productores_json(activo)
     fecha_cuestionario = str((activo or {}).get("fecha_hora_envio") or date.today())[:10]
+    dias_informados = {k["fecha"] for k in kilos}
+    if len(dias_informados) == 1:
+        # Lo que informa es de otro día (ej. el flujo de mañana, mandado en la tarde): el historial
+        # lo anota para ese día y no para el del cuestionario que estaba abierto.
+        fecha_cuestionario = dias_informados.pop()
     avisados = None
     if resultado == "ajustado":
         avisados = notificar_ajuste_cuestionario(
@@ -5068,7 +5261,7 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
               else "corregido" if es_correccion and resultado == "ajustado" else resultado)
     registrar_evento(
         evento, numero, turno=activo["turno"] if activo else "espontaneo",
-        fecha=(activo or {}).get("fecha_hora_envio") or date.today(), productores=productores_aviso,
+        fecha=fecha_cuestionario, productores=productores_aviso,
         detalle=ajuste_anterior if anula else detalle_ajuste, texto_usuario=texto_usuario,
         avisados=avisados, cuestionario_id=cuestionario_id, aviso=aviso,
     )
@@ -5243,7 +5436,7 @@ def _avisar_persona(numero, mensaje, tipo, descripcion):
         anotar_aviso_en_historial(numero, mensaje)
     return resultado != "error"
 
-def _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuario, aviso, productores):
+def _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuario, aviso, productores, kilos=None):
     """Camino de un productor. Devuelve el texto para él, o None si no hay zonal que pueda
     confirmarlo (entonces se registra directo, como antes)."""
     estado = (activo or {}).get("estado")
@@ -5255,9 +5448,10 @@ def _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuari
         tipo = "anulacion"  # tenía un ajuste firme y quiere volver a lo previsto
     else:
         tipo = "ajuste"
-    return solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle_ajuste, texto_usuario, productores)
+    return solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle_ajuste, texto_usuario, productores,
+                                        kilos=kilos)
 
-def solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle, texto_usuario, productores=None):
+def solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle, texto_usuario, productores=None, kilos=None):
     """El productor pide un cambio: queda como 'ajuste_por_confirmar' y se le pregunta al zonal
     responsable del fundo. Devuelve el texto para el productor, o None si no hay zonal."""
     num = normalizar_numero(numero)
@@ -5269,6 +5463,9 @@ def solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle, texto_usu
     quien = datos_numero(num).get("nombre") or num
     turno = activo["turno"] if activo else "espontaneo"
     fecha = str((activo or {}).get("fecha_hora_envio") or date.today())[:10]
+    dias_informados = {k["fecha"] for k in kilos or []}
+    if len(dias_informados) == 1:
+        fecha = dias_informados.pop()
     try:
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.row_factory = sqlite3.Row
@@ -5301,10 +5498,11 @@ def solicitar_confirmacion_zonal(numero, activo, tipo, aviso, detalle, texto_usu
             "WHERE cuestionario_id = ? AND estado IN ('pendiente', 'pendiente_plantilla')", (cid,))
         cursor = conn.execute(
             "INSERT INTO aprobaciones (fecha, tipo, estado, numero_origen, nombre_origen, cuestionario_id, turno, "
-            "productores, aviso, detalle, texto_usuario, estado_previo, ajuste_previo, zonales, entregas) "
-            "VALUES (?, ?, 'pendiente_plantilla', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')",
+            "productores, aviso, detalle, texto_usuario, estado_previo, ajuste_previo, zonales, entregas, kilos) "
+            "VALUES (?, ?, 'pendiente_plantilla', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)",
             (fecha, tipo, num, quien, cid, turno, "; ".join(fundos), aviso, detalle, texto_usuario,
-             estado_previo, ajuste_previo, json.dumps([z["numero"] for z in zonales])))
+             estado_previo, ajuste_previo, json.dumps([z["numero"] for z in zonales]),
+             json.dumps(kilos, ensure_ascii=False) if kilos else None))
         sid = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -5397,7 +5595,7 @@ def retirar_solicitud(numero, activo, texto_usuario):
     return f"✅ Listo, retiré tu pedido de ajuste{a_quien}. {queda}"
 
 def resolver_solicitud_ajuste(numero, solicitud, decision, detalle_final=None, aviso=None, comentario=None,
-                              texto_usuario=None):
+                              texto_usuario=None, kilos=None):
     """El zonal confirma o rechaza lo que pidió un productor de sus fundos. Confirmar lo deja firme
     en el cuestionario del productor y avisa a gerencia, admin, EAS con avisos y la planta;
     rechazar lo deja como estaba y solo le avisa al productor."""
@@ -5443,6 +5641,16 @@ def resolver_solicitud_ajuste(numero, solicitud, decision, detalle_final=None, a
         conn.commit()
         conn.close()
         _descartar_en_cola(f"aprobacion:{solicitud}")
+        # Los kilos quedan firmes con la confirmación: los que pidió el productor, o los del zonal si
+        # da otra cifra (si la cambia sin decir kilos, no se guarda nada de ese pedido).
+        dia = _a_fecha(ap["fecha"])
+        if anulacion:
+            if fundos:
+                guardar_kilos(ap["numero_origen"], _trisemanal_por_variedad(dia, fundos), "trisemanal", cid,
+                              nombre=quien, respetar_otros=True)
+        else:
+            lineas = _limpiar_kilos(kilos, dia) if kilos else ([] if cambiado else _json_lista(ap.get("kilos")))
+            guardar_kilos(ap["numero_origen"], lineas, "aprobado", cid, nombre=f"{quien} (confirmado por {nombre_zonal})")
         avisados = notificar_ajuste_cuestionario(
             ap["numero_origen"], final_aviso, es_correccion=(ap["estado_previo"] == "ajustado" and not anulacion),
             anulacion=anulacion, texto_usuario=ap["texto_usuario"],
@@ -6990,6 +7198,9 @@ def _fecha_texto(fecha):
 _PALABRAS_CATEGORIA = {"semana", "sem", "temporada", "año", "anio", "mes", "dia", "día", "csg",
                        "codigo", "código"}
 _PREFIJOS_PORCENTAJE = ("pct", "porc", "desv", "avance", "cumpl", "variac")
+# Una columna con unidad ("Embalado temporada kg", "Cajas eq temporada") es una cantidad aunque
+# nombre la temporada o la semana: sin esto salía como categoría, sin miles ni gráfico.
+_PALABRAS_MEDIDA = {"kg", "kgs", "kilos", "caja", "cajas", "eq", "bultos", "bins", "usd", "pallets", "toneladas", "ton"}
 _PREFIJOS_CON_SIGNO = ("desv", "variac", "dif")
 
 def _palabras(texto):
@@ -7018,9 +7229,11 @@ def _tipo_columna(encabezado, valores):
     if not presentes or not all(_es_numero(v) for v in presentes):
         return "texto"
     palabras = _palabras(encabezado)
-    if any(p in _PALABRAS_CATEGORIA for p in palabras):
+    if "%" in str(encabezado):
+        return "porcentaje"
+    if any(p in _PALABRAS_CATEGORIA for p in palabras) and not any(p in _PALABRAS_MEDIDA for p in palabras):
         return "categoria"
-    if "%" in str(encabezado) or any(p.startswith(_PREFIJOS_PORCENTAJE) for p in palabras):
+    if any(p.startswith(_PREFIJOS_PORCENTAJE) for p in palabras):
         return "porcentaje"
     if _es_razon(encabezado):
         return "razon"
@@ -8189,6 +8402,10 @@ def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None,
             for fila in filas:
                 if isinstance(fila[i], str):
                     fila[i] = traducir_especie(fila[i])
+        # Informes automáticos: una sección puede completar sus filas con datos de la base local
+        # (ej. «Confirmado kg» del informe diario). Las secciones que arma Claude no lo traen.
+        if callable(seccion.get("completar")):
+            encabezados, filas = seccion["completar"](encabezados, filas, alcance)
         pivoteada = False
         if seccion.get("pivote") and filas:
             try:
@@ -8354,19 +8571,134 @@ def _fechas_informe(fecha):
     return (hoy, ayer, temporada_de(hoy), hoy.strftime("%Y%m%d"), ayer.strftime("%Y%m%d"),
             hoy.strftime("%d-%m"), ayer.strftime("%d-%m"))
 
+_ESPECIE_POR_VARIEDAD = {}
+
+def _especie_de_variedad(variedad):
+    """Especie (en español) de una variedad, según la base; '' si no se encuentra."""
+    v = (variedad or "").strip()
+    if not v:
+        return ""
+    if v not in _ESPECIE_POR_VARIEDAD:
+        especie = ""
+        conn = conectar_sql()
+        if conn:
+            try:
+                fila = conn.cursor().execute(
+                    "SELECT TOP 1 Especie FROM [Recepcion_Consolidada] WHERE Variedad = ? AND Especie IS NOT NULL",
+                    (v,)).fetchone()
+                especie = traducir_especie(fila[0].strip()) if fila and fila[0] else ""
+            except Exception as e:
+                logger.error(f"Error buscando la especie de {v}: {str(e)}")
+            finally:
+                conn.close()
+        _ESPECIE_POR_VARIEDAD[v] = especie
+    return _ESPECIE_POR_VARIEDAD[v]
+
+def _kilos_vigentes(fecha):
+    """Kilos confirmados que valen para ese día: por productor y variedad, el último lote que los
+    informó (un lote puede repartirlos en dos plantas). Un total sin variedad reemplaza lo anterior
+    del productor, y lo que llega después por variedad reemplaza ese total."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        filas = [dict(f) for f in conn.execute(
+            "SELECT productor, variedad, planta, kg, lote FROM kilos_confirmados WHERE fecha = ? ORDER BY lote, id",
+            (fecha.isoformat(),))]
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo los kilos confirmados: {str(e)}")
+        return []
+    vigentes = {}
+    for f in filas:
+        clave = (_clave_fundo(f["productor"]), _variedad_informe(f["variedad"]))
+        if clave in vigentes and vigentes[clave][0]["lote"] == f["lote"]:
+            vigentes[clave].append(f)
+        else:
+            vigentes[clave] = [f]
+    lote_total = {p: lineas[0]["lote"] for (p, v), lineas in vigentes.items() if not v}
+    resultado = []
+    for (p, v), lineas in vigentes.items():
+        if p in lote_total:
+            if v and lineas[0]["lote"] < lote_total[p]:
+                continue
+            if not v and any(l[0]["lote"] > lote_total[p] for (p2, v2), l in vigentes.items() if p2 == p and v2):
+                continue
+        resultado.extend(lineas)
+    return resultado
+
+def _kilos_en_alcance(linea, alcance):
+    if alcance is None:
+        return True
+    if isinstance(alcance, AlcancePlanta):
+        return any(_planta_coincide(linea["planta"], p) for p in alcance)
+    return any(_fundo_coincide(f, linea["productor"]) for f in alcance)
+
+def _completar_confirmados(encabezados, filas, alcance, fecha):
+    """Sección 4 del informe diario de cosecha: agrega «Confirmado kg» (lo último que informaron o
+    confirmaron los zonales para ese día) antes de «Real kg», y una fila por lo informado que no
+    calza con ninguna de la Trisemanal, la Precosecha o la recepción."""
+    nombres = [_normalizar_nombre(h) for h in encabezados]
+    try:
+        i_esp, i_pla, i_pro, i_var, i_tri, i_real = [nombres.index(n) for n in (
+            "ESPECIE", "PLANTA", "PRODUCTOR", "VARIEDAD", "TRISEMANAL KG", "REAL KG")]
+    except ValueError:
+        return encabezados, filas
+    encabezados = list(encabezados[:i_real]) + ["Confirmado kg"] + list(encabezados[i_real:])
+    filas = [list(f[:i_real]) + [None] + list(f[i_real:]) for f in filas]
+    i_conf = i_real
+    es_total = lambda f: str(f[i_esp] or "").strip().upper() == "TOTAL"
+    total = next((f for f in filas if es_total(f)), None)
+    datos = [f for f in filas if not es_total(f)]
+
+    def sumar(fila, kg):
+        fila[i_conf] = (fila[i_conf] or 0) + kg
+
+    for k in _kilos_vigentes(fecha):
+        # Una planta sin destino informado: solo se completa lo que ya está en su tabla.
+        solo_existentes = isinstance(alcance, AlcancePlanta) and not k["planta"]
+        if not solo_existentes and not _kilos_en_alcance(k, alcance):
+            continue
+        prod, var = _clave_fundo(k["productor"]), _variedad_informe(k["variedad"])
+        del_productor = [f for f in datos if _clave_fundo(f[i_pro]) == prod]
+        candidatas = [f for f in del_productor if not var or _variedad_informe(f[i_var]) == var]
+        if k["planta"]:
+            candidatas = [f for f in candidatas if _planta_coincide(k["planta"], f[i_pla])]
+        if candidatas and (var or len(candidatas) == 1):
+            sumar(max(candidatas, key=lambda f: f[i_tri] or 0), k["kg"])
+        elif candidatas and not k["kg"]:
+            for fila in candidatas:  # "no cosecha" sin variedad: todas sus variedades en 0
+                sumar(fila, 0)
+        elif not solo_existentes:
+            misma_variedad = [f for f in datos if var and _variedad_informe(f[i_var]) == var]
+            nueva = [0] * len(encabezados)
+            parecidas = del_productor or misma_variedad
+            nueva[i_esp] = parecidas[0][i_esp] if parecidas else _especie_de_variedad(k["variedad"])
+            nueva[i_pla] = _planta_informe(k["planta"]) if k["planta"] else (del_productor[0][i_pla] if del_productor else "")
+            nueva[i_pro] = del_productor[0][i_pro] if del_productor else k["productor"]
+            nueva[i_var] = var or "(sin variedad)"
+            nueva[i_conf] = k["kg"]
+            datos.append(nueva)
+    orden_planta = {"LISONJERA": 0, "EL CARMELO": 1}
+    datos.sort(key=lambda f: (0 if f[i_esp] == "Cereza" else 1, str(f[i_esp] or ""),
+                              orden_planta.get(_planta_informe(f[i_pla]), 2), str(f[i_pla] or ""),
+                              -(f[i_tri] or 0), -(f[i_conf] or 0)))
+    if total is not None:
+        confirmados = [f[i_conf] for f in datos if f[i_conf] is not None]
+        total[i_conf] = sum(confirmados) if confirmados else None
+        datos.append(total)
+    return encabezados, datos
+
 def spec_informe_cosecha(fecha):
     hoy, ayer, t, H, A, hd, ad = _fechas_informe(fecha)
     real, pre, tri = BASE_ORIGEN_REAL, BASE_ORIGEN_ESTIM_PRIMAVERA, BASE_ORIGEN_TRISEMANAL
     corte = f"Temporada={t} AND CAST(Fecha AS DATE)<='{A}'"
     rt, pt = _suma_si(f"[Base Origen]='{real}' AND {corte}"), _suma_si(f"[Base Origen]='{pre}' AND {corte}")
-    ra, ta = (_suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{A}'"),
-              _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{A}'"))
+    ra = _suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{A}'")
     th = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{H}'")
     thc = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{H}'", "CajasEq")
     rh = _suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{H}'")
     kpis = (f"SELECT ROUND({rt},0) AS [Real temporada al {ad} (kg)], ROUND({pt},0) AS [Precosecha al {ad} (kg)], "
             f"ROUND(100.0*{rt}/NULLIF({pt},0),1) AS [% avance vs Precosecha], ROUND({ra},0) AS [Real ayer {ad} (kg)], "
-            f"ROUND({ta},0) AS [Trisemanal ayer {ad} (kg)], ROUND({ra}-{ta},0) AS [Diferencia ayer vs Trisemanal (kg)], "
             f"ROUND({th},0) AS [{KPI_KG_HOY}], ROUND({thc},0) AS [Trisemanal hoy (cajas eq)], "
             f"ROUND({rh},0) AS [Real hoy parcial (kg)] FROM datos")
     grupo = f"{_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}"
@@ -8403,20 +8735,23 @@ def spec_informe_cosecha(fecha):
              "ROUND(R-T,0) AS [Diferencia kg], 0 AS S FROM b WHERE T<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','',"
              "ROUND(SUM(T),0),ROUND(SUM(R),0),ROUND(SUM(R-T),0),1 FROM b) x ORDER BY S, [Real kg] DESC, [Trisemanal kg] DESC"),
          "grafico": {"tipo": "ninguno"}},
-        {"titulo": f"4. Hoy {hd}: Trisemanal, Precosecha y real parcial", "bases": ("datos",),
+        # Columnas pedidas por Edson el 09-11-2026: Especie | Planta | Productor | Variedad |
+        # Trisemanal kg | Precosecha kg | Confirmado kg | Real kg (sin las cajas eq de la Trisemanal).
+        {"titulo": f"4. Hoy {hd}: Trisemanal, Precosecha, confirmado y real", "bases": ("datos",),
          "consulta_sql": (
              f"WITH b AS (SELECT {_INF_ESPECIE} AS Especie, {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, "
-             f"{_INF_VARIEDAD} AS Variedad, {s_t} AS T, {_suma_si(f'[Base Origen]={chr(39)}{tri}{chr(39)}', 'CajasEq')} AS C, "
-             f"{s_p} AS P, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{H}' AND [Base Origen] IN ('{tri}','{pre}','{real}') "
-             f"GROUP BY Especie, {grupo}) SELECT Especie, Planta, Productor, Variedad, [Trisemanal kg], "
-             "[Trisemanal cajas eq], [Precosecha kg], [Real hoy kg] FROM (SELECT Especie, Planta, Productor, Variedad, "
-             "ROUND(T,0) AS [Trisemanal kg], ROUND(C,0) AS [Trisemanal cajas eq], ROUND(P,0) AS [Precosecha kg], "
-             "ROUND(R,0) AS [Real hoy kg], 0 AS S, CASE Especie WHEN 'Cereza' THEN 1 ELSE 2 END AS OE, "
+             f"{_INF_VARIEDAD} AS Variedad, {s_t} AS T, {s_p} AS P, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{H}' "
+             f"AND [Base Origen] IN ('{tri}','{pre}','{real}') GROUP BY Especie, {grupo}) "
+             "SELECT Especie, Planta, Productor, Variedad, [Trisemanal kg], [Precosecha kg], [Real kg] FROM ("
+             "SELECT Especie, Planta, Productor, Variedad, ROUND(T,0) AS [Trisemanal kg], ROUND(P,0) AS [Precosecha kg], "
+             "ROUND(R,0) AS [Real kg], 0 AS S, CASE Especie WHEN 'Cereza' THEN 1 ELSE 2 END AS OE, "
              "CASE Planta WHEN 'LISONJERA' THEN 1 WHEN 'EL CARMELO' THEN 2 ELSE 3 END AS OP FROM b "
-             "WHERE T<>0 OR P<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','','',ROUND(SUM(T),0),ROUND(SUM(C),0),"
-             "ROUND(SUM(P),0),ROUND(SUM(R),0),1,9,9 FROM b) x ORDER BY S, OE, Especie, OP, Planta, [Trisemanal kg] DESC"),
+             "WHERE T<>0 OR P<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','','',ROUND(SUM(T),0),ROUND(SUM(P),0),"
+             "ROUND(SUM(R),0),1,9,9 FROM b) x ORDER BY S, OE, Especie, OP, Planta, [Trisemanal kg] DESC"),
+         "completar": lambda encabezados, filas, alcance: _completar_confirmados(encabezados, filas, alcance, hoy),
          "grafico": {"tipo": "ninguno"},
-         "nota": "Real hoy = recepción registrada hasta la hora de generación del informe (parcial)."},
+         "nota": "Confirmado = lo último que informó o confirmó el zonal para hoy (si confirmó sin cambios, la "
+                 "Trisemanal); vacío = sin respuesta. Real = recepción registrada hasta la hora del informe (parcial)."},
         {"titulo": f"5. Confirmaciones y ajustes ({ad} y {hd})", "fuente": "confirmaciones",
          "consulta_sql": (
              "SELECT substr(c.fecha_hora,9,2)||'-'||substr(c.fecha_hora,6,2)||' '||substr(c.fecha_hora,12,5) AS Hora, "
@@ -8427,14 +8762,18 @@ def spec_informe_cosecha(fecha):
              "WHEN 'aprobado' THEN 'Confirmado por zonal' WHEN 'rechazado' THEN 'No confirmado por zonal' "
              "WHEN 'retirado' THEN 'Retirado' ELSE c.evento END AS Estado, "
              "(SELECT e.kg_previstos FROM confirmaciones e WHERE e.cuestionario_id = c.cuestionario_id "
-             "AND e.evento = 'enviado' ORDER BY e.id LIMIT 1) AS [Previsto kg], "
-             "CASE WHEN c.evento IN ('enviado','confirmado') THEN '' ELSE COALESCE(c.aviso, c.detalle, '') END AS Detalle "
+             "AND e.evento = 'enviado' AND e.fecha = c.fecha ORDER BY e.id LIMIT 1) AS [Previsto kg], "
+             "CASE WHEN c.evento IN ('enviado','confirmado') THEN '' "
+             "WHEN c.evento IN ('anulado','rechazado','retirado') THEN COALESCE(c.aviso, c.detalle, '') "
+             "ELSE COALESCE(c.detalle, c.aviso, '') END AS Detalle "
              "FROM confirmaciones c WHERE c.evento <> 'resumen_planta' AND c.cuestionario_id IS NOT NULL "
              "AND c.id = (SELECT MAX(x.id) FROM confirmaciones x WHERE x.cuestionario_id = c.cuestionario_id "
-             f"AND x.evento <> 'resumen_planta') AND c.fecha BETWEEN '{ayer.isoformat()}' AND '{hoy.isoformat()}' "
+             f"AND x.evento <> 'resumen_planta') AND (c.fecha BETWEEN '{ayer.isoformat()}' AND '{hoy.isoformat()}' "
+             f"OR date(c.fecha_hora) BETWEEN '{ayer.isoformat()}' AND '{hoy.isoformat()}') "
              "ORDER BY c.fecha, c.id"),
          "total": False, "grafico": {"tipo": "ninguno"},
-         "nota": "Último estado de cada cuestionario o reporte, según el día al que se refiere."},
+         "nota": "Último estado de cada cuestionario o reporte registrado ayer u hoy; «Para» = día al que se "
+                 "refiere."},
     ]
     return {"titulo": f"Informe diario de cosecha – {DIAS_SEMANA[hoy.weekday()]} {hoy:%d-%m-%Y}",
             "subtitulo": (f"Temporada {t} · kilos · real de la temporada con corte al {ad} · hoy con real parcial "
