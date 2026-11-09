@@ -89,8 +89,10 @@ ALERTA_SEMANAL_HORA = os.getenv("ALERTA_SEMANAL_HORA", "08:00")
 # ajustaron los zonales en la tarde (después del cuestionario de las 15:00).
 RESUMEN_PLANTAS_HORA = os.getenv("RESUMEN_PLANTAS_HORA", "18:00")
 # Informes diarios de cosecha y de procesos (pedido de Edson, 09-11-2026): a todos los usuarios,
-# cada uno con su alcance y sus bases. INFORMES_DIARIOS_HORA vacío los apaga.
-INFORMES_DIARIOS_HORA = os.getenv("INFORMES_DIARIOS_HORA", "10:30")
+# cada uno con su alcance y sus bases, todos los días a las 08:00 y a las 16:00. Horas separadas
+# por coma; vacío los apaga.
+INFORMES_DIARIOS_HORAS = [h.strip() for h in os.getenv("INFORMES_DIARIOS_HORAS", "08:00,16:00").split(",")
+                          if h.strip()]
 INFORMES_DIARIOS_PERFILES = tuple(
     p.strip() for p in os.getenv("INFORMES_DIARIOS_PERFILES", "admin,gerencia,eas,zonal,productor,planta").split(",")
     if p.strip())
@@ -6536,13 +6538,14 @@ def iniciar_scheduler():
     scheduler.add_job(enviar_alerta_desviaciones, "cron", day_of_week=ALERTA_SEMANAL_DIA, hour=h_al, minute=m_al, id="alerta_semanal")
     h_pl, m_pl = _hora_cron(RESUMEN_PLANTAS_HORA, (18, 0))
     scheduler.add_job(enviar_resumen_plantas, "cron", hour=h_pl, minute=m_pl, id="resumen_plantas")
-    informes = "apagados"
-    if INFORMES_DIARIOS_HORA.strip():
-        h_inf, m_inf = _hora_cron(INFORMES_DIARIOS_HORA, (10, 30))
+    horas_informes = []
+    for hhmm in INFORMES_DIARIOS_HORAS:
+        h_inf, m_inf = _hora_cron(hhmm, (8, 0))
         # Arma y sube varios PDF: se le da margen por si el servidor estaba ocupado justo a esa hora.
-        scheduler.add_job(enviar_informes_diarios, "cron", hour=h_inf, minute=m_inf, id="informes_diarios",
-                          misfire_grace_time=900)
-        informes = f"{h_inf:02d}:{m_inf:02d}"
+        scheduler.add_job(enviar_informes_diarios, "cron", hour=h_inf, minute=m_inf,
+                          id=f"informes_diarios_{h_inf:02d}{m_inf:02d}", misfire_grace_time=900)
+        horas_informes.append(f"{h_inf:02d}:{m_inf:02d}")
+    informes = " y ".join(horas_informes) or "apagados"
     scheduler.start()
     modo = "PRODUCCIÓN" if ENVIOS_AUTOMATICOS_PRODUCCION else "PRUEBA (solo números admin)"
     logger.info(
@@ -8576,7 +8579,7 @@ def enviar_informe_diario_a(numero, tipo, fecha):
     return "enviado" if ok else "error"
 
 def enviar_informes_diarios(fecha=None, numeros=None):
-    """Job diario (INFORMES_DIARIOS_HORA): el informe de cosecha y el de procesos a todos los
+    """Job diario (INFORMES_DIARIOS_HORAS, 08:00 y 16:00): el informe de cosecha y el de procesos a todos los
     usuarios de INFORMES_DIARIOS_PERFILES, cada uno con su alcance y sus bases. Cada versión
     distinta del PDF se arma y se sube una sola vez. Con la ventana de 24 h cerrada va la
     plantilla y el informe queda en cola (se arma de nuevo al entregarlo). En modo prueba va
