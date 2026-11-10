@@ -208,6 +208,8 @@ class BaseExterna:
 
     # True si la base filtra los datos según el correo de la persona (Cierre): sin correo no se consulta.
     requiere_email = False
+    # Nota al pie de los informes PDF y Excel que leen esta base (ver consulta_tabla).
+    nota_informe = ""
 
     def __init__(self, id, nombre, prefijo_env, descripcion, reglas="", esquema="dbo",
                  base_defecto=None, usuario_defecto=None, max_filas=400):
@@ -404,6 +406,40 @@ class BaseExterna:
                 f"el total.)") if truncado else ""
         return f"{cabecera}\n{cuerpo}{nota}"
 
+    def consulta_tabla(self, consulta, email=None, quien="", max_filas=None):
+        """Para los informes PDF y Excel del bot (generar_informe con fuente=<id>): la misma validación,
+        conexión y filtro por correo que consultar_<id>, pero devuelve la tabla en vez de texto:
+        ({"columnas", "filas", "truncado", "alcance"}, None) o (None, motivo)."""
+        inicio = time.perf_counter()
+        herramienta = f"informe_{self.id}"
+        tope = max(1, int(max_filas or self.max_filas))
+        try:
+            sql = preparar_consulta(consulta, self.esquema)
+        except ErrorBase as e:
+            self._registrar(quien, email, herramienta, inicio, error=f"rechazada: {e}", sql=consulta)
+            return None, str(e)
+        try:
+            conn, cur, alcance = self.conectar(email)
+        except ErrorBase as e:
+            self._registrar(quien, email, herramienta, inicio, error=str(e), sql=sql)
+            return None, str(e)
+        try:
+            cur.execute(sql)
+            if cur.description is None:
+                self._registrar(quien, email, herramienta, inicio, filas=0, sql=sql)
+                return None, "La consulta no devolvió una tabla."
+            columnas = [d[0] or f"columna_{i + 1}" for i, d in enumerate(cur.description)]
+            filas = cur.fetchmany(tope + 1)
+        except pyodbc.Error as e:
+            msg = self._mensaje_error_sql(e)
+            self._registrar(quien, email, herramienta, inicio, error=msg, sql=sql)
+            return None, msg
+        finally:
+            conn.close()
+        self._registrar(quien, email, herramienta, inicio, filas=min(len(filas), tope), sql=sql)
+        return {"columnas": columnas, "filas": [list(f) for f in filas[:tope]], "truncado": len(filas) > tope,
+                "alcance": alcance}, None
+
     def _ver_modelo(self, email, quien, inicio):
         herramienta = self.herramienta_modelo
         try:
@@ -451,6 +487,8 @@ DESCRIPCION_CIERRE = (
     "- T-SQL de SQL Server 2019 con nivel de compatibilidad 100: sin STRING_AGG ni TRY_CAST (usa FOR XML PATH y CAST).\n"
     "- Responde breve (se lee en WhatsApp): cifras grandes en millones con 1 decimal y separador de miles con "
     "punto; di el corte usado (mes) y si es presupuesto, real o ambos.\n"
+    "- Si piden estos datos en PDF o Excel, ármalo con generar_informe usando fuente='cierre' en cada sección (y "
+    "fuente_kpis='cierre' para las cifras clave): las consultas son las mismas que aquí.\n"
     "- El informe o la presentación para el Directorio no se arma con esta herramienta: si lo piden, explica que "
     "por ahora se prepara en Claude con el conector Cierre SQL."
 )
@@ -467,6 +505,8 @@ class BaseCierre(BaseExterna):
     cambian allá, basta reiniciar el bot."""
 
     requiere_email = True
+    nota_informe = ("Cierre según la base Presupuesto (Softland): muestra solo los grupos de fundos autorizados para el "
+                    "correo del usuario. Cifras en CLP salvo las columnas en USD.")
 
     def __init__(self):
         ruta = _env("CIERRE_REGLAS_ARCHIVO", r"C:\ClaudeCierre\server.py")

@@ -3888,20 +3888,39 @@ TOOL_HISTORIAL_CONFIRMACIONES = {
 # puede leer también `confirmaciones`: por sección (fuente) y en las cifras clave (fuente_kpis).
 _INFORMES_POR_PERMISO = {}
 
-def _herramienta_informe(nivel, confirmaciones, bases=("datos", "packing")):
+def _herramienta_informe(nivel, confirmaciones, bases=("datos", "packing"), externas=()):
     """generar_informe según lo que puede leer el usuario: sus bases, las tablas de embarques de
-    su nivel y, si ve el historial, la fuente 'confirmaciones'. Se arma una vez por combinación,
-    así la definición es siempre la misma (la caché de prompts depende de eso)."""
-    clave = (nivel, bool(confirmaciones), bases)
+    su nivel, si ve el historial la fuente 'confirmaciones' y sus bases externas (Cierre). Se arma una
+    vez por combinación, así la definición es siempre la misma (la caché de prompts depende de eso).
+    Sin bases de Control_EAS (finanzas) las secciones leen solo sus bases externas."""
+    externas = tuple(externas)
+    clave = (nivel, bool(confirmaciones), bases, externas)
     if clave not in _INFORMES_POR_PERMISO:
-        tablas = _lista_tablas(bases, "o")
+        de_externas = [bases_externas.BASES[e] for e in externas]
+        if bases:
+            tablas = _lista_tablas(bases, "o")
+            tool = json.loads(json.dumps(TOOL_GENERAR_INFORME).replace("<TABLAS>", tablas))
+        else:
+            tablas = " o ".join(f"las vistas de {b.nombre}" for b in de_externas)
+            consultas = " o ".join(b.herramienta_consulta for b in de_externas)
+            tool = json.loads(json.dumps(TOOL_GENERAR_INFORME)
+                              .replace("<TABLAS> (mismas columnas y reglas que consultar_sql)",
+                                       f"{tablas} (mismas reglas que {consultas})")
+                              .replace("<TABLAS>", tablas).replace("consultar_sql", consultas))
         # El valor 'cosecha' de la fuente es SQL Server, también para quien solo lee packing.
-        fuente = {
-            "type": "string", "enum": ["cosecha", "confirmaciones"],
-            "description": f"'cosecha' (por defecto): la consulta es SQL Server sobre {tablas} y las tablas de embarques. "
-                           "'confirmaciones': la consulta es SQLite sobre la tabla `confirmaciones` (ver consultar_confirmaciones).",
-        }
-        tool = json.loads(json.dumps(TOOL_GENERAR_INFORME).replace("<TABLAS>", tablas))
+        opciones, partes = [], []
+        if bases:
+            opciones.append("cosecha")
+            partes.append(f"'cosecha' (por defecto): la consulta es SQL Server sobre {tablas} y las tablas de embarques.")
+        if confirmaciones:
+            opciones.append("confirmaciones")
+            partes.append("'confirmaciones': la consulta es SQLite sobre la tabla `confirmaciones` (ver consultar_confirmaciones).")
+        for i, b in enumerate(de_externas):
+            opciones.append(b.id)
+            partes.append(f"'{b.id}'{' (por defecto)' if not bases and i == 0 else ''}: la consulta es T-SQL sobre las "
+                          f"vistas de {b.nombre}, igual que en {b.herramienta_consulta} (sin esquema; ya vienen "
+                          f"filtradas por lo que el usuario tiene autorizado).")
+        fuente = {"type": "string", "enum": opciones, "description": " ".join(partes)}
         if nivel >= 2:
             tool["description"] += (" Las secciones también pueden leer `embarques`, `embarques_fob` y "
                                     "`embarques_pallets` (ver consultar_sql).")
@@ -3912,6 +3931,11 @@ def _herramienta_informe(nivel, confirmaciones, bases=("datos", "packing")):
         if confirmaciones:
             tool["description"] += (" Con fuente='confirmaciones' una sección (o las cifras clave, con fuente_kpis) "
                                     "lee el historial de confirmaciones y ajustes en vez de SQL Server.")
+        for b in de_externas:
+            tool["description"] += (f" Con fuente='{b.id}' una sección (o las cifras clave, con fuente_kpis) lee la base "
+                                    f"{b.nombre}: es otra base, así que cada tabla sale de una sola fuente y el título o "
+                                    f"la nota dicen cuál es.")
+        if len(opciones) > 1 or externas:
             tool["input_schema"]["properties"]["fuente_kpis"] = fuente
             tool["input_schema"]["properties"]["secciones"]["items"]["properties"]["fuente"] = fuente
         _INFORMES_POR_PERMISO[clave] = tool
@@ -4415,7 +4439,10 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
             "BASES DE ESTE USUARIO: NO tiene la base de cosecha, ni la de packing, ni embarques: para él no "
             "existen las tablas `datos`, `packing` ni las de embarques, ni las herramientas de cosecha, así que "
             "ignora lo que digan estas instrucciones sobre consultarlas y no ofrezcas esos datos. Solo puede "
-            f"consultar: {disponibles}. Si pide cosecha, packing o embarques, explícale con amabilidad que no "
+            f"consultar: {disponibles}."
+            + (" Si pide esos datos en PDF o Excel, ármalo con generar_informe (las secciones leen esa base)."
+               if externas else "")
+            + " Si pide cosecha, packing o embarques, explícale con amabilidad que no "
             "los tiene habilitados y que puede pedírselos a Edson Lazo."
         )
     elif nivel == 1:
@@ -4455,7 +4482,9 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
         partes.append(
             "OTRAS BASES: además de cosecha, este usuario puede consultar "
             + "; ".join(f"{b.nombre} con {b.herramienta_consulta} (lee su descripción)" for b in externas)
-            + ". Son bases distintas de la de cosecha: no mezcles sus cifras sin decirlo."
+            + ". Son bases distintas de la de cosecha: no mezcles sus cifras sin decirlo. Para un PDF o Excel con "
+            + "esos datos usa generar_informe con fuente=" + " o ".join(f"'{b.id}'" for b in externas)
+            + " en las secciones que los leen."
         )
     if bases == BASES_LECTURA["cosecha"]:
         partes.append(
@@ -4521,6 +4550,10 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
     # Barrera de bases: no basta con no ofrecerle la herramienta al modelo. Quien no lee Control_EAS
     # (ej. finanzas) recibe este aviso, y no el de "sin fundos" de más abajo.
     bases = bases_de(numero_sender)
+    if not bases and tool_name == "generar_informe" and _externas_configuradas(numero_sender):
+        # Quien solo consulta bases externas (finanzas) arma informes con ellas: no tiene fundos que revisar
+        # y las secciones sin fuente leen su primera base externa.
+        return _generar_informe_desde_tool(numero_sender, tool_input, alcance=None, bases=bases)
     if not bases and tool_name in HERRAMIENTAS_COSECHA | {"consultar_sql", "generar_informe"}:
         return "Las bases de cosecha y packing no están habilitadas para este usuario."
 
@@ -4577,20 +4610,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
                              embarques=nivel_embarques(numero_sender), bases=bases)
 
     if tool_name == "generar_informe":
-        return generar_informe_personalizado(
-            numero_sender,
-            tool_input.get("formato") or "pdf",
-            tool_input.get("titulo"),
-            tool_input.get("secciones") or [],
-            subtitulo=tool_input.get("subtitulo") or None,
-            resumen=tool_input.get("resumen") or None,
-            consulta_kpis=tool_input.get("consulta_kpis") or None,
-            alcance=alcance,
-            embarques=nivel_embarques(numero_sender),
-            confirmaciones=puede_ver_confirmaciones(numero_sender),
-            fuente_kpis=tool_input.get("fuente_kpis") or None,
-            bases=bases,
-        )
+        return _generar_informe_desde_tool(numero_sender, tool_input, alcance=alcance, bases=bases)
 
     if tool_name == "generar_informe_proyeccion":
         return generar_informe_proyeccion(
@@ -4720,8 +4740,12 @@ def herramientas_disponibles(numero_sender=None):
     nivel = nivel_embarques(numero_sender)
     confirmaciones = puede_ver_confirmaciones(numero_sender)
     bases = bases_de(numero_sender)
-    # Sin bases de Control_EAS (ej. finanzas) no hay consultar_sql ni generar_informe: ambos leen esa base.
-    sql = [_herramienta_sql(nivel, bases), _herramienta_informe(nivel, confirmaciones, bases)] if bases else []
+    # Sin bases de Control_EAS (ej. finanzas) no hay consultar_sql; generar_informe sí, si tiene bases externas
+    # (Cierre), y entonces sus secciones leen solo esas bases.
+    ids_externas = _externas_configuradas(numero_sender)
+    sql = [_herramienta_sql(nivel, bases)] if bases else []
+    if bases or ids_externas:
+        sql.append(_herramienta_informe(nivel, confirmaciones, bases, ids_externas))
     if confirmaciones:
         sql.append(TOOL_CONSULTAR_CONFIRMACIONES)
     # Bases externas (Cierre...) habilitadas para este número por su perfil o a mano.
@@ -5043,6 +5067,8 @@ def enviar_whatsapp(numero_destino, mensaje_texto):
     (Meta rechaza en silencio los mensajes demasiado largos).
     """
     exito = True
+    # WhatsApp marca la negrita con UN asterisco: **texto** se vería con asteriscos de más.
+    mensaje_texto = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"*\1*", mensaje_texto or "")
     for parte in dividir_mensaje_whatsapp(mensaje_texto):
         exito = _enviar_whatsapp_una_parte(numero_destino, parte) and exito
     return exito
@@ -7387,7 +7413,10 @@ _PALABRAS_CATEGORIA = {"semana", "sem", "temporada", "año", "anio", "mes", "dia
 _PREFIJOS_PORCENTAJE = ("pct", "porc", "desv", "avance", "cumpl", "variac")
 # Una columna con unidad ("Embalado temporada kg", "Cajas eq temporada") es una cantidad aunque
 # nombre la temporada o la semana: sin esto salía como categoría, sin miles ni gráfico.
-_PALABRAS_MEDIDA = {"kg", "kgs", "kilos", "caja", "cajas", "eq", "bultos", "bins", "usd", "pallets", "toneladas", "ton"}
+_PALABRAS_MEDIDA = {"kg", "kgs", "kilos", "caja", "cajas", "eq", "bultos", "bins", "usd", "pallets", "toneladas", "ton",
+                    # Montos de Cierre ("Ppto temporada", "Real temporada"): sin esto salían sin miles ni total.
+                    "clp", "ppto", "presupuesto", "real", "monto", "gasto", "gastos", "costo", "costos", "ingreso",
+                    "ingresos", "margen", "diferencia", "dif", "saldo"}
 _PREFIJOS_CON_SIGNO = ("desv", "variac", "dif")
 
 def _palabras(texto):
@@ -7418,7 +7447,9 @@ def _tipo_columna(encabezado, valores):
     palabras = _palabras(encabezado)
     if "%" in str(encabezado):
         return "porcentaje"
-    if any(p in _PALABRAS_CATEGORIA for p in palabras) and not any(p in _PALABRAS_MEDIDA for p in palabras):
+    # Una categoría (semana, temporada, código) nunca trae decimales: si los trae, es una cantidad.
+    if (any(p in _PALABRAS_CATEGORIA for p in palabras) and not any(p in _PALABRAS_MEDIDA for p in palabras)
+            and all(float(v).is_integer() for v in presentes)):
         return "categoria"
     if any(p.startswith(_PREFIJOS_PORCENTAJE) for p in palabras):
         return "porcentaje"
@@ -8526,18 +8557,59 @@ def _notas_de_fuente(consultas):
                      "facturados, cuyo valor es provisorio hasta la liquidación.")
     return notas or [NOTA_FUENTES]
 
-def _consulta_informe(sql, fuente, alcance, max_filas, embarques, confirmaciones, bases):
-    """Ejecuta la consulta de una sección según su fuente: la base de cosecha (SQL Server) o
-    el historial de confirmaciones (SQLite, solo para los perfiles que lo ven)."""
+def _externas_configuradas(numero):
+    """Bases externas (ids) que este número puede usar y que están configuradas en el .env."""
+    return tuple(b for b in bases_externas_de(numero) if bases_externas.BASES[b].configurada)
+
+def _generar_informe_desde_tool(numero_sender, tool_input, alcance, bases):
+    """generar_informe con los permisos del número: sus bases de Control_EAS, embarques, confirmaciones y
+    sus bases externas (con su correo, que es lo que filtra Cierre). Sin bases de Control_EAS, las secciones
+    y cifras clave que no dicen su fuente leen la primera base externa."""
+    ids = _externas_configuradas(numero_sender)
+    secciones = [dict(s) for s in (tool_input.get("secciones") or []) if isinstance(s, dict)]
+    fuente_kpis = tool_input.get("fuente_kpis") or None
+    if not bases and ids:
+        for s in secciones:
+            s["fuente"] = s.get("fuente") or ids[0]
+        fuente_kpis = fuente_kpis or ids[0]
+    return generar_informe_personalizado(
+        numero_sender,
+        tool_input.get("formato") or "pdf",
+        tool_input.get("titulo"),
+        secciones,
+        subtitulo=tool_input.get("subtitulo") or None,
+        resumen=tool_input.get("resumen") or None,
+        consulta_kpis=tool_input.get("consulta_kpis") or None,
+        alcance=alcance,
+        embarques=nivel_embarques(numero_sender) if bases else 0,
+        confirmaciones=puede_ver_confirmaciones(numero_sender),
+        fuente_kpis=fuente_kpis,
+        bases=bases,
+        externas={"ids": ids, "email": email_de(numero_sender), "quien": numero_sender or "prueba"},
+    )
+
+def _consulta_informe(sql, fuente, alcance, max_filas, embarques, confirmaciones, bases, externas=None):
+    """Ejecuta la consulta de una sección según su fuente: la base de cosecha (SQL Server), el
+    historial de confirmaciones (SQLite, solo para los perfiles que lo ven) o una base externa
+    (Cierre), con el correo del usuario. externas = {"ids", "email", "quien"}."""
+    if fuente in bases_externas.BASES:
+        base = bases_externas.BASES[fuente]
+        if not externas or fuente not in externas.get("ids", ()):
+            return None, f"la base {base.nombre} no está habilitada para este usuario."
+        return base.consulta_tabla(sql, email=externas.get("email"), quien=externas.get("quien") or "",
+                                   max_filas=max_filas)
     if fuente == "confirmaciones":
         if not confirmaciones:
             return None, "el historial de confirmaciones es solo para admin, EAS y gerencia."
         return ejecutar_consulta_confirmaciones(sql, max_filas=max_filas)
+    if not bases:
+        return None, "este usuario no tiene la base de cosecha ni la de packing: indica la fuente de su base externa."
     return ejecutar_consulta_sql(sql, alcance, max_filas=max_filas, embarques=embarques, bases=bases)
 
 def generar_informe_personalizado(numero_destino, formato, titulo, secciones, subtitulo=None,
                                   resumen=None, consulta_kpis=None, alcance=None, embarques=False,
-                                  confirmaciones=False, fuente_kpis=None, bases=BASES_LECTURA["ambas"]):
+                                  confirmaciones=False, fuente_kpis=None, bases=BASES_LECTURA["ambas"],
+                                  externas=None):
     """Informe a medida que arma Claude: cada sección es una consulta SQL sobre las bases del
     usuario (y las tablas de embarques si el perfil las ve), que se ejecuta aquí, así las cifras salen de
     la base y no del modelo, con pivote y gráfico opcionales. Si ninguna sección pide
@@ -8545,23 +8617,30 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
     informe, error = armar_informe_personalizado(
         titulo, secciones, subtitulo=subtitulo, resumen=resumen, consulta_kpis=consulta_kpis,
         alcance=alcance, embarques=embarques, confirmaciones=confirmaciones, fuente_kpis=fuente_kpis,
-        bases=bases)
+        bases=bases, externas=externas)
     if error:
         return error
     return enviar_informe(numero_destino, formato, informe)
 
 def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None, consulta_kpis=None,
                                 alcance=None, embarques=False, confirmaciones=False, fuente_kpis=None,
-                                bases=BASES_LECTURA["ambas"], omitir_vacias=False):
+                                bases=BASES_LECTURA["ambas"], omitir_vacias=False, externas=None):
     """Ejecuta las consultas y arma el informe (sin enviarlo): (informe, None) o (None, error).
-    omitir_vacias=True deja fuera las secciones sin filas (informes automáticos)."""
+    omitir_vacias=True deja fuera las secciones sin filas (informes automáticos). externas = bases
+    externas que puede leer quien lo pide (ver _consulta_informe)."""
     if not secciones:
         return None, "ERROR: el informe necesita al menos una sección con su consulta_sql."
-    notas = _notas_de_fuente([consulta_kpis] + [s.get("consulta_sql") for s in secciones])
+    # Notas al pie: las de Control_EAS según lo que leen esas consultas, y la de cada base externa usada.
+    fuentes = [(consulta_kpis, fuente_kpis)] + [(s.get("consulta_sql"), s.get("fuente")) for s in secciones]
+    usadas = list(dict.fromkeys(f for c, f in fuentes if c and f in bases_externas.BASES))
+    propias = [c for c, f in fuentes if c and f not in bases_externas.BASES]
+    notas = ((_notas_de_fuente(propias) if propias or not usadas else [])
+             + [bases_externas.BASES[f].nota_informe for f in usadas if bases_externas.BASES[f].nota_informe])
     informe = {"titulo": titulo or "Informe de cosecha", "subtitulo": subtitulo,
                "resumen": resumen, "kpis": [], "secciones": [], "notas": notas}
     if consulta_kpis:
-        resultado, error = _consulta_informe(consulta_kpis, fuente_kpis, alcance, 1, embarques, confirmaciones, bases)
+        resultado, error = _consulta_informe(consulta_kpis, fuente_kpis, alcance, 1, embarques, confirmaciones, bases,
+                                             externas)
         if error:
             return None, f"ERROR en consulta_kpis: {error} No envié nada; corrígela y vuelve a intentarlo."
         if resultado["filas"]:
@@ -8579,7 +8658,7 @@ def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None,
     for numero_seccion, seccion in enumerate(secciones[:8]):
         nombre = seccion.get("titulo") or f"Sección {numero_seccion + 1}"
         resultado, error = _consulta_informe(seccion.get("consulta_sql"), seccion.get("fuente"), alcance,
-                                             MAX_FILAS_INFORME, embarques, confirmaciones, bases)
+                                             MAX_FILAS_INFORME, embarques, confirmaciones, bases, externas)
         if error:
             return None, f"ERROR en la sección '{nombre}': {error} No envié nada; corrige la consulta y vuelve a intentarlo."
         encabezados = resultado["columnas"]
