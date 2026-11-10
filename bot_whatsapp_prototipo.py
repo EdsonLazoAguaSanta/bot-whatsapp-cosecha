@@ -4486,6 +4486,8 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
             + "esos datos usa generar_informe con fuente=" + " o ".join(f"'{b.id}'" for b in externas)
             + " en las secciones que los leen."
         )
+    # Instrucciones propias de cada base externa (ej. cómo se presenta el gasto vs presupuesto de Cierre).
+    partes.extend(b.instruccion_prompt for b in externas if b.instruccion_prompt)
     if bases == BASES_LECTURA["cosecha"]:
         partes.append(
             "PACKING: la base de packing (el embalaje de la fruta: kilos embalados y vaciados, rendimiento de "

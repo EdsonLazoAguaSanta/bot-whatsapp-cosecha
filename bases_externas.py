@@ -210,6 +210,9 @@ class BaseExterna:
     requiere_email = False
     # Nota al pie de los informes PDF y Excel que leen esta base (ver consulta_tabla).
     nota_informe = ""
+    # Instrucción que va en el prompt de quien tiene esta base: lo que no puede quedar solo en la
+    # descripción de la herramienta (ahí el modelo la pierde cuando repite una cifra de antes).
+    instruccion_prompt = ""
 
     def __init__(self, id, nombre, prefijo_env, descripcion, reglas="", esquema="dbo",
                  base_defecto=None, usuario_defecto=None, max_filas=400):
@@ -507,6 +510,15 @@ class BaseCierre(BaseExterna):
     requiere_email = True
     nota_informe = ("Cierre según la base Presupuesto (Softland): muestra solo los grupos de fundos autorizados para el "
                     "correo del usuario. Cifras en CLP salvo las columnas en USD.")
+    # Pedido de Edson (10-11-2026): el bot, el conector y la web deben dar la misma cifra.
+    instruccion_prompt = (
+        "CIERRE: el gasto vs presupuesto (de un fundo, un grupo o el total) va SIEMPRE con el alcance y la forma "
+        "del informe web que dicen las reglas de consultar_cierre: Operaciones + Inversiones, sin packing ni "
+        "frigorífico ni cultivos, real y presupuesto cortados en el último mes cerrado, y Diferencia = Presupuesto "
+        "- Contabilidad. También cuando el usuario pide repetir o actualizar una cifra que diste antes con otro "
+        "alcance (ej. solo gastos operacionales): usa este y avisa que la cifra cambia. Usa otro alcance solo si "
+        "el usuario lo escribe en su mensaje."
+    )
 
     def __init__(self):
         ruta = _env("CIERRE_REGLAS_ARCHIVO", r"C:\ClaudeCierre\server.py")
