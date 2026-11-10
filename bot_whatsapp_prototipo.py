@@ -2793,17 +2793,57 @@ def _ctes_embarques(nivel=2):
         "embarques_pallets": _cte_embarques_pallets(con_fob=nivel >= 2),
     }
 
-# Packing_Consolidado: el embalaje de la fruta (la contraparte de la recepción). Se deja
-# fuera 'Packing Edge' por decisión de Edson (05-11-2026); el resto de las fuentes sí se
-# consulta. No tiene el problema de filas duplicadas sin kilos de Recepcion_Consolidada
-# (verificado: 1 fila de 91.377 sin KgsEmbalados), así que no se filtra nada más.
-BASE_ORIGEN_PACKING_EXCLUIDA = "Packing Edge"
+# Packing_Consolidado: el embalaje de la fruta (la contraparte de la recepción). El embalaje real viene
+# de dos sistemas que miden lo mismo: FX (cada planta, con categoría y calibre) y Edge (la exportadora,
+# 2-3 días atrasado y sin calibre); sumarlos duplica. Desde el 10-11-2026 (guía Control_EAS, script 39)
+# se usa UNA fuente por planta y temporada: FX, salvo donde FX no tiene la temporada completa, que lo
+# decide la vista bot.Packing de Control_EAS (hoy Almahue 2025-26, cuyo FX se perdió, y plantas de
+# terceros). Ahí entra Edge hasta su último día, rotulado 'Packing Planta' con FuenteReal = 'Edge'.
+# No tiene el problema de filas duplicadas sin kilos de Recepcion_Consolidada (verificado: 1 fila de
+# 91.377 sin KgsEmbalados), así que no se filtra nada más.
+BASE_ORIGEN_PACKING_EDGE = "Packing Edge"
+_PACKING_EDGE = {"t": 0.0, "pares": None}
+
+def packing_desde_edge():
+    """[(Temporada, Planta, último día de Edge)] donde el packing real sale de Edge, según bot.Packing.
+    Se lee cada hora; si la vista no responde, queda lo último leído (o nada: solo FX, como antes)."""
+    if time.time() - _PACKING_EDGE["t"] < 3600 and _PACKING_EDGE["pares"] is not None:
+        return _PACKING_EDGE["pares"]
+    conn = conectar_sql()
+    if not conn:
+        return _PACKING_EDGE["pares"] or []
+    try:
+        conn.timeout = TIEMPO_MAX_SQL
+        cursor = conn.cursor()
+        cursor.execute("SELECT Temporada, Planta, MAX(Fecha) FROM bot.Packing WHERE Fuente_Real = 'Edge' "
+                       "GROUP BY Temporada, Planta")
+        pares = [(int(t), str(p).strip(), u) for t, p, u in cursor.fetchall() if t is not None and p and u]
+        _PACKING_EDGE.update(t=time.time(), pares=pares)
+        logger.info(f"Packing desde Edge (bot.Packing): {', '.join(f'{p} {t}' for t, p, _ in pares) or 'ninguno'}")
+        return pares
+    except Exception as e:
+        logger.error(f"No pude leer bot.Packing para elegir la fuente del packing: {str(e)}")
+        _PACKING_EDGE["t"] = time.time() - 3000  # reintenta en 10 minutos
+        return _PACKING_EDGE["pares"] or []
+    finally:
+        conn.close()
 
 def _cte_packing(alcance):
     """Tabla `packing` con nombres en castellano y acotada al alcance del usuario, igual que
     `datos`. Las columnas de texto vienen de campos nchar con espacios de relleno, por eso el
     LTRIM/RTRIM: sin él, Categoria llega como 'CAT 1                 '."""
-    condiciones = [f"pc.[Base origen] <> N'{BASE_ORIGEN_PACKING_EXCLUIDA}'"]
+    edge = packing_desde_edge()
+    planta = "UPPER(LTRIM(RTRIM(pc.Packing_name)))"
+    periodos = " OR ".join(
+        f"(pc.Temporada = {t} AND {planta} = N'{p.upper().replace(chr(39), chr(39) * 2)}' "
+        f"AND CAST(pc.Fecha AS DATE) <= '{u:%Y%m%d}')" for t, p, u in edge)
+    if periodos:
+        # Edge solo en esos periodos; FX en todo lo demás (en esos periodos, FX no entra).
+        condiciones = [f"((pc.[Base origen] = N'{BASE_ORIGEN_PACKING_EDGE}' AND ({periodos})) OR "
+                       f"(pc.[Base origen] <> N'{BASE_ORIGEN_PACKING_EDGE}' AND NOT "
+                       f"(pc.[Base origen] = N'Packing Planta' AND ({periodos}))))"]
+    else:
+        condiciones = [f"pc.[Base origen] <> N'{BASE_ORIGEN_PACKING_EDGE}'"]
     if isinstance(alcance, AlcancePlanta):
         condiciones.append(_sql_plantas(alcance, columna="pc.Packing_name", literales=True)[0])
     elif alcance is not None:
@@ -2812,7 +2852,10 @@ def _cte_packing(alcance):
     temporada = _sql_expr_temporada("pc.Fecha", "pc.Temporada")
     return ("packing AS (SELECT "
             f"{temporada} AS Temporada, pc.Temporada AS TemporadaBase, "
-            "LTRIM(RTRIM(pc.[Base origen])) AS [Base Origen], pc.Especie, pc.Variedad, "
+            f"CASE WHEN pc.[Base origen] = N'{BASE_ORIGEN_PACKING_EDGE}' THEN N'Packing Planta' "
+            "ELSE LTRIM(RTRIM(pc.[Base origen])) END AS [Base Origen], "
+            f"CASE pc.[Base origen] WHEN N'{BASE_ORIGEN_PACKING_EDGE}' THEN N'Edge' WHEN N'Packing Planta' THEN N'FX' "
+            "END AS FuenteReal, pc.Especie, pc.Variedad, "
             "pc.Variedad_Agronomica AS [Variedad Agronomica], pc.Productor, "
             "pc.Familia_Productor AS Grupo, "
             f"{_sql_expr_zonal('pc.Productor')} AS Zonal, "
@@ -3664,7 +3707,13 @@ _SQL_PACKING_REGLAS = (
         "varias formas ('CAT 1' y 'CAT1' son lo mismo): si agrupas por categoría, únelas con "
         "REPLACE(Categoria, ' ', ''). "
 )
-_SQL_PACKING_EDGE = "La fuente 'Packing Edge' está excluida por decisión de Agua Santa; no la menciones como disponible. "
+_SQL_PACKING_EDGE = (
+    "El embalaje real ('Packing Planta') sale de los sistemas de cada planta (FX), salvo donde FX no tiene la "
+    "temporada completa (hoy Almahue 2025-26 y plantas de terceros): ahí sale de Edge, el sistema de la "
+    "exportadora, con FuenteReal = 'Edge' (en el resto FuenteReal = 'FX'). Ya viene sin duplicar: no sumes nada "
+    "aparte. Las filas de Edge no traen Categoria ni Calibre: si preguntan por calibre o categoría de esas "
+    "plantas y temporadas, dilo. "
+)
 _SQL_FIN = "Devuelve máximo 400 filas. Si da error, lee el mensaje, corrige y reintenta."
 
 _DESCRIPCION_SQL = {
@@ -8542,7 +8591,8 @@ def _notas_de_fuente(consultas):
     # Solo como tabla: "Packing" también es la columna de planta de `datos`.
     if re.search(r"\b(?:from|join)\s+\[?packing\b", texto):
         notas.append("Embalaje según Packing_Consolidado (Control EAS). Kgs Embalados = salida del "
-                     "proceso; Kgs Vaciados = entrada. No incluye la fuente Packing Edge.")
+                     "proceso; Kgs Vaciados = entrada. Una fuente por planta y temporada: FX, o Edge donde "
+                     "FX no está completo (sin categoría ni calibre).")
     if re.search(r"\bembarques\b", texto):
         notas.append("Embarques según Reporte_Embarque_PBI (Control EAS). Cajas = cajas físicas; "
                      "Cajas Eq = cajas equivalentes.")
