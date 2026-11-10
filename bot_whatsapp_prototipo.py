@@ -34,6 +34,10 @@ app = FastAPI()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Bases que se consultan además de la de cosecha (Control_EAS): Cierre y las que se sumen. Va después
+# de load_dotenv y del logging porque lee su configuración del .env al importarse.
+import bases_externas
+
 # ============================================================================
 # CONFIGURACIÓN
 # ============================================================================
@@ -53,17 +57,17 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 # Modelo que conversa con los usuarios. Opus 5.5 es el más capaz para entender preguntas
 # abiertas, encadenar varias consultas y analizar los resultados como un chat de IA. Se
 # puede cambiar en el .env sin tocar el código.
-CLAUDE_MODELO = os.getenv("CLAUDE_MODELO", "claude-opus-5-5")
+CLAUDE_MODELO = os.getenv("CLAUDE_MODELO", "claude-sonnet-5-5")
 # Profundidad de razonamiento: low | medium | high | xhigh | max. Opus 5.5 trae "medium" por
 # defecto; "high" rinde mejor cuando una respuesta necesita varias consultas y análisis.
-CLAUDE_ESFUERZO = os.getenv("CLAUDE_ESFUERZO", "high")
+CLAUDE_ESFUERZO = os.getenv("CLAUDE_ESFUERZO", "medium")
 # Rondas de herramientas que puede encadenar Claude para responder UN mensaje (consultar,
 # mirar el resultado, volver a consultar, armar el archivo...). Al llegar al tope se le pide
 # que conteste con lo que ya tiene.
 MAX_PASOS_HERRAMIENTAS = int(os.getenv("MAX_PASOS_HERRAMIENTAS", "10"))
 # Si el modelo declina una solicitud por sus filtros de seguridad, la API la reintenta sola
 # en otro modelo (fallback del lado del servidor). Solo lo aceptan estos modelos.
-MODELOS_CON_FALLBACK = ("claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5")
+MODELOS_CON_FALLBACK = ("claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5")
 BETA_FALLBACK = "server-side-fallback-2026-07-01"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -429,6 +433,20 @@ def inicializar_db_local():
     # habilita usuario por usuario (ver bases_de).
     if "ver_bases" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN ver_bases TEXT")
+    # Correo de la persona (desde el 10-11-2026): las bases externas que filtran por usuario (Cierre)
+    # muestran los datos según ese correo. Lo fija solo el administrador (/admin), nunca el mensaje.
+    if "email" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN email TEXT")
+    # Bases externas por número (ids de bases_externas.BASES, ej. 'cierre'), además de las que traiga su
+    # perfil: habilitada = 1 se la da, 0 se la quita aunque su perfil la traiga. Sin fila = lo del perfil.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS numeros_bases (
+            numero TEXT,
+            base TEXT,
+            habilitada INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (numero, base)
+        )
+    """)
     # Migración: el productor único que había antes pasa a ser el primer fundo asignado.
     conn.execute("""
         INSERT OR IGNORE INTO numeros_fundos (numero, fundo)
@@ -476,12 +494,56 @@ def numero_esta_permitido(numero):
 #   planta    - consulta SOLO lo que entra a su(s) planta(s) (columna Packing) y recibe cada día,
 #               al cierre, el resumen de lo que confirmaron o ajustaron los zonales para su
 #               planta. No responde cuestionarios, no reporta ajustes y no ve embarques.
-ROLES_VALIDOS = ("admin", "gerencia", "eas", "zonal", "productor", "planta")
+#   finanzas  - (desde el 10-11-2026) consulta SOLO las bases que se le habiliten (ej. Cierre); por
+#               defecto no ve cosecha, packing ni embarques, no reporta ajustes y no recibe envíos
+#               automáticos (no está en ninguna lista de destinatarios).
+#
+# Qué puede hacer cada perfil. Las listas ROLES_* salen de aquí: un perfil nuevo es una línea.
+#   ve_todo        consulta cosecha y packing de todos los fundos (sin asignarle fundos).
+#   acotado        consulta y confirma solo sus fundos asignados (o los de su zonal).
+#   embarques      puede ver embarques (con el nivel que se le elija por número, ver nivel_embarques).
+#   confirmaciones consulta el historial de confirmaciones y ajustes (consultar_confirmaciones).
+#   reporta        reporta ajustes de cosecha y ve el historial de reportes.
+#   avisos_opcionales  recibe los envíos automáticos solo si se le activan (notificaciones=1).
+#   bases          bases de Control_EAS que lee si no se le eligen otras (ver BASES_LECTURA y bases_de).
+#   externas       bases externas (ids de bases_externas.BASES, ej. "cierre") que trae el perfil. Son un
+#                  atributo más: también se dan o se quitan por número con ?cierre=si|no en /admin.
+PERFILES = {
+    "admin":     {"ve_todo": True,  "acotado": False, "embarques": True,  "confirmaciones": True,
+                  "reporta": True,  "avisos_opcionales": False, "bases": "ambas",   "externas": ()},
+    "gerencia":  {"ve_todo": True,  "acotado": False, "embarques": True,  "confirmaciones": True,
+                  "reporta": True,  "avisos_opcionales": True,  "bases": "cosecha", "externas": ()},
+    "eas":       {"ve_todo": True,  "acotado": False, "embarques": True,  "confirmaciones": True,
+                  "reporta": True,  "avisos_opcionales": True,  "bases": "cosecha", "externas": ()},
+    "zonal":     {"ve_todo": False, "acotado": True,  "embarques": False, "confirmaciones": False,
+                  "reporta": True,  "avisos_opcionales": False, "bases": "cosecha", "externas": ()},
+    "productor": {"ve_todo": False, "acotado": True,  "embarques": False, "confirmaciones": False,
+                  "reporta": True,  "avisos_opcionales": False, "bases": "cosecha", "externas": ()},
+    "planta":    {"ve_todo": False, "acotado": False, "embarques": False, "confirmaciones": False,
+                  "reporta": False, "avisos_opcionales": False, "bases": "cosecha", "externas": ()},
+    "finanzas":  {"ve_todo": False, "acotado": False, "embarques": False, "confirmaciones": False,
+                  "reporta": False, "avisos_opcionales": False, "bases": "ninguna", "externas": ()},
+}
+ROLES_VALIDOS = tuple(PERFILES)
 # Roles sin restricción de fundos (ven la información de todos los productores).
-ROLES_VEN_TODO = ("admin", "gerencia", "eas")
+ROLES_VEN_TODO = tuple(r for r, p in PERFILES.items() if p["ve_todo"])
 # Roles cuyo acceso se limita a los fundos que tengan asignados.
-ROLES_ACOTADOS = ("zonal", "productor")
+ROLES_ACOTADOS = tuple(r for r, p in PERFILES.items() if p["acotado"])
+# Roles que reciben los envíos automáticos solo si se les activan ("solo si lo necesitan").
+ROLES_AVISOS_OPCIONALES = tuple(r for r, p in PERFILES.items() if p["avisos_opcionales"])
+# Roles que no están en ninguna lista de destinatarios de los envíos automáticos (cuestionarios,
+# resúmenes, alertas, informes diarios). Solo informativo, para /admin: esas listas están en cada envío.
+ROLES_SIN_ENVIOS = ("finanzas",)
 ROL_POR_DEFECTO = "productor"
+
+def perfil_de(numero):
+    """Capacidades del perfil del número (las de ROL_POR_DEFECTO si el rol no se conoce)."""
+    return PERFILES.get(rol_de(numero) or ROL_POR_DEFECTO, PERFILES[ROL_POR_DEFECTO])
+
+def puede_reportar(numero):
+    """¿Reporta ajustes de cosecha (y ve el historial de reportes)? Sin número es una prueba local de
+    administración (ver /test/mensaje)."""
+    return numero is None or perfil_de(numero)["reporta"]
 
 def agregar_numero_permitido(numero, nombre=None, rol=None, productor=None, recibe_notificaciones=None,
                              acceso_total=None, zonal=None):
@@ -888,7 +950,7 @@ def numeros_por_rol(roles, solo_con_notificaciones=False):
     resultado = []
     for fila in filas:
         rol = fila["rol"] or ROL_POR_DEFECTO
-        if solo_con_notificaciones and rol in ("gerencia", "eas") and not fila["recibe_notificaciones"]:
+        if solo_con_notificaciones and rol in ROLES_AVISOS_OPCIONALES and not fila["recibe_notificaciones"]:
             continue
         fila["fundos"] = fundos_efectivos(fila["numero"])
         fila["acceso_total"] = bool(fila["acceso_total"])
@@ -900,6 +962,8 @@ def quitar_numero_permitido(numero):
     cursor = conn.execute("DELETE FROM numeros_permitidos WHERE numero = ?", (normalizar_numero(numero),))
     eliminado = cursor.rowcount > 0
     conn.execute("DELETE FROM numeros_plantas WHERE numero = ?", (normalizar_numero(numero),))
+    # Si el número vuelve a agregarse no recupera solo el acceso a las bases externas.
+    conn.execute("DELETE FROM numeros_bases WHERE numero = ?", (normalizar_numero(numero),))
     conn.commit()
     conn.close()
     return eliminado
@@ -908,11 +972,12 @@ def listar_numeros_permitidos():
     conn = sqlite3.connect(DB_LOCAL_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.execute(
-        "SELECT numero, nombre, rol, recibe_notificaciones, acceso_total, zonal, fecha_agregado "
+        "SELECT numero, nombre, rol, email, recibe_notificaciones, acceso_total, zonal, fecha_agregado "
         "FROM numeros_permitidos ORDER BY fecha_agregado DESC"
     )
     filas = [dict(row) for row in cursor.fetchall()]
     for fila in filas:
+        fila["bases_externas"] = list(bases_externas_de(fila["numero"]))
         fila["fundos"] = fundos_de(fila["numero"])
         if fila["zonal"]:
             fila["fundos_de_su_zonal"] = len(productores_de_zonal(fila["zonal"]))
@@ -2469,7 +2534,7 @@ def _revisar_origenes(tokens, ctes, bases=("datos", "packing")):
 # Embarques (vistas Reporte_Embarque_PBI y Embarque-Liquidacion-PBI): información comercial
 # (clientes, naves, valores FOB) que Agua Santa decidió mostrar solo a estos perfiles. No
 # depende de acceso_total: un zonal con acceso a todos los fundos igual no la ve.
-ROLES_EMBARQUES = ("admin", "eas", "gerencia")
+ROLES_EMBARQUES = tuple(r for r, p in PERFILES.items() if p["embarques"])
 TABLAS_EMBARQUES = ("embarques", "embarques_detalle", "embarques_fob", "embarques_pallets")
 # Qué tablas de embarques ve cada nivel. El calibre (serie), el productor y la planta solo vienen
 # en la vista de liquidación, junto con el FOB: «solo embarques» la ve como `embarques_detalle`,
@@ -2512,16 +2577,17 @@ def _tablas_embarques(embarques):
     return TABLAS_POR_NIVEL[max(0, min(2, nivel))]
 
 # Bases que lee cada usuario, de cualquier perfil. 'cosecha' = la tabla `datos` y las herramientas
-# de cosecha; 'packing' = la tabla `packing`. Los envíos automáticos (cuestionarios, resúmenes y
-# avisos) no dependen de esto: siguen según el perfil.
-BASES_LECTURA = {"ambas": ("datos", "packing"), "cosecha": ("datos",), "packing": ("packing",)}
+# de cosecha; 'packing' = la tabla `packing`; 'ninguna' = nada de Control_EAS (ni cosecha, ni
+# packing, ni embarques), para quien solo consulta bases externas. Los envíos automáticos
+# (cuestionarios, resúmenes y avisos) no dependen de esto: siguen según el perfil.
+BASES_LECTURA = {"ambas": ("datos", "packing"), "cosecha": ("datos",), "packing": ("packing",), "ninguna": ()}
 NOMBRE_BASES = {tablas: nombre for nombre, tablas in BASES_LECTURA.items()}
 BASES_POR_DEFECTO = "cosecha"
 
 def bases_de(numero):
     """Tablas que puede leer: el admin, ambas; los demás, lo que se les haya elegido. Sin elegir
-    = solo cosecha, así nadie ve Packing hasta que se le habilite. Sin número es una prueba
-    local de administración (ver /test/mensaje)."""
+    = lo de su perfil (solo cosecha, así nadie ve Packing hasta que se le habilite; finanzas,
+    ninguna). Sin número es una prueba local de administración (ver /test/mensaje)."""
     if numero is None:
         return BASES_LECTURA["ambas"]
     try:
@@ -2534,7 +2600,66 @@ def bases_de(numero):
         return BASES_LECTURA[BASES_POR_DEFECTO]
     if fila and fila[0] == "admin":
         return BASES_LECTURA["ambas"]
-    return BASES_LECTURA.get(fila[1] if fila else None, BASES_LECTURA[BASES_POR_DEFECTO])
+    perfil = PERFILES.get((fila[0] if fila else None) or ROL_POR_DEFECTO, PERFILES[ROL_POR_DEFECTO])
+    return BASES_LECTURA.get(fila[1] if fila else None, BASES_LECTURA[perfil["bases"]])
+
+def email_de(numero):
+    """Correo registrado del número (o None). Con él se filtran las bases externas por usuario."""
+    if numero is None:
+        return None
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute("SELECT email FROM numeros_permitidos WHERE numero = ?",
+                            (normalizar_numero(numero),)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo el correo del usuario: {str(e)}")
+        return None
+    return (fila[0] or None) if fila else None
+
+def fijar_email(numero, email):
+    """email = "" lo borra."""
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.execute("UPDATE numeros_permitidos SET email = ? WHERE numero = ?", (email or None, normalizar_numero(numero)))
+    conn.commit()
+    conn.close()
+
+def bases_externas_de(numero):
+    """Bases externas (ids de bases_externas.BASES) que puede consultar: el admin, todas; los demás, las
+    de su perfil más las que se les den por número, menos las que se les quiten. Es un atributo
+    aparte del perfil: cualquier perfil puede tener Cierre. Sin número es una prueba local de
+    administración (ver /test/mensaje)."""
+    todas = tuple(bases_externas.BASES)
+    if numero is None:
+        return todas
+    rol = rol_de(numero)
+    if rol is None:
+        return ()
+    if rol == "admin":
+        return todas
+    elegidas = set(PERFILES.get(rol, PERFILES[ROL_POR_DEFECTO])["externas"])
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        filas = conn.execute("SELECT base, habilitada FROM numeros_bases WHERE numero = ?",
+                             (normalizar_numero(numero),)).fetchall()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo las bases externas del usuario: {str(e)}")
+        return ()
+    for base, habilitada in filas:
+        (elegidas.add if habilitada else elegidas.discard)(base)
+    return tuple(b for b in todas if b in elegidas)
+
+def fijar_bases_externas(numero, cambios):
+    """cambios = {id_base: True para darla | False para quitarla}."""
+    num = normalizar_numero(numero)
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    for base, habilitada in cambios.items():
+        conn.execute("INSERT INTO numeros_bases (numero, base, habilitada) VALUES (?, ?, ?) "
+                     "ON CONFLICT (numero, base) DO UPDATE SET habilitada = excluded.habilitada",
+                     (num, base, 1 if habilitada else 0))
+    conn.commit()
+    conn.close()
 
 def _texto_tablas(tablas):
     """"la tabla 'datos'" o "las tablas 'datos' y 'packing'", para los mensajes de error."""
@@ -2544,7 +2669,7 @@ def _texto_tablas(tablas):
     return "las tablas " + ", ".join(f"'{t}'" for t in tablas[:-1]) + f" y '{tablas[-1]}'"
 
 # El historial de confirmaciones y ajustes lo consultan los mismos perfiles que ven todo.
-ROLES_CONFIRMACIONES = ("admin", "eas", "gerencia")
+ROLES_CONFIRMACIONES = tuple(r for r, p in PERFILES.items() if p["confirmaciones"])
 
 def puede_ver_confirmaciones(numero):
     """Sin número es una prueba local de administración (ver /test/mensaje)."""
@@ -4270,7 +4395,7 @@ cuestionario, atiéndela con las demás herramientas como siempre.""")
                 "y se le vuelve a pedir al zonal); si dice que lo deje como estaba, es resultado \"confirmado\" "
                 "(retira su pedido)."
             )
-    elif numero_sender and rol_de(numero_sender) != "planta":
+    elif numero_sender and puede_reportar(numero_sender):
         partes.append("""REPORTES DE AJUSTE: este usuario no tiene ningún cuestionario de proyección vigente ahora, pero
 IGUAL puede reportar en cualquier momento que su cosecha va a venir distinta de lo proyectado
 (ej. "la boreal viene con 2.000 kilos menos", "la garcica se atrasó una semana", "es solo una
@@ -4279,8 +4404,21 @@ por datos— usa la herramienta registrar_respuesta_cuestionario con resultado "
 detalle concreto: queda registrado y se le avisa al equipo EAS. NUNCA le digas que no puedes
 registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con esa herramienta.""")
 
+    bases = bases_de(numero_sender)
+    externas = [bases_externas.BASES[b] for b in bases_externas_de(numero_sender)
+                if bases_externas.BASES[b].configurada]
     nivel = nivel_embarques(numero_sender)
-    if nivel == 1:
+    if not bases:
+        disponibles = (", ".join(f"{b.nombre} (con {b.herramienta_consulta})" for b in externas)
+                       or "ninguna por ahora")
+        partes.append(
+            "BASES DE ESTE USUARIO: NO tiene la base de cosecha, ni la de packing, ni embarques: para él no "
+            "existen las tablas `datos`, `packing` ni las de embarques, ni las herramientas de cosecha, así que "
+            "ignora lo que digan estas instrucciones sobre consultarlas y no ofrezcas esos datos. Solo puede "
+            f"consultar: {disponibles}. Si pide cosecha, packing o embarques, explícale con amabilidad que no "
+            "los tiene habilitados y que puede pedírselos a Edson Lazo."
+        )
+    elif nivel == 1:
         partes.append(
             "EMBARQUES: este usuario puede consultar los embarques de exportación (cajas, pallets, "
             "clientes, naves, puertos, mercados, productor, planta, categoría, calibre y contenedor) con "
@@ -4313,7 +4451,12 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
             "Si este usuario la pide, explícale con amabilidad que no está disponible para su perfil."
         )
 
-    bases = bases_de(numero_sender)
+    if bases and externas:
+        partes.append(
+            "OTRAS BASES: además de cosecha, este usuario puede consultar "
+            + "; ".join(f"{b.nombre} con {b.herramienta_consulta} (lee su descripción)" for b in externas)
+            + ". Son bases distintas de la de cosecha: no mezcles sus cifras sin decirlo."
+        )
     if bases == BASES_LECTURA["cosecha"]:
         partes.append(
             "PACKING: la base de packing (el embalaje de la fruta: kilos embalados y vaciados, rendimiento de "
@@ -4365,14 +4508,28 @@ def construir_system_prompt(es_audio=False, cuestionario_activo=None, alcance=No
 HERRAMIENTAS_COSECHA = {t["name"] for t in TOOLS + [TOOL_PROYECCION]}
 
 def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None):
+    # Bases externas (Cierre...): tienen su propio permiso (perfil + numeros_bases) y su propio filtro
+    # (Cierre, por el correo del número), así que van antes de la barrera de fundos de cosecha: un
+    # perfil sin fundos asignados (ej. finanzas) igual puede consultarlas.
+    base_externa = bases_externas.base_de_herramienta(tool_name)
+    if base_externa:
+        if base_externa.id not in bases_externas_de(numero_sender):
+            return f"La base {base_externa.nombre} no está habilitada para este usuario."
+        return base_externa.ejecutar(tool_name, tool_input, email=email_de(numero_sender),
+                                     quien=numero_sender or "prueba")
+
+    # Barrera de bases: no basta con no ofrecerle la herramienta al modelo. Quien no lee Control_EAS
+    # (ej. finanzas) recibe este aviso, y no el de "sin fundos" de más abajo.
+    bases = bases_de(numero_sender)
+    if not bases and tool_name in HERRAMIENTAS_COSECHA | {"consultar_sql", "generar_informe"}:
+        return "Las bases de cosecha y packing no están habilitadas para este usuario."
+
     # Barrera de alcance: zonal y productor solo ven sus fundos. Se calcula aquí, desde el
     # número que escribe, y NO desde nada que venga en el mensaje o que decida el modelo.
     alcance = alcance_de(numero_sender) if numero_sender else None
     if alcance is not None and not alcance:
         return MENSAJE_SIN_PLANTA if isinstance(alcance, AlcancePlanta) else MENSAJE_SIN_FUNDOS
 
-    # Misma barrera para las bases: no basta con no ofrecerle la herramienta al modelo.
-    bases = bases_de(numero_sender)
     if tool_name in HERRAMIENTAS_COSECHA and "datos" not in bases:
         return "La base de cosecha no está habilitada para este usuario: solo puede consultar packing."
 
@@ -4393,6 +4550,9 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
     if tool_name == "registrar_respuesta_cuestionario":
         if isinstance(alcance, AlcancePlanta):
             return ("Tu perfil es de planta: no registra ajustes. Si la cosecha viene distinta, "
+                    "avísale al zonal del productor o al equipo EAS.")
+        if not puede_reportar(numero_sender):
+            return ("Tu perfil no registra ajustes de cosecha. Si la cosecha viene distinta, "
                     "avísale al zonal del productor o al equipo EAS.")
         return registrar_respuesta_cuestionario(
             numero_sender,
@@ -4560,16 +4720,19 @@ def herramientas_disponibles(numero_sender=None):
     nivel = nivel_embarques(numero_sender)
     confirmaciones = puede_ver_confirmaciones(numero_sender)
     bases = bases_de(numero_sender)
-    sql = [_herramienta_sql(nivel, bases), _herramienta_informe(nivel, confirmaciones, bases)]
+    # Sin bases de Control_EAS (ej. finanzas) no hay consultar_sql ni generar_informe: ambos leen esa base.
+    sql = [_herramienta_sql(nivel, bases), _herramienta_informe(nivel, confirmaciones, bases)] if bases else []
     if confirmaciones:
         sql.append(TOOL_CONSULTAR_CONFIRMACIONES)
-    # La planta solo consulta: los ajustes los reportan zonales y productores, y el historial de
-    # reportes es de ellos y del equipo.
-    reporta = not numero_sender or rol_de(numero_sender) != "planta"
+    # Bases externas (Cierre...) habilitadas para este número por su perfil o a mano.
+    externas = bases_externas.herramientas(bases_externas_de(numero_sender))
+    # La planta (y finanzas) solo consulta: los ajustes los reportan zonales y productores, y el
+    # historial de reportes es de ellos y del equipo.
+    reporta = puede_reportar(numero_sender)
     cosecha = TOOLS + [TOOL_PROYECCION] if "datos" in bases else []
     # El zonal confirma lo que piden sus productores (y, en modo prueba, el admin que las recibe).
     resuelve = bool(numero_sender) and (rol_de(numero_sender) == "zonal" or bool(aprobaciones_para(numero_sender)))
-    return (cosecha + sql
+    return (cosecha + sql + externas
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
             + ([TOOL_CONFIRMAR_AJUSTE] if resuelve else [])
             + ([TOOL_HISTORIAL_CONFIRMACIONES] if reporta else []))
@@ -6873,9 +7036,11 @@ def atender_mensaje(message):
 
             logger.info(f"Mensaje de {numero_sender}: {msg_text}")
 
-            if base_desconectada():
+            if base_desconectada() and bases_de(numero_sender):
                 # Sin base no hay cifras: se avisa y no se llama a Claude (inventaría o diría
                 # que no hay datos). Los cuestionarios pendientes quedan en cola para después.
+                # Quien solo consulta bases externas (sin Control_EAS) sigue atendido: cada base
+                # externa tiene su propio modo mantención.
                 guardar_conversacion(numero_sender, msg_type, msg_text, MENSAJE_BASE_DESCONECTADA)
                 enviar_whatsapp(numero_sender, MENSAJE_BASE_DESCONECTADA)
                 return
@@ -6958,23 +7123,44 @@ async def privacy():
     </body></html>
     """
 
+def _estado_bases_externas():
+    return {id_: b.estado() for id_, b in bases_externas.BASES.items()}
+
 @app.get("/health")
 async def health():
     """Verifica estado del bot"""
     if base_desconectada():
-        return {"status": "Bot activo, base desconectada (modo mantención)", "base": "desconectada"}
-    return {"status": "Bot activo y listo", "base": "conectada"}
+        return {"status": "Bot activo, base desconectada (modo mantención)", "base": "desconectada",
+                "bases_externas": _estado_bases_externas()}
+    return {"status": "Bot activo y listo", "base": "conectada", "bases_externas": _estado_bases_externas()}
 
 @app.get("/admin/base")
-def admin_base(clave: str, estado: str = None):
+def admin_base(clave: str, estado: str = None, base: str = None):
     """
     Modo mantención de la base SQL, sin reiniciar el bot. estado=desconectar: no abre conexiones,
     responde con un aviso y no hace los envíos programados; estado=conectar: vuelve a la normalidad.
     Al conectar vuelve a leer los catálogos (variedades, productores...), que quedan vacíos si
     el bot arrancó desconectado. Sin estado, solo informa. Uso: .../admin/base?clave=...&estado=desconectar
+    base: sin indicar (o 'cosecha') = la de cosecha (Control_EAS), como siempre; 'cierre' u otra base
+    externa = solo esa, sin tocar la de cosecha. Ej.: .../admin/base?clave=...&base=cierre&estado=desconectar
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if base is not None and base.strip().lower() not in ("", "cosecha"):
+        externa = bases_externas.BASES.get(base.strip().lower())
+        if not externa:
+            return JSONResponse({"status": "error", "error": f"No conozco la base '{base}'. Bases: cosecha, "
+                                 f"{', '.join(bases_externas.BASES)}."}, status_code=400)
+        if estado is not None:
+            accion = estado.strip().lower()
+            if accion in ("desconectar", "mantencion", "mantención", "off", "0"):
+                externa.fijar_mantencion(True)
+            elif accion in ("conectar", "on", "1"):
+                externa.fijar_mantencion(False)
+            else:
+                return JSONResponse({"status": "error", "error": "estado debe ser desconectar o conectar"},
+                                    status_code=400)
+        return {"status": "ok", "base": externa.id, "estado": externa.estado()}
     if estado is not None:
         accion = estado.strip().lower()
         if accion in ("desconectar", "mantencion", "mantención", "off", "0"):
@@ -6989,7 +7175,8 @@ def admin_base(clave: str, estado: str = None):
         else:
             return JSONResponse({"status": "error", "error": "estado debe ser desconectar o conectar"},
                                 status_code=400)
-    return {"status": "ok", "base": "desconectada" if base_desconectada() else "conectada"}
+    return {"status": "ok", "base": "desconectada" if base_desconectada() else "conectada",
+            "bases_externas": _estado_bases_externas()}
 
 @app.get("/historial")
 async def historial(clave: str, limit: int = 50):
@@ -9080,14 +9267,18 @@ def _estado_numero(numero):
         notif = False
     if rol == "admin":
         detalle_notif = "sí (los admin reciben siempre)"
-    elif rol in ("gerencia", "eas"):
+    elif rol in ROLES_AVISOS_OPCIONALES:
         detalle_notif = "sí" if notif else "no (actívalas con notificaciones=1)"
+    elif rol in ROLES_SIN_ENVIOS:
+        detalle_notif = "no (su perfil no recibe envíos automáticos)"
     else:
         detalle_notif = "sí, según su rol"
     acceso_total = tiene_acceso_total(num)
     ve_todo = rol in ROLES_VEN_TODO or acceso_total
     zonal = zonal_de_numero(num)
-    if rol in ROLES_VEN_TODO:
+    if not bases_de(num):
+        detalle_alcance = "no consulta cosecha ni packing (bases: ninguna)"
+    elif rol in ROLES_VEN_TODO:
         detalle_alcance = f"todos los fundos (por su perfil {rol})"
     elif rol == "planta":
         plantas_num = plantas_de(num)
@@ -9110,6 +9301,8 @@ def _estado_numero(numero):
         "plantas": plantas_de(num),
         "embarques": NOMBRE_NIVEL_EMBARQUES[nivel_embarques(num)],
         "bases": NOMBRE_BASES[bases_de(num)],
+        "email": email_de(num),
+        "bases_externas": {b: bases_externas.BASES[b].estado() for b in bases_externas_de(num)},
         "ve_todo": ve_todo,
         "acceso_total": acceso_total,
         "alcance": detalle_alcance,
@@ -9142,8 +9335,36 @@ def _bases_param(valor):
     texto = valor.strip().lower()
     if texto not in BASES_LECTURA:
         return None, JSONResponse(
-            {"status": "error", "error": "bases debe ser ambas, cosecha o packing."}, status_code=400)
+            {"status": "error", "error": "bases debe ser ambas, cosecha, packing o ninguna."}, status_code=400)
     return texto, None
+
+def _email_param(valor):
+    """Valida ?email= : (correo en minúsculas | "" para borrarlo | None si no vino, error)."""
+    if valor is None:
+        return None, None
+    texto = valor.strip().lower()
+    if texto in ("", "0", "no", "ninguno", "quitar"):
+        return "", None
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", texto):
+        return None, JSONResponse({"status": "error", "error": f"Correo inválido: {valor}"}, status_code=400)
+    return texto, None
+
+# Cada base externa es un parámetro con su nombre (?cierre=si|no), en /admin/numeros/agregar y /rol.
+PARAMETROS_BASES_EXTERNAS = set(bases_externas.BASES)
+
+def _bases_externas_param(request):
+    """Lee ?cierre=si|no (uno por base externa): ({id: True|False}, error). Vacío si no vino ninguno."""
+    cambios = {}
+    for id_ in bases_externas.BASES:
+        try:
+            valor = _parsear_si_no(request.query_params.get(id_))
+        except ValueError:
+            return None, JSONResponse(
+                {"status": "error", "error": f"Valor inválido para '{id_}'. Usa 1/si para habilitar la base, "
+                                             f"o 0/no para quitarla."}, status_code=400)
+        if valor is not None:
+            cambios[id_] = bool(valor)
+    return cambios, None
 
 def fijar_bases(numero, nombre):
     conn = sqlite3.connect(DB_LOCAL_PATH)
@@ -9190,16 +9411,23 @@ def _zonal_param(zonal):
 async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre: str = None,
                                rol: str = None, productor: str = None, fundos: str = None,
                                notificaciones: str = None, acceso_total: str = None, zonal: str = None,
-                               plantas: str = None, embarques: str = None, bases: str = None):
+                               plantas: str = None, embarques: str = None, bases: str = None,
+                               email: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
-    rol: admin | gerencia | eas | zonal | productor (por defecto: productor; zonal si se da ?zonal=).
+    rol: admin | gerencia | eas | zonal | productor | planta | finanzas (por defecto: productor;
+    zonal si se da ?zonal=).
     zonal: lo vincula a un zonal de /admin/zonales: ve los productores de ese zonal.
     fundos: fundos asignados separados por "|" (para zonal/productor, que solo ven los suyos).
     notificaciones: 1/si para que gerencia o eas reciba los avisos automáticos.
-    bases: ambas | cosecha | packing, lo que puede consultar (sin elegir: solo cosecha).
+    bases: ambas | cosecha | packing | ninguna, lo que puede consultar de Control_EAS (sin elegir:
+    lo de su perfil; solo cosecha, o ninguna para finanzas).
+    email: correo de la persona (email=quitar lo borra). Cierre muestra los datos según este correo.
+    cierre: si/no, le da o le quita la base de Cierre, sea cual sea su perfil (igual con cada base
+    externa, por su nombre). Para ver datos, además su correo debe estar en dbo.Cierre_UsuarioAcceso.
     Uso: .../admin/numeros/agregar?clave=...&numero=56912345678&nombre=Joaquin&zonal=Joaquin Llano
+         .../admin/numeros/agregar?clave=...&numero=569...&nombre=Ana&rol=finanzas&email=ana@aguasanta.cl&cierre=si
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
@@ -9208,9 +9436,15 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases"}
-        | set(ALIAS_PARAMETROS),
+        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email"}
+        | set(ALIAS_PARAMETROS) | PARAMETROS_BASES_EXTERNAS,
     )
+    if error:
+        return error
+    email_real, error = _email_param(email)
+    if error:
+        return error
+    cambios_externas, error = _bases_externas_param(request)
     if error:
         return error
     if rol is not None and rol not in ROLES_VALIDOS:
@@ -9257,6 +9491,10 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
             fijar_nivel_embarques(numero_normalizado, nivel_emb)
         if bases_elegidas is not None:
             fijar_bases(numero_normalizado, bases_elegidas)
+        if email_real is not None:
+            fijar_email(numero_normalizado, email_real)
+        if cambios_externas:
+            fijar_bases_externas(numero_normalizado, cambios_externas)
 
         bienvenida_enviada = False
         if es_nuevo:
@@ -9278,14 +9516,18 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
 async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str = None,
                             productor: str = None, fundos: str = None, notificaciones: str = None,
                             acceso_total: str = None, zonal: str = None, plantas: str = None,
-                            embarques: str = None, bases: str = None):
+                            embarques: str = None, bases: str = None, email: str = None):
     """
     Cambia el rol, el zonal, los fundos asignados, las bases que lee y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
-    notificaciones=1), zonal y productor (solo SUS fundos).
+    notificaciones=1), zonal y productor (solo SUS fundos), planta (solo su planta), finanzas
+    (solo las bases que se le habiliten, ej. cierre=si).
     zonal: lo vincula a un zonal (ve sus productores); zonal=ninguno lo desvincula.
-    bases: ambas | cosecha | packing, lo que puede consultar.
+    bases: ambas | cosecha | packing | ninguna, lo que puede consultar de Control_EAS.
+    email: correo de la persona (email=quitar lo borra). cierre: si/no, le da o le quita la base de
+    Cierre, sea cual sea su perfil (igual con cada base externa, por su nombre).
     Uso: .../admin/numeros/rol?clave=...&numero=56912345678&rol=zonal&zonal=Pedro Dominguez
+         .../admin/numeros/rol?clave=...&numero=56912345678&email=juan@aguasanta.cl&cierre=si
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
@@ -9294,16 +9536,24 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases"}
-        | set(ALIAS_PARAMETROS),
+        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email"}
+        | set(ALIAS_PARAMETROS) | PARAMETROS_BASES_EXTERNAS,
     )
     if error:
         return error
+    email_real, error = _email_param(email)
+    if error:
+        return error
+    cambios_externas, error = _bases_externas_param(request)
+    if error:
+        return error
     if (rol is None and productor is None and fundos is None and notificaciones is None
-            and acceso_total is None and zonal is None and plantas is None and embarques is None and bases is None):
+            and acceso_total is None and zonal is None and plantas is None and embarques is None and bases is None
+            and email_real is None and not cambios_externas):
         return JSONResponse(
             {"status": "error",
-             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, bases, productor, notificaciones o acceso_total"},
+             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, bases, email, "
+                      f"{', '.join(sorted(PARAMETROS_BASES_EXTERNAS))}, productor, notificaciones o acceso_total"},
             status_code=400,
         )
     if rol is not None and rol not in ROLES_VALIDOS:
@@ -9345,6 +9595,10 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
             fijar_nivel_embarques(numero, nivel_emb)
         if bases_elegidas is not None:
             fijar_bases(numero, bases_elegidas)
+        if email_real is not None:
+            fijar_email(numero, email_real)
+        if cambios_externas:
+            fijar_bases_externas(numero, cambios_externas)
         num = normalizar_numero(numero)
         return {"status": "ok", "numero": num, **_estado_numero(num)}
     except Exception as e:
@@ -9801,6 +10055,35 @@ async def admin_quitar_numero(clave: str, numero: str):
         logger.error(f"Error quitando número permitido: {str(e)}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
+@app.get("/admin/avisar")
+def admin_avisar(clave: str, texto: str):
+    """
+    Aviso a los admin desde el Panel Elazo: pedidos de acceso, de cambio o de baja que llegan
+    desde el manual (protegido con clave). Va directo si la ventana de 24 h está abierta; si no,
+    queda en cola y se entrega apenas el admin le escriba al bot (no hay plantilla de Meta para
+    este aviso y la del cuestionario diría otra cosa).
+    """
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    texto = (texto or "").strip()[:1500]
+    if not texto:
+        return JSONResponse({"status": "error", "error": "Falta el texto"}, status_code=400)
+    directos = en_cola = errores = 0
+    for d in numeros_por_rol(("admin",)):
+        numero = d["numero"]
+        if ventana_24h_abierta(numero):
+            if enviar_whatsapp(numero, texto):
+                anotar_aviso_en_historial(numero, texto)
+                directos += 1
+            else:
+                errores += 1
+        elif encolar_mensaje_pendiente(numero, "aviso_panel", texto):
+            en_cola += 1
+        else:
+            errores += 1
+    logger.info(f"Aviso del panel a los admin: {directos} directos, {en_cola} en cola, {errores} con error")
+    return {"status": "ok", "directos": directos, "en_cola": en_cola, "errores": errores}
+
 @app.get("/test/mensaje")
 def test_mensaje(clave: str, mensaje: str, numero: str = None, guardar: bool = False):
     """
@@ -9820,10 +10103,23 @@ def test_mensaje(clave: str, mensaje: str, numero: str = None, guardar: bool = F
     return {"pregunta": mensaje, "respuesta": respuesta, "herramientas": traza}
 
 @app.get("/test/conexion")
-async def test_conexion(clave: str):
-    """PRUEBA: verifica la conexión a SQL Server (con la clave de administración)."""
+def test_conexion(clave: str, base: str = None, numero: str = None, email: str = None):
+    """PRUEBA: verifica la conexión a SQL Server (con la clave de administración).
+    base=cierre (u otra base externa): prueba esa base; con numero= usa el correo registrado de ese
+    número (o email= directo) y responde qué grupos ve. Ej.: .../test/conexion?clave=...&base=cierre&numero=569..."""
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if base is not None and base.strip().lower() not in ("", "cosecha"):
+        externa = bases_externas.BASES.get(base.strip().lower())
+        if not externa:
+            return JSONResponse({"status": "error", "error": f"No conozco la base '{base}'."}, status_code=400)
+        correo = (email or "").strip().lower() or email_de(numero)
+        try:
+            conn, _, alcance = externa.conectar(correo)
+            conn.close()
+        except bases_externas.ErrorBase as e:
+            return {"status": "Error", "base": externa.id, "estado": externa.estado(), "email": correo, "error": str(e)}
+        return {"status": "Conexión OK", "base": externa.id, "email": correo, "alcance": alcance}
     conn = conectar_sql()
     if conn:
         conn.close()
