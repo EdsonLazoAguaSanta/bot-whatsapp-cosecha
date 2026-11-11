@@ -6354,8 +6354,11 @@ def entregar_mensajes_pendientes(numero):
             referencia = fila["referencia"] or ""
             if referencia.startswith("informe:"):
                 # El informe diario se arma al entregarlo, con las cifras de ese momento.
-                _, tipo_informe, dia = referencia.split(":", 2)
-                ok = enviar_informe_diario_a(numero, tipo_informe, datetime.strptime(dia, "%Y-%m-%d").date()) != "error"
+                # informe:<tipo>:<AAAA-MM-DD>[:am|pm] (los anteriores al 11-11-2026 no traen el turno).
+                _, tipo_informe, resto = referencia.split(":", 2)
+                dia, _, turno_cola = resto.partition(":")
+                ok = enviar_informe_diario_a(numero, tipo_informe, datetime.strptime(dia, "%Y-%m-%d").date(),
+                                             turno=turno_cola or None) != "error"
             else:
                 ok = enviar_whatsapp(numero, fila["mensaje"])
             if not ok:
@@ -9114,25 +9117,60 @@ def _completar_confirmados(encabezados, filas, alcance, fecha):
         datos.append(total)
     return encabezados, datos
 
-def spec_informe_cosecha(fecha):
-    hoy, ayer, t, H, A, hd, ad = _fechas_informe(fecha)
+def turno_informe(ahora=None):
+    """'am' antes del mediodía (el informe muestra el día anterior cerrado) o 'pm' (corta el día de hoy a la
+    hora del informe). Pedido de Edson, 11-11-2026: las plantas reciben y procesan las 24 horas, así que el
+    informe de la mañana no debe mezclar lo poco que lleva el día con el día anterior."""
+    return "am" if (ahora or datetime.now()).hour < 12 else "pm"
+
+def _corte_informe(fecha, turno):
+    """Día de corte y sus textos. AM: el día anterior completo (hasta las 24:00). PM: hoy hasta la hora del
+    informe. Las fechas de las bases no traen hora: el PM toma todo lo registrado hoy hasta ese momento."""
+    am = turno == "am"
+    dia = fecha - timedelta(days=1) if am else fecha
+    hora = datetime.now().strftime("%H:%M")
+    d = dia.strftime("%d-%m")
+    return {"am": am, "dia": dia, "D": dia.strftime("%Y%m%d"), "d": d, "t": temporada_de(dia), "hora": hora,
+            "corte": f"cierre {d}" if am else f"corte {d} {hora}",
+            "al": f"al cierre del {d}" if am else f"al {d} {hora}",
+            "del_dia": f"del {d}" if am else "hoy",
+            "subtitulo": (f"cierre del día {d} (todo lo registrado hasta las 24:00)" if am
+                          else f"corte hoy {d} a las {hora} (el día va parcial)")}
+
+# Otras exportadoras en los informes diarios (11-11-2026): secciones aparte al final, solo para quien las ve
+# (ver ve_externas). Nunca se suman a las cifras de Agua Santa.
+_EXT_ESPECIE = "CASE Especie WHEN 'CHERRY' THEN 'Cereza' WHEN 'ORANGE // NARANJA' THEN 'Naranja' ELSE Especie END"
+_NOTA_EXTERNAS = ("Fruta de otras exportadoras que reciben y procesan las plantas: va aparte y no se suma a la de "
+                  "Agua Santa. Su temporada va de junio a mayo.")
+
+def spec_informe_cosecha(fecha, turno="pm"):
+    c = _corte_informe(fecha, turno)
+    am, t, D, d = c["am"], c["t"], c["D"], c["d"]
+    ayer = fecha - timedelta(days=1)
+    A, ad = ayer.strftime("%Y%m%d"), ayer.strftime("%d-%m")
     real, pre, tri = BASE_ORIGEN_REAL, BASE_ORIGEN_ESTIM_PRIMAVERA, BASE_ORIGEN_TRISEMANAL
-    corte = f"Temporada={t} AND CAST(Fecha AS DATE)<='{A}'"
+    corte = f"Temporada={t} AND CAST(Fecha AS DATE)<='{D}'"
     rt, pt = _suma_si(f"[Base Origen]='{real}' AND {corte}"), _suma_si(f"[Base Origen]='{pre}' AND {corte}")
-    ra = _suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{A}'")
-    th = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{H}'")
-    thc = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{H}'", "CajasEq")
-    rh = _suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{H}'")
-    kpis = (f"SELECT ROUND({rt},0) AS [Real temporada al {ad} (kg)], ROUND({pt},0) AS [Precosecha al {ad} (kg)], "
-            f"ROUND(100.0*{rt}/NULLIF({pt},0),1) AS [% avance vs Precosecha], ROUND({ra},0) AS [Real ayer {ad} (kg)], "
-            f"ROUND({th},0) AS [{KPI_KG_HOY}], ROUND({thc},0) AS [Trisemanal hoy (cajas eq)], "
-            f"ROUND({rh},0) AS [Real hoy parcial (kg)] FROM datos")
+    rd = _suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{D}'")
+    td = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{D}'")
+    tdc = _suma_si(f"[Base Origen]='{tri}' AND CAST(Fecha AS DATE)='{D}'", "CajasEq")
+    if am:
+        # AM: todo es del día anterior cerrado (pedido de Edson: C3 y C4 serían el mismo día, va solo C4).
+        kpis = (f"SELECT ROUND({rt},0) AS [Real temporada {c['al']} (kg)], ROUND({pt},0) AS [Precosecha {c['al']} (kg)], "
+                f"ROUND(100.0*{rt}/NULLIF({pt},0),1) AS [% avance vs Precosecha], ROUND({rd},0) AS [Real del {d} (kg)], "
+                f"ROUND({td},0) AS [Trisemanal del {d} (kg)], ROUND({tdc},0) AS [Trisemanal del {d} (cajas eq)] FROM datos")
+    else:
+        ra = _suma_si(f"[Base Origen]='{real}' AND CAST(Fecha AS DATE)='{A}'")
+        kpis = (f"SELECT ROUND({rt},0) AS [Real temporada {c['al']} (kg)], ROUND({pt},0) AS [Precosecha al {d} (kg)], "
+                f"ROUND(100.0*{rt}/NULLIF({pt},0),1) AS [% avance vs Precosecha], ROUND({ra},0) AS [Real ayer {ad} (kg)], "
+                f"ROUND({td},0) AS [{KPI_KG_HOY}], ROUND({tdc},0) AS [Trisemanal hoy (cajas eq)], "
+                f"ROUND({rd},0) AS [Real hoy parcial (kg)] FROM datos")
     grupo = f"{_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}"
     s_r = _suma_si(f"[Base Origen]='{real}'")
     s_p = _suma_si(f"[Base Origen]='{pre}'")
     s_t = _suma_si(f"[Base Origen]='{tri}'")
     secciones = [
-        {"titulo": f"1. Avance de la temporada por planta (corte {ad})", "bases": ("datos",),
+        {"titulo": f"Avance de la temporada por planta ({c['corte']})", "bases": ("datos",),
          "consulta_sql": (
              f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {s_r} AS R, {s_p} AS P FROM datos WHERE {corte} "
              f"AND [Base Origen] IN ('{real}','{pre}') GROUP BY {_INF_PLANTA}) "
@@ -9142,7 +9180,7 @@ def spec_informe_cosecha(fecha):
              "ROUND(100.0*SUM(R)/NULLIF(SUM(P),0),1), 9 FROM b) x ORDER BY O, [Real kg] DESC"),
          "grafico": {"tipo": "barras", "categoria": "Planta", "valores": ["Real kg", "Precosecha kg"],
                      "titulo": "Real vs Precosecha por planta (kg)"}},
-        {"titulo": f"2. Llegadas de la temporada por productor y variedad (corte {ad})", "bases": ("datos",),
+        {"titulo": f"Llegadas de la temporada por productor y variedad ({c['corte']})", "bases": ("datos",),
          "consulta_sql": (
              f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
              f"{s_r} AS R, {s_p} AS P FROM datos WHERE {corte} AND [Base Origen] IN ('{real}','{pre}') GROUP BY {grupo}) "
@@ -9152,21 +9190,25 @@ def spec_informe_cosecha(fecha):
              "ROUND(SUM(P),0),ROUND(100.0*SUM(R)/NULLIF(SUM(P),0),1),1,9 FROM b) x ORDER BY S, O, [Real kg] DESC"),
          "grafico": {"tipo": "ninguno"},
          "nota": "Rainier incluye Royal Rainier. % avance vacío = sin Precosecha cargada para esa línea."},
-        {"titulo": f"3. Llegadas de ayer {ad}: Trisemanal vs real", "bases": ("datos",),
-         "consulta_sql": (
-             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
-             f"{s_t} AS T, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{A}' AND [Base Origen] IN ('{tri}','{real}') "
-             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Trisemanal kg], [Real kg], [Diferencia kg] FROM ("
-             "SELECT Planta, Productor, Variedad, ROUND(T,0) AS [Trisemanal kg], ROUND(R,0) AS [Real kg], "
-             "ROUND(R-T,0) AS [Diferencia kg], 0 AS S FROM b WHERE T<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','',"
-             "ROUND(SUM(T),0),ROUND(SUM(R),0),ROUND(SUM(R-T),0),1 FROM b) x ORDER BY S, [Real kg] DESC, [Trisemanal kg] DESC"),
-         "grafico": {"tipo": "ninguno"}},
+    ]
+    if not am:
+        secciones.append(
+            {"titulo": f"Llegadas de ayer {ad}: Trisemanal vs real", "bases": ("datos",),
+             "consulta_sql": (
+                 f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+                 f"{s_t} AS T, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{A}' AND [Base Origen] IN ('{tri}','{real}') "
+                 f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Trisemanal kg], [Real kg], [Diferencia kg] FROM ("
+                 "SELECT Planta, Productor, Variedad, ROUND(T,0) AS [Trisemanal kg], ROUND(R,0) AS [Real kg], "
+                 "ROUND(R-T,0) AS [Diferencia kg], 0 AS S FROM b WHERE T<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','',"
+                 "ROUND(SUM(T),0),ROUND(SUM(R),0),ROUND(SUM(R-T),0),1 FROM b) x ORDER BY S, [Real kg] DESC, [Trisemanal kg] DESC"),
+             "grafico": {"tipo": "ninguno"}})
+    secciones += [
         # Columnas pedidas por Edson el 09-11-2026: Especie | Planta | Productor | Variedad |
         # Trisemanal kg | Precosecha kg | Confirmado kg | Real kg (sin las cajas eq de la Trisemanal).
-        {"titulo": f"4. Hoy {hd}: Trisemanal, Precosecha, confirmado y real", "bases": ("datos",),
+        {"titulo": f"{'Ayer' if am else 'Hoy'} {d}: Trisemanal, Precosecha, confirmado y real", "bases": ("datos",),
          "consulta_sql": (
              f"WITH b AS (SELECT {_INF_ESPECIE} AS Especie, {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, "
-             f"{_INF_VARIEDAD} AS Variedad, {s_t} AS T, {s_p} AS P, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{H}' "
+             f"{_INF_VARIEDAD} AS Variedad, {s_t} AS T, {s_p} AS P, {s_r} AS R FROM datos WHERE CAST(Fecha AS DATE)='{D}' "
              f"AND [Base Origen] IN ('{tri}','{pre}','{real}') GROUP BY Especie, {grupo}) "
              "SELECT Especie, Planta, Productor, Variedad, [Trisemanal kg], [Precosecha kg], [Real kg] FROM ("
              "SELECT Especie, Planta, Productor, Variedad, ROUND(T,0) AS [Trisemanal kg], ROUND(P,0) AS [Precosecha kg], "
@@ -9174,11 +9216,13 @@ def spec_informe_cosecha(fecha):
              "CASE Planta WHEN 'LISONJERA' THEN 1 WHEN 'EL CARMELO' THEN 2 ELSE 3 END AS OP FROM b "
              "WHERE T<>0 OR P<>0 OR R<>0 UNION ALL SELECT 'TOTAL','','','',ROUND(SUM(T),0),ROUND(SUM(P),0),"
              "ROUND(SUM(R),0),1,9,9 FROM b) x ORDER BY S, OE, Especie, OP, Planta, [Trisemanal kg] DESC"),
-         "completar": lambda encabezados, filas, alcance: _completar_confirmados(encabezados, filas, alcance, hoy),
+         "completar": lambda encabezados, filas, alcance: _completar_confirmados(encabezados, filas, alcance, c["dia"]),
          "grafico": {"tipo": "ninguno"},
-         "nota": "Confirmado = lo último que informó o confirmó el zonal para hoy (si confirmó sin cambios, la "
-                 "Trisemanal); vacío = sin respuesta. Real = recepción registrada hasta la hora del informe (parcial)."},
-        {"titulo": f"5. Confirmaciones y ajustes ({ad} y {hd})", "fuente": "confirmaciones",
+         "nota": ("Confirmado = lo último que informó o confirmó el zonal para ese día (si confirmó sin cambios, la "
+                  "Trisemanal); vacío = sin respuesta. Real = recepción del día completo." if am else
+                  "Confirmado = lo último que informó o confirmó el zonal para hoy (si confirmó sin cambios, la "
+                  "Trisemanal); vacío = sin respuesta. Real = recepción registrada hasta la hora del informe (parcial).")},
+        {"titulo": f"Confirmaciones y ajustes ({ad} y {fecha:%d-%m})", "fuente": "confirmaciones",
          "consulta_sql": (
              "SELECT substr(c.fecha_hora,9,2)||'-'||substr(c.fecha_hora,6,2)||' '||substr(c.fecha_hora,12,5) AS Hora, "
              "c.nombre AS Quien, substr(c.fecha,9,2)||'-'||substr(c.fecha,6,2) AS Para, "
@@ -9194,86 +9238,114 @@ def spec_informe_cosecha(fecha):
              "ELSE COALESCE(c.detalle, c.aviso, '') END AS Detalle "
              "FROM confirmaciones c WHERE c.evento <> 'resumen_planta' AND c.cuestionario_id IS NOT NULL "
              "AND c.id = (SELECT MAX(x.id) FROM confirmaciones x WHERE x.cuestionario_id = c.cuestionario_id "
-             f"AND x.evento <> 'resumen_planta') AND (c.fecha BETWEEN '{ayer.isoformat()}' AND '{hoy.isoformat()}' "
-             f"OR date(c.fecha_hora) BETWEEN '{ayer.isoformat()}' AND '{hoy.isoformat()}') "
+             f"AND x.evento <> 'resumen_planta') AND (c.fecha BETWEEN '{ayer.isoformat()}' AND '{fecha.isoformat()}' "
+             f"OR date(c.fecha_hora) BETWEEN '{ayer.isoformat()}' AND '{fecha.isoformat()}') "
              "ORDER BY c.fecha, c.id"),
          "total": False, "grafico": {"tipo": "ninguno"},
          "nota": "Último estado de cada cuestionario o reporte registrado ayer u hoy; «Para» = día al que se "
                  "refiere."},
+        {"titulo": f"Otras exportadoras: recepción ({c['corte']})", "externas": True,
+         "consulta_sql": (
+             f"WITH b AS (SELECT Planta, Exportadora, {_EXT_ESPECIE} AS Especie, "
+             f"SUM(CASE WHEN Fecha='{D}' THEN KgRecibidos ELSE 0 END) AS RD, SUM(KgRecibidos) AS RT FROM externas "
+             f"WHERE Temporada={t} AND Fecha<='{D}' GROUP BY Planta, Exportadora, Especie) "
+             f"SELECT Planta, Exportadora, Especie, [Recibido {c['del_dia']} kg], [Recibido temporada kg] FROM ("
+             f"SELECT Planta, Exportadora, Especie, ROUND(RD,0) AS [Recibido {c['del_dia']} kg], ROUND(RT,0) AS "
+             "[Recibido temporada kg], 0 AS S FROM b WHERE RT<>0 UNION ALL SELECT 'TOTAL','','',ROUND(SUM(RD),0),"
+             "ROUND(SUM(RT),0),1 FROM b) x ORDER BY S, [Recibido temporada kg] DESC"),
+         "grafico": {"tipo": "ninguno"}, "nota": _NOTA_EXTERNAS},
     ]
-    return {"titulo": f"Informe diario de cosecha – {DIAS_SEMANA[hoy.weekday()]} {hoy:%d-%m-%Y}",
-            "subtitulo": (f"Temporada {t} · kilos · real de la temporada con corte al {ad} · hoy con real parcial "
-                          f"a las {datetime.now():%H:%M} · Precosecha = Estim Primavera"),
+    return {"titulo": f"Informe diario de cosecha – {DIAS_SEMANA[fecha.weekday()]} {fecha:%d-%m-%Y}",
+            "subtitulo": f"Temporada {t} · kilos de Agua Santa · {c['subtitulo']} · Precosecha = Estim Primavera",
             "consulta_kpis": kpis, "secciones": secciones}
 
-def spec_informe_procesos(fecha):
-    hoy, ayer, t, H, A, hd, ad = _fechas_informe(fecha)
+def spec_informe_procesos(fecha, turno="pm"):
+    c = _corte_informe(fecha, turno)
+    am, t, D, d = c["am"], c["t"], c["D"], c["d"]
     pk, tp, real = "Packing Planta", "Trisem Proceso", BASE_ORIGEN_REAL
-    corte = f"Temporada={t} AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{A}'"
-    vt = _suma_si(f"[Base Origen]='{pk}' AND Temporada={t} AND CAST(Fecha AS DATE)<='{A}'", "KgsVaciados")
-    ct = _suma_si(f"[Base Origen]='{pk}' AND Temporada={t} AND CAST(Fecha AS DATE)<='{A}'", "CajasEq")
-    et = _suma_si(f"[Base Origen]='{pk}' AND Temporada={t} AND CAST(Fecha AS DATE)<='{A}'", "KgsEmbalados")
-    va = _suma_si(f"[Base Origen]='{pk}' AND CAST(Fecha AS DATE)='{A}'", "KgsVaciados")
-    ph = _suma_si(f"[Base Origen]='{tp}' AND CAST(Fecha AS DATE)='{H}'", "KgsVaciados")
-    phc = _suma_si(f"[Base Origen]='{tp}' AND CAST(Fecha AS DATE)='{H}'", "CajasEq")
-    vh = _suma_si(f"[Base Origen]='{pk}' AND CAST(Fecha AS DATE)='{H}'", "KgsVaciados")
-    kpis = (f"SELECT ROUND({vt},0) AS [Procesado temporada al {ad} (kg)], ROUND({ct},0) AS [Cajas eq temporada], "
-            f"ROUND(100.0*{et}/NULLIF({vt},0),1) AS [% embalaje temporada], ROUND({va},0) AS [Procesado ayer {ad} (kg)], "
-            f"ROUND({ph},0) AS [Programa hoy (kg)], ROUND({phc},0) AS [Programa hoy (cajas eq)], "
-            f"ROUND({vh},0) AS [Procesado hoy parcial (kg)] FROM packing")
+    corte = f"Temporada={t} AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{D}'"
+    vt, ct, et = (_suma_si(corte, "KgsVaciados"), _suma_si(corte, "CajasEq"), _suma_si(corte, "KgsEmbalados"))
+    del_dia = lambda base, col: _suma_si(f"[Base Origen]='{base}' AND CAST(Fecha AS DATE)='{D}'", col)
+    # Cifras pedidas por Edson el 11-11-2026: 4 = cajas eq producidas y 5 = cajas eq programadas del día.
+    sufijo = f"del {d}" if am else "hoy"
+    kpis = (f"SELECT ROUND({vt},0) AS [Procesado temporada {c['al']} (kg)], ROUND({ct},0) AS [Cajas eq temporada], "
+            f"ROUND(100.0*{et}/NULLIF({vt},0),1) AS [% embalaje temporada], "
+            f"ROUND({del_dia(pk, 'CajasEq')},0) AS [Cajas eq producidas {sufijo}{'' if am else ' (parcial)'}], "
+            f"ROUND({del_dia(tp, 'CajasEq')},0) AS [Cajas eq programadas {sufijo}], "
+            f"ROUND({del_dia(tp, 'KgsVaciados')},0) AS [Programa {sufijo} (kg)], "
+            f"ROUND({del_dia(pk, 'KgsVaciados')},0) AS [Procesado {sufijo}{'' if am else ' parcial'} (kg)] FROM packing")
     grupo = f"{_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}"
     campos_dia = (f"{_suma_si(f'[Base Origen]={chr(39)}{tp}{chr(39)}', 'KgsVaciados')} AS T, "
                   f"{_suma_si(f'[Base Origen]={chr(39)}{tp}{chr(39)}', 'CajasEq')} AS TC, "
                   f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsVaciados')} AS V, "
                   f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsEmbalados')} AS E, "
                   f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'CajasEq')} AS C")
+    planta_especie = f"{_INF_PLANTA}, Especie"
 
-    def seccion_dia(dia):
-        return (f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
-                f"{campos_dia} FROM packing WHERE CAST(Fecha AS DATE)='{dia}' AND [Base Origen] IN ('{tp}','{pk}') "
-                f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Programa kg], [Programa cajas eq], "
-                "[Procesado kg], [Cajas eq embaladas], [% embalaje] FROM (SELECT Planta, Productor, Variedad, "
-                "ROUND(T,0) AS [Programa kg], ROUND(TC,0) AS [Programa cajas eq], ROUND(V,0) AS [Procesado kg], "
-                "ROUND(C,0) AS [Cajas eq embaladas], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, "
-                f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL','','',ROUND(SUM(T),0),ROUND(SUM(TC),0),"
-                "ROUND(SUM(V),0),ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x "
-                "ORDER BY S, O, [Programa kg] DESC")
+    def por_planta(con_recepcion):
+        # P1 (11-11-2026): por planta y especie, con lo recibido y lo que falta procesar (recibido - procesado).
+        # Quien no tiene la base de cosecha la recibe sin esas dos columnas.
+        recibido = (f" UNION ALL SELECT {_INF_PLANTA}, {_INF_ESPECIE}, 0.0, 0.0, 0.0, SUM(KgsRecepcionados) FROM datos "
+                    f"WHERE Temporada={t} AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{D}' GROUP BY {planta_especie}"
+                    if con_recepcion else "")
+        extra = ", [Kg recibidos], [Kg por procesar]" if con_recepcion else ""
+        extra_b = ", ROUND(R,0) AS [Kg recibidos], ROUND(R-V,0) AS [Kg por procesar]" if con_recepcion else ""
+        extra_t = ", ROUND(SUM(R),0), ROUND(SUM(R-V),0)" if con_recepcion else ""
+        return (f"WITH r AS (SELECT {_INF_PLANTA} AS Planta, {_INF_ESPECIE} AS Especie, SUM(KgsVaciados) AS V, "
+                f"SUM(KgsEmbalados) AS E, SUM(CajasEq) AS C, 0.0 AS R FROM packing WHERE {corte} GROUP BY {planta_especie}"
+                f"{recibido}), b AS (SELECT Planta, Especie, SUM(V) AS V, SUM(E) AS E, SUM(C) AS C, SUM(R) AS R FROM r "
+                "GROUP BY Planta, Especie) SELECT Planta, Especie, [Procesado kg], [Embalado kg], [Cajas eq], [% embalaje]"
+                f"{extra} FROM (SELECT Planta, Especie, ROUND(V,0) AS [Procesado kg], ROUND(E,0) AS [Embalado kg], "
+                f"ROUND(C,0) AS [Cajas eq], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje]{extra_b}, 0 AS S, "
+                f"{_INF_ORDEN_PLANTA} AS O FROM b WHERE V<>0 OR R<>0 UNION ALL SELECT 'TOTAL', '', ROUND(SUM(V),0), "
+                f"ROUND(SUM(E),0), ROUND(SUM(C),0), ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1){extra_t}, 1, 9 FROM b) x "
+                "ORDER BY S, O, [Procesado kg] DESC")
 
+    grafico_p1 = {"tipo": "barras", "categoria": "Planta", "valores": ["Procesado kg", "Embalado kg"],
+                  "titulo": "Procesado vs embalado por planta (kg)"}
     secciones = [
-        {"titulo": f"1. Proceso de la temporada por planta (corte {ad})", "bases": ("packing",),
-         "consulta_sql": (
-             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, SUM(KgsVaciados) AS V, SUM(KgsEmbalados) AS E, "
-             f"SUM(CajasEq) AS C FROM packing WHERE {corte} GROUP BY {_INF_PLANTA}) SELECT Planta, [Procesado kg], "
-             "[Embalado kg], [Cajas eq], [% embalaje] FROM (SELECT Planta, ROUND(V,0) AS [Procesado kg], "
-             "ROUND(E,0) AS [Embalado kg], ROUND(C,0) AS [Cajas eq], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], "
-             f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL', ROUND(SUM(V),0), ROUND(SUM(E),0), "
-             "ROUND(SUM(C),0), ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1), 9 FROM b) x ORDER BY O, [Procesado kg] DESC"),
-         "grafico": {"tipo": "barras", "categoria": "Planta", "valores": ["Procesado kg", "Embalado kg"],
-                     "titulo": "Procesado vs embalado por planta (kg)"}},
-        {"titulo": f"2. Proceso de la temporada por productor y variedad (corte {ad})", "bases": ("packing",),
+        {"titulo": f"Proceso de la temporada por planta y especie ({c['corte']})", "bases": ("datos", "packing"),
+         "consulta_sql": por_planta(True), "grafico": grafico_p1,
+         "nota": "Kg por procesar = kg recibidos (recepción en planta) - kg procesados (vaciados), acumulado de la "
+                 "temporada."},
+        {"titulo": f"Proceso de la temporada por planta y especie ({c['corte']})", "bases": ("packing",),
+         "sin": "datos", "consulta_sql": por_planta(False), "grafico": grafico_p1},
+        # Desde / Hasta (11-11-2026): primer y último día en que se procesó (vació) esa variedad.
+        {"titulo": f"Proceso de la temporada por productor y variedad ({c['corte']})", "bases": ("packing",),
          "consulta_sql": (
              f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+             "MIN(CASE WHEN KgsVaciados<>0 THEN CAST(Fecha AS DATE) END) AS Di, "
+             "MAX(CASE WHEN KgsVaciados<>0 THEN CAST(Fecha AS DATE) END) AS Hi, "
              f"SUM(KgsVaciados) AS V, SUM(KgsEmbalados) AS E, SUM(CajasEq) AS C FROM packing WHERE {corte} "
-             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Procesado kg], [Cajas eq], [% embalaje] FROM ("
-             "SELECT Planta, Productor, Variedad, ROUND(V,0) AS [Procesado kg], ROUND(C,0) AS [Cajas eq], "
-             f"ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, {_INF_ORDEN_PLANTA} AS O FROM b UNION ALL "
-             "SELECT 'TOTAL','','',ROUND(SUM(V),0),ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x "
-             "ORDER BY S, O, [Procesado kg] DESC"),
+             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, Desde, Hasta, [Procesado kg], [Cajas eq], "
+             "[% embalaje] FROM (SELECT Planta, Productor, Variedad, Di AS Desde, Hi AS Hasta, ROUND(V,0) AS "
+             "[Procesado kg], ROUND(C,0) AS [Cajas eq], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, "
+             f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL','','',MIN(Di),MAX(Hi),ROUND(SUM(V),0),"
+             "ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x ORDER BY S, O, [Procesado kg] DESC"),
          "grafico": {"tipo": "ninguno"},
-         "nota": "Rainier incluye Royal Rainier. % embalaje = kg embalados / kg vaciados."},
-        {"titulo": f"3. Proceso de ayer {ad}: programa vs real", "bases": ("packing",),
-         "consulta_sql": seccion_dia(A), "grafico": {"tipo": "ninguno"}},
-        {"titulo": f"4. Hoy {hd}: programa vs procesado (parcial)", "bases": ("packing",),
-         "consulta_sql": seccion_dia(H), "grafico": {"tipo": "ninguno"},
-         "nota": "Procesado = registrado hasta la hora de generación del informe (parcial). El embalado del día se "
-                 "registra con desfase, por eso su % puede salir bajo."},
-        {"titulo": "5. Fruta recibida pendiente de proceso (cereza, corte hoy)", "bases": ("datos", "packing"),
+         "nota": "Rainier incluye Royal Rainier. Desde / Hasta = primer y último día en que se procesó esa variedad. "
+                 "% embalaje = kg embalados / kg vaciados."},
+        {"titulo": f"Proceso {'del ' + d if am else 'de hoy ' + d + ' (parcial)'}: programa vs real", "bases": ("packing",),
+         "consulta_sql": (
+             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+             f"{campos_dia} FROM packing WHERE CAST(Fecha AS DATE)='{D}' AND [Base Origen] IN ('{tp}','{pk}') "
+             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Programa kg], [Programa cajas eq], "
+             "[Procesado kg], [Cajas eq embaladas], [% embalaje] FROM (SELECT Planta, Productor, Variedad, "
+             "ROUND(T,0) AS [Programa kg], ROUND(TC,0) AS [Programa cajas eq], ROUND(V,0) AS [Procesado kg], "
+             "ROUND(C,0) AS [Cajas eq embaladas], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, "
+             f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL','','',ROUND(SUM(T),0),ROUND(SUM(TC),0),"
+             "ROUND(SUM(V),0),ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x "
+             "ORDER BY S, O, [Programa kg] DESC"),
+         "grafico": {"tipo": "ninguno"},
+         "nota": (None if am else "Procesado = registrado hasta la hora del informe (parcial). El embalado del día "
+                                  "se registra con desfase, por eso su % puede salir bajo.")},
+        {"titulo": f"Fruta recibida pendiente de proceso (cereza, {c['corte']})", "bases": ("datos", "packing"),
          "consulta_sql": (
              f"WITH r AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
              f"SUM(KgsRecepcionados) AS Rec, 0.0 AS Vac FROM datos WHERE Temporada={t} AND Especie='CHERRY' "
-             f"AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{H}' GROUP BY {grupo} UNION ALL "
+             f"AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{D}' GROUP BY {grupo} UNION ALL "
              f"SELECT {_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}, 0.0, SUM(KgsVaciados) FROM packing "
-             f"WHERE Temporada={t} AND Especie='CHERRY' AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{H}' "
+             f"WHERE Temporada={t} AND Especie='CHERRY' AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{D}' "
              f"GROUP BY {grupo}), g AS (SELECT Planta, Productor, Variedad, SUM(Rec) AS Rec, SUM(Vac) AS Vac FROM r "
              "GROUP BY Planta, Productor, Variedad) SELECT Planta, Productor, Variedad, [Recibido kg], [Procesado kg], "
              "[Pendiente kg] FROM (SELECT Planta, Productor, Variedad, ROUND(Rec,0) AS [Recibido kg], "
@@ -9283,11 +9355,11 @@ def spec_informe_procesos(fecha):
          "grafico": {"tipo": "ninguno"},
          "nota": "Recibido (recepción en planta) menos procesado (kg vaciados), acumulado de la temporada; "
                  "solo líneas con saldo."},
-        {"titulo": f"6. Embalado por calibre (cereza, corte {ad})", "bases": ("packing",),
+        {"titulo": f"Embalado por calibre (cereza, {c['corte']})", "bases": ("packing",),
          "consulta_sql": (
-             f"SELECT Calibre, [Embalado ayer {ad} kg], [Embalado temporada kg], [Cajas eq temporada], [% temporada] "
+             f"SELECT Calibre, [Embalado {c['del_dia']} kg], [Embalado temporada kg], [Cajas eq temporada], [% temporada] "
              "FROM (SELECT ISNULL(Calibre,'TOTAL') AS Calibre, "
-             f"ROUND({_suma_si(f'CAST(Fecha AS DATE)={chr(39)}{A}{chr(39)}', 'KgsEmbalados')},0) AS [Embalado ayer {ad} kg], "
+             f"ROUND({_suma_si(f'CAST(Fecha AS DATE)={chr(39)}{D}{chr(39)}', 'KgsEmbalados')},0) AS [Embalado {c['del_dia']} kg], "
              "ROUND(SUM(KgsEmbalados),0) AS [Embalado temporada kg], ROUND(SUM(CajasEq),0) AS [Cajas eq temporada], "
              "ROUND(100.0*SUM(KgsEmbalados)/NULLIF((SELECT SUM(KgsEmbalados) FROM packing WHERE "
              f"{corte} AND Especie='CHERRY'),0),1) AS [% temporada], GROUPING(Calibre) AS G, {_INF_ORDEN_CALIBRE} AS O "
@@ -9295,25 +9367,46 @@ def spec_informe_procesos(fecha):
              "WHERE [Embalado temporada kg]<>0 ORDER BY G, O"),
          "grafico": {"tipo": "barras", "categoria": "Calibre", "valores": ["Embalado temporada kg"],
                      "titulo": "Embalado de la temporada por calibre (kg)"}},
+        {"titulo": f"Otras exportadoras: proceso de la temporada ({c['corte']})", "externas": True,
+         "consulta_sql": (
+             f"WITH b AS (SELECT Planta, Exportadora, {_EXT_ESPECIE} AS Especie, SUM(KgRecibidos) AS R, "
+             "SUM(KgVaciados) AS V, SUM(KgPackingExportacion) AS X, SUM(KgPackingMercadoInterno) AS M, "
+             f"SUM(KgPackingDesecho) AS DS FROM externas WHERE Temporada={t} AND Fecha<='{D}' "
+             "GROUP BY Planta, Exportadora, Especie) SELECT Planta, Exportadora, Especie, [Recibido kg], [Procesado kg], "
+             "[Por procesar kg], [Exportación kg], [Mercado interno kg], [Desecho kg] FROM (SELECT Planta, Exportadora, "
+             "Especie, ROUND(R,0) AS [Recibido kg], ROUND(V,0) AS [Procesado kg], ROUND(R-V,0) AS [Por procesar kg], "
+             "ROUND(X,0) AS [Exportación kg], ROUND(M,0) AS [Mercado interno kg], ROUND(DS,0) AS [Desecho kg], 0 AS S "
+             "FROM b WHERE R<>0 OR V<>0 UNION ALL SELECT 'TOTAL','','',ROUND(SUM(R),0),ROUND(SUM(V),0),"
+             "ROUND(SUM(R-V),0),ROUND(SUM(X),0),ROUND(SUM(M),0),ROUND(SUM(DS),0),1 FROM b) x "
+             "ORDER BY S, [Procesado kg] DESC"),
+         "grafico": {"tipo": "ninguno"},
+         "nota": _NOTA_EXTERNAS + " Procesado = kg vaciados en proceso normal; exportación, mercado interno y "
+                                  "desecho = kg embalados."},
     ]
-    return {"titulo": f"Informe diario de procesos – {DIAS_SEMANA[hoy.weekday()]} {hoy:%d-%m-%Y}",
-            "subtitulo": (f"Temporada {t} · kilos vaciados y cajas eq · temporada con corte al {ad} · hoy con proceso "
-                          f"parcial a las {datetime.now():%H:%M} · Programa = Trisem Proceso"),
+    return {"titulo": f"Informe diario de procesos – {DIAS_SEMANA[fecha.weekday()]} {fecha:%d-%m-%Y}",
+            "subtitulo": (f"Temporada {t} · kilos vaciados y cajas eq de Agua Santa · {c['subtitulo']} · "
+                          "Programa = Trisem Proceso"),
             "consulta_kpis": kpis, "secciones": secciones}
 
 def _permisos_informe_diario(numero):
     """(alcance, bases, confirmaciones) con que se arma el informe diario de ese número."""
     return alcance_de(numero), bases_de(numero), puede_ver_confirmaciones(numero)
 
-def armar_informe_diario(tipo, fecha, numero, permisos=None):
-    """(informe, None) o (None, motivo) para ese número, con su alcance y sus bases."""
+def armar_informe_diario(tipo, fecha, numero, permisos=None, turno=None):
+    """(informe, None) o (None, motivo) para ese número, con su alcance y sus bases. turno: 'am' (cierre del
+    día anterior) o 'pm' (hoy hasta la hora del informe); sin turno, según la hora (ver turno_informe)."""
     alcance, bases, confirmaciones = permisos or _permisos_informe_diario(numero)
+    turno = turno or turno_informe()
     if alcance is not None and not alcance:
         return None, "sin fundos ni planta asignados"
     if ("datos" if tipo == "cosecha" else "packing") not in bases:
         return None, f"no tiene habilitada la base de {'cosecha' if tipo == 'cosecha' else 'packing'}"
-    spec = spec_informe_cosecha(fecha) if tipo == "cosecha" else spec_informe_procesos(fecha)
+    spec = spec_informe_cosecha(fecha, turno) if tipo == "cosecha" else spec_informe_procesos(fecha, turno)
+    # "sin": la variante para quien NO tiene esa base; "externas": solo para quien ve otras exportadoras.
+    externas = getattr(bases, "externas", False)
     secciones = [s for s in spec["secciones"] if set(s.get("bases", ())) <= set(bases)
+                 and not (s.get("sin") and s["sin"] in bases)
+                 and (externas or not s.get("externas"))
                  and (s.get("fuente") != "confirmaciones" or confirmaciones)]
     informe, error = armar_informe_personalizado(
         spec["titulo"], secciones, subtitulo=spec["subtitulo"], consulta_kpis=spec["consulta_kpis"],
@@ -9323,7 +9416,23 @@ def armar_informe_diario(tipo, fecha, numero, permisos=None):
         return None, error
     if not informe["secciones"]:
         return None, "sin datos"
+    # Se numeran al final: según el turno, el perfil y los datos del día, algunas secciones no van.
+    for i, seccion in enumerate(informe["secciones"], 1):
+        seccion["titulo"] = f"{i}. {seccion['titulo']}"
+    informe["kg_plantilla"] = _kg_plantilla(tipo, informe, fecha, turno, alcance, bases)
     return informe, None
+
+def _kg_plantilla(tipo, informe, fecha, turno, alcance, bases):
+    """Kilos de la plantilla de aviso («{{2}} kg previstos»): la Trisemanal de hoy. El informe PM la trae
+    entre sus cifras; el AM muestra el día anterior, así que se consulta aparte."""
+    if tipo != "cosecha":
+        return 0
+    if turno != "am":
+        return _kpi_valor(informe, KPI_KG_HOY)
+    r, e = ejecutar_consulta_sql(
+        f"SELECT SUM(KgsRecepcionados) FROM datos WHERE [Base Origen]='{BASE_ORIGEN_TRISEMANAL}' "
+        f"AND CAST(Fecha AS DATE)='{fecha:%Y%m%d}'", alcance, max_filas=1, bases=bases)
+    return (r["filas"][0][0] or 0) if r and r["filas"] else 0
 
 def _pdf_informe_diario(informe):
     _preparar_informe(informe)
@@ -9332,10 +9441,10 @@ def _pdf_informe_diario(informe):
 def _kpi_valor(informe, etiqueta):
     return next((k["valor"] for k in informe.get("kpis", []) if k["etiqueta"] == etiqueta), 0) or 0
 
-def enviar_informe_diario_a(numero, tipo, fecha):
+def enviar_informe_diario_a(numero, tipo, fecha, turno=None):
     """Arma y manda un informe diario a una persona (al entregar la cola). 'enviado',
     'sin_datos' o 'error'."""
-    informe, motivo = armar_informe_diario(tipo, fecha, numero)
+    informe, motivo = armar_informe_diario(tipo, fecha, numero, turno=turno)
     if not informe:
         logger.info(f"Informe diario de {tipo} para {numero}: no se envía ({motivo})")
         return "sin_datos"
@@ -9343,7 +9452,7 @@ def enviar_informe_diario_a(numero, tipo, fecha):
     ok = enviar_documento(numero, contenido, nombre, FORMATOS_ARCHIVO["pdf"][1], descripcion=informe["titulo"])
     return "enviado" if ok else "error"
 
-def enviar_informes_diarios(fecha=None, numeros=None):
+def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
     """Job diario (INFORMES_DIARIOS_HORAS, 08:00 y 16:00): el informe de cosecha y el de procesos a todos los
     usuarios de INFORMES_DIARIOS_PERFILES, cada uno con su alcance y sus bases. Cada versión
     distinta del PDF se arma y se sube una sola vez. Con la ventana de 24 h cerrada va la
@@ -9354,6 +9463,7 @@ def enviar_informes_diarios(fecha=None, numeros=None):
         return
     try:
         fecha = fecha or date.today()
+        turno = turno or turno_informe()
         if numeros:
             buscados = {normalizar_numero(n) for n in numeros}
             destinatarios = [d for d in numeros_por_rol(ROLES_VALIDOS) if d["numero"] in buscados]
@@ -9371,15 +9481,15 @@ def enviar_informes_diarios(fecha=None, numeros=None):
             archivos = []
             for tipo in TIPOS_INFORME_DIARIO:
                 clave = (tipo, type(alcance).__name__, tuple(alcance) if alcance is not None else None,
-                         tuple(bases), confirmaciones)
+                         tuple(bases), getattr(bases, "externas", False), confirmaciones)
                 if clave not in versiones:
-                    informe, motivo = armar_informe_diario(tipo, fecha, num, permisos)
+                    informe, motivo = armar_informe_diario(tipo, fecha, num, permisos, turno)
                     version = None
                     if informe:
                         contenido, nombre = _pdf_informe_diario(informe)
                         media_id = subir_media(contenido, nombre, FORMATOS_ARCHIVO["pdf"][1])
                         version = {"media_id": media_id, "nombre": nombre, "titulo": informe["titulo"],
-                                   "kg": _kpi_valor(informe, KPI_KG_HOY)}
+                                   "kg": informe.get("kg_plantilla", 0)}
                     versiones[clave] = version
                 if versiones[clave]:
                     archivos.append((tipo, versiones[clave]))
@@ -9411,13 +9521,14 @@ def enviar_informes_diarios(fecha=None, numeros=None):
             conn.close()
             for t, a in archivos:
                 encolar_mensaje_pendiente(num, f"informe_diario_{t}", f"({a['titulo']})",
-                                          referencia=f"informe:{t}:{fecha.isoformat()}")
+                                          referencia=f"informe:{t}:{fecha.isoformat()}:{turno}")
                 recibieron[t].append(d)
             cuenta["personas_plantilla"] += 1
         for tipo, personas in recibieron.items():
             if personas:
-                registrar_alerta_enviada(f"informe_diario_{tipo}", f"Informe diario de {tipo} del {fecha:%d-%m-%Y}", personas)
-        logger.info(f"Informes diarios {fecha}: {cuenta}")
+                registrar_alerta_enviada(f"informe_diario_{tipo}",
+                                         f"Informe diario de {tipo} {turno.upper()} del {fecha:%d-%m-%Y}", personas)
+        logger.info(f"Informes diarios {fecha} {turno.upper()}: {cuenta}")
         return cuenta
     except Exception as e:
         logger.exception(f"Error en los informes diarios: {str(e)}")
@@ -10214,15 +10325,19 @@ async def admin_resumen_plantas(clave: str, solo_ver: bool = False, fecha: str =
     return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_resumen_plantas(fecha=dia)}
 
 @app.get("/admin/informes_diarios")
-def admin_informes_diarios(clave: str, fecha: str = None, numero: str = None, solo_ver: bool = False):
+def admin_informes_diarios(clave: str, fecha: str = None, numero: str = None, solo_ver: bool = False,
+                           turno: str = None):
     """
     Dispara los informes diarios de cosecha y procesos (mismo envío que el job, respeta el modo
     prueba/producción). numero=569... los manda solo a ese usuario. Con solo_ver=true arma los PDF
     de ese número (o del admin) SIN enviarlos y los deja en la carpeta temporal del servidor.
-    Uso: .../admin/informes_diarios?clave=...&solo_ver=true&numero=569...
+    turno=am|pm elige el corte (AM: cierre del día anterior; PM: hoy hasta la hora); sin turno, según la hora.
+    Uso: .../admin/informes_diarios?clave=...&solo_ver=true&numero=569...&turno=am
     """
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    if turno not in (None, "am", "pm"):
+        return JSONResponse({"status": "error", "error": "turno debe ser am o pm"}, status_code=400)
     try:
         dia = _parsear_fecha_param(fecha)
     except ValueError:
@@ -10235,7 +10350,7 @@ def admin_informes_diarios(clave: str, fecha: str = None, numero: str = None, so
             return JSONResponse({"status": "error", "error": "numero no está en la lista"}, status_code=400)
         archivos = {}
         for tipo in TIPOS_INFORME_DIARIO:
-            informe, motivo = armar_informe_diario(tipo, dia, objetivo)
+            informe, motivo = armar_informe_diario(tipo, dia, objetivo, turno=turno)
             if not informe:
                 archivos[tipo] = {"enviaria": False, "motivo": motivo}
                 continue
@@ -10247,7 +10362,8 @@ def admin_informes_diarios(clave: str, fecha: str = None, numero: str = None, so
                               "cifras": {k["etiqueta"]: k["valor"] for k in informe["kpis"]}}
         return {"status": "ok", "numero": objetivo, "informes": archivos}
     numeros = [numero] if numero else None
-    return {"status": "ok", "modo": _modo_envios(), "resultado": enviar_informes_diarios(fecha=dia, numeros=numeros)}
+    return {"status": "ok", "modo": _modo_envios(),
+            "resultado": enviar_informes_diarios(fecha=dia, numeros=numeros, turno=turno)}
 
 @app.get("/admin/aprobaciones")
 def admin_aprobaciones(clave: str, limit: int = 30):
