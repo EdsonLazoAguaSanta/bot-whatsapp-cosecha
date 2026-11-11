@@ -7712,10 +7712,13 @@ def _unidad_columna(encabezado):
         return "cajas"
     return None
 
-def grafico_desde_tabla(encabezados, filas, tipos, por=None, valores=None, tipo=None, titulo=None):
+def grafico_desde_tabla(encabezados, filas, tipos, por=None, valores=None, tipo=None, titulo=None,
+                        grupos=None, orden_fijo=None):
     """Gráfico de totales a partir de una tabla: suma las columnas numéricas por la
     categoría elegida (la primera columna de texto si no se indica). Las categorías que no
-    son tiempo van de mayor a menor y las que sobran se juntan en "Otros"."""
+    son tiempo van de mayor a menor y las que sobran se juntan en "Otros". grupos = {categoría:
+    la que la absorbe} (ej. 4JD suma en 4J); orden_fijo = orden de las categorías (las demás van después,
+    como vengan), en vez de ordenar por valor."""
     if not filas:
         return None
     idx_cat = _buscar_columna(encabezados, por) if por else None
@@ -7743,6 +7746,7 @@ def grafico_desde_tabla(encabezados, filas, tipos, por=None, valores=None, tipo=
     orden, acumulado = [], {}
     for fila in filas:
         clave = _texto_celda(fila[idx_cat], tipos[idx_cat]) or "(sin dato)"
+        clave = (grupos or {}).get(clave, clave)
         if clave not in acumulado:
             acumulado[clave] = [0.0] * len(idx_val)
             orden.append(clave)
@@ -7752,7 +7756,10 @@ def grafico_desde_tabla(encabezados, filas, tipos, por=None, valores=None, tipo=
 
     tipo = tipo if tipo in TIPOS_GRAFICO else None
     cronologica = _es_cronologica(encabezados[idx_cat], tipos[idx_cat])
-    if not cronologica:
+    if orden_fijo:
+        orden = [c for c in orden_fijo if c in acumulado] + [c for c in orden if c not in orden_fijo]
+        tipo = tipo or "barras"
+    elif not cronologica:
         maximo = 6 if tipo == "torta" else MAX_CATEGORIAS_GRAFICO
         orden.sort(key=lambda c: acumulado[c][0], reverse=True)
         if len(orden) > maximo:
@@ -8857,15 +8864,26 @@ def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None,
             total = fila_total(encabezados, filas, tipos) if seccion.get("total", True) else None
         pedido = seccion.get("grafico") or {}
         dibujo = None
-        if pedido.get("tipo") != "ninguno" and filas and (
+        datos_grafico = (encabezados, filas, tipos)
+        if pedido.get("consulta_sql") and filas:
+            # Informes automáticos: el gráfico trae su propia consulta (ej. cajas eq producidas vs Precosecha,
+            # que no son columnas de la tabla). Las secciones que arma Claude no lo usan.
+            res_g, err_g = _consulta_informe(pedido["consulta_sql"], seccion.get("fuente"), alcance, MAX_FILAS_INFORME,
+                                             embarques, confirmaciones, bases, externas)
+            if err_g:
+                return None, f"ERROR en el gráfico de la sección '{nombre}': {err_g}"
+            filas_g = [[_valor_normalizado(v) for v in f] for f in res_g["filas"]]
+            datos_grafico = (res_g["columnas"], filas_g, _tipos_columnas(res_g["columnas"], filas_g))
+        if pedido.get("tipo") != "ninguno" and datos_grafico[1] and (
                 pedido.get("tipo") or (not alguno_pide_grafico and numero_seccion == 0)):
             if pivoteada and not pedido.get("categoria"):
                 dibujo = grafico_totales_por_columna(encabezados, filas, tipos,
                                                      titulo=pedido.get("titulo"), tipo=pedido.get("tipo"))
             else:
-                dibujo = grafico_desde_tabla(encabezados, filas, tipos, por=pedido.get("categoria"),
+                dibujo = grafico_desde_tabla(*datos_grafico, por=pedido.get("categoria"),
                                              valores=pedido.get("valores"), tipo=pedido.get("tipo"),
-                                             titulo=pedido.get("titulo"))
+                                             titulo=pedido.get("titulo"), grupos=pedido.get("grupos"),
+                                             orden_fijo=pedido.get("orden"))
         nota = seccion.get("nota")
         if resultado["truncado"]:
             nota = ((nota + " ") if nota else "") + (
@@ -9301,8 +9319,15 @@ def spec_informe_procesos(fecha, turno="pm"):
                 f"ROUND(SUM(E),0), ROUND(SUM(C),0), ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1){extra_t}, 1, 9 FROM b) x "
                 "ORDER BY S, O, [Procesado kg] DESC")
 
-    grafico_p1 = {"tipo": "barras", "categoria": "Planta", "valores": ["Procesado kg", "Embalado kg"],
-                  "titulo": "Procesado vs embalado por planta (kg)"}
+    # Gráfico de P1 (Edson, 11-11-2026): cajas eq producidas vs la Precosecha (Estim Primavera) en cajas eq.
+    grafico_p1 = {"tipo": "barras", "categoria": "Planta", "valores": ["Cajas eq producidas", "Precosecha cajas eq"],
+                  "titulo": "Cajas eq producidas vs Precosecha por planta (cajas eq)",
+                  "consulta_sql": (
+                      f"SELECT {_INF_PLANTA} AS Planta, "
+                      f"ROUND(SUM(CASE WHEN [Base Origen]='{pk}' THEN CajasEq ELSE 0 END),0) AS [Cajas eq producidas], "
+                      f"ROUND(SUM(CASE WHEN [Base Origen]='{BASE_ORIGEN_ESTIM_PRIMAVERA}' THEN CajasEq ELSE 0 END),0) "
+                      f"AS [Precosecha cajas eq] FROM packing WHERE Temporada={t} AND CAST(Fecha AS DATE)<='{D}' "
+                      f"AND [Base Origen] IN ('{pk}','{BASE_ORIGEN_ESTIM_PRIMAVERA}') GROUP BY {_INF_PLANTA}")}
     secciones = [
         {"titulo": f"Proceso de la temporada por planta y especie ({c['corte']})", "bases": ("datos", "packing"),
          "consulta_sql": por_planta(True), "grafico": grafico_p1,
@@ -9339,13 +9364,13 @@ def spec_informe_procesos(fecha, turno="pm"):
          "grafico": {"tipo": "ninguno"},
          "nota": (None if am else "Procesado = registrado hasta la hora del informe (parcial). El embalado del día "
                                   "se registra con desfase, por eso su % puede salir bajo.")},
-        {"titulo": f"Fruta recibida pendiente de proceso (cereza, {c['corte']})", "bases": ("datos", "packing"),
+        {"titulo": f"Fruta recibida pendiente de proceso ({c['corte']})", "bases": ("datos", "packing"),
          "consulta_sql": (
              f"WITH r AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
-             f"SUM(KgsRecepcionados) AS Rec, 0.0 AS Vac FROM datos WHERE Temporada={t} AND Especie='CHERRY' "
+             f"SUM(KgsRecepcionados) AS Rec, 0.0 AS Vac FROM datos WHERE Temporada={t} "
              f"AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{D}' GROUP BY {grupo} UNION ALL "
              f"SELECT {_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}, 0.0, SUM(KgsVaciados) FROM packing "
-             f"WHERE Temporada={t} AND Especie='CHERRY' AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{D}' "
+             f"WHERE Temporada={t} AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{D}' "
              f"GROUP BY {grupo}), g AS (SELECT Planta, Productor, Variedad, SUM(Rec) AS Rec, SUM(Vac) AS Vac FROM r "
              "GROUP BY Planta, Productor, Variedad) SELECT Planta, Productor, Variedad, [Recibido kg], [Procesado kg], "
              "[Pendiente kg] FROM (SELECT Planta, Productor, Variedad, ROUND(Rec,0) AS [Recibido kg], "
@@ -9366,7 +9391,10 @@ def spec_informe_procesos(fecha, turno="pm"):
              f"FROM packing WHERE {corte} AND Especie='CHERRY' GROUP BY Calibre WITH ROLLUP) x "
              "WHERE [Embalado temporada kg]<>0 ORDER BY G, O"),
          "grafico": {"tipo": "barras", "categoria": "Calibre", "valores": ["Embalado temporada kg"],
-                     "titulo": "Embalado de la temporada por calibre (kg)"}},
+                     "titulo": "Embalado de la temporada por calibre (kg)",
+                     # Edson, 11-11-2026: cada calibre D suma en su calibre (4JD = 4J ... LD = L).
+                     "grupos": {"4JD": "4J", "3JD": "3J", "2JD": "2J", "JD": "J", "XLD": "XL", "LD": "L"},
+                     "orden": ["4J", "3J", "2J", "J", "XL", "L"]}},
         {"titulo": f"Otras exportadoras: proceso de la temporada ({c['corte']})", "externas": True,
          "consulta_sql": (
              f"WITH b AS (SELECT Planta, Exportadora, {_EXT_ESPECIE} AS Especie, SUM(KgRecibidos) AS R, "
