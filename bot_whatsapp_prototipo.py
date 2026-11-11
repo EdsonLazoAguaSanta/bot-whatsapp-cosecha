@@ -437,6 +437,10 @@ def inicializar_db_local():
     # muestran los datos según ese correo. Lo fija solo el administrador (/admin), nunca el mensaje.
     if "email" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN email TEXT")
+    # Ve la fruta de OTRAS exportadoras que procesan las plantas (desde el 11-11-2026): 1 = sí. Solo cuenta
+    # para gerencia (ver ve_externas); vacío = no, así nadie la ve hasta que Edson se la active.
+    if "ver_externas" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN ver_externas INTEGER")
     # Bases externas por número (ids de bases_externas.BASES, ej. 'cierre'), además de las que traiga su
     # perfil: habilitada = 1 se la da, 0 se la quita aunque su perfil la traiga. Sin fila = lo del perfil.
     conn.execute("""
@@ -985,6 +989,7 @@ def listar_numeros_permitidos():
         fila["plantas"] = plantas_de(fila["numero"])
         fila["embarques"] = NOMBRE_NIVEL_EMBARQUES[nivel_embarques(fila["numero"])]
         fila["bases"] = NOMBRE_BASES[bases_de(fila["numero"])]
+        fila["externas"] = ve_externas(fila["numero"])
     conn.close()
     return filas
 
@@ -2544,7 +2549,12 @@ TABLAS_EMBARQUES = ("embarques", "embarques_detalle", "embarques_fob", "embarque
 # sin FOB para «solo embarques» y con FOB para quien lo ve.
 TABLAS_POR_NIVEL = {0: (), 1: ("embarques", "embarques_detalle", "embarques_pallets"),
                     2: ("embarques", "embarques_fob", "embarques_pallets")}
-NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES}
+# Otras exportadoras (desde el 11-11-2026): lo que las plantas propias reciben, vacían y embalan para OTRAS
+# exportadoras. Control_EAS lo carga cada hora en PKG-Externas (las tablas de siempre filtran solo Agua Santa,
+# id_exportadora 32). Es información de terceros: solo gerencia, y solo a quien Edson se la active.
+TABLAS_EXTERNAS = ("externas", "externas_detalle")
+ROLES_EXTERNAS = ("gerencia",)
+NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES, *TABLAS_EXTERNAS}
 
 NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
 NOMBRE_NIVEL_EMBARQUES = {nivel: nombre for nombre, nivel in NIVELES_EMBARQUES.items()}
@@ -2584,7 +2594,48 @@ BASES_LECTURA = {"ambas": ("datos", "packing"), "cosecha": ("datos",), "packing"
 NOMBRE_BASES = {tablas: nombre for nombre, tablas in BASES_LECTURA.items()}
 BASES_POR_DEFECTO = "cosecha"
 
+class BasesLectura(tuple):
+    """Las mismas tuplas de BASES_LECTURA, marcadas con si el usuario ve las otras exportadoras (externas).
+    Se compara, se usa de clave y se recorre igual que la tupla, así pasa sin cambios por consultar_sql,
+    generar_informe y los informes; validar_consulta_sql y _consulta_con_datos leen la marca."""
+    externas = False
+
+def ve_externas(numero):
+    """Si ve la fruta de otras exportadoras (tablas externas): el admin, siempre; gerencia, si se le activó;
+    los demás perfiles, nunca. Sin número es una prueba local de administración (ver /test/mensaje)."""
+    if numero is None:
+        return True
+    rol = rol_de(numero)
+    if rol == "admin":
+        return True
+    if rol not in ROLES_EXTERNAS:
+        return False
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute("SELECT ver_externas FROM numeros_permitidos WHERE numero = ?",
+                            (normalizar_numero(numero),)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo si ve otras exportadoras: {str(e)}")
+        return False
+    return bool(fila and fila[0])
+
+def fijar_externas(numero, si):
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.execute("UPDATE numeros_permitidos SET ver_externas = ? WHERE numero = ?", (1 if si else 0, normalizar_numero(numero)))
+    conn.commit()
+    conn.close()
+
 def bases_de(numero):
+    """Tablas que puede leer (_bases_elegidas), marcadas con si ve las otras exportadoras."""
+    tablas = _bases_elegidas(numero)
+    if tablas and ve_externas(numero):
+        marcadas = BasesLectura(tablas)
+        marcadas.externas = True
+        return marcadas
+    return tablas
+
+def _bases_elegidas(numero):
     """Tablas que puede leer: el admin, ambas; los demás, lo que se les haya elegido. Sin elegir
     = lo de su perfil (solo cosecha, así nadie ve Packing hasta que se le habilite; finanzas,
     ninguna). Sin número es una prueba local de administración (ver /test/mensaje)."""
@@ -2705,7 +2756,10 @@ def validar_consulta_sql(sql, tablas_extra=(), bases=BASES_LECTURA["ambas"]):
     reservados = ctes & NOMBRES_RESERVADOS_SQL
     if reservados:
         return None, f"No definas un WITH llamado '{sorted(reservados)[0]}': ese nombre ya es una tabla."
-    permitidas = {*bases, *tablas_extra, "conversiones"}
+    externas = TABLAS_EXTERNAS if getattr(bases, "externas", False) else ()
+    permitidas = {*bases, *tablas_extra, *externas, "conversiones"}
+    if {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EXTERNAS) - permitidas):
+        return None, "Las tablas de otras exportadoras (externas) no están habilitadas para este usuario."
     vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
     if vedadas:
         if "embarques" in permitidas:
@@ -2865,6 +2919,26 @@ def _cte_packing(alcance):
             "NULLIF(LTRIM(RTRIM(pc.Calibre)), '') AS Calibre "
             f"FROM [Packing_Consolidado] pc WHERE {' AND '.join(condiciones)})")
 
+def _ctes_externas():
+    """Otras exportadoras: `externas` (kilos por día, con las reglas de Control_EAS: vaciado solo proceso normal
+    y packing separado en exportación, mercado interno y desecho) y `externas_detalle` (un movimiento por fila,
+    con productor, variedad, categoría y calibre). Sin filtro de alcance: solo las ve quien tiene el permiso."""
+    texto = lambda c: f"NULLIF(LTRIM(RTRIM({c})), '')"
+    return [
+        "externas AS (SELECT LTRIM(RTRIM(e.Planta)) AS Planta, e.Temporada, e.Fecha, "
+        f"{texto('e.Exportadora')} AS Exportadora, {texto('e.Especie')} AS Especie, "
+        "CAST(e.Kg_Recibidos AS FLOAT) AS KgRecibidos, CAST(e.Kg_Vaciados AS FLOAT) AS KgVaciados, "
+        "CAST(e.Kg_Packing_Exportacion AS FLOAT) AS KgPackingExportacion, "
+        "CAST(e.Kg_Packing_Mercado_Interno AS FLOAT) AS KgPackingMercadoInterno, "
+        "CAST(e.Kg_Packing_Desecho AS FLOAT) AS KgPackingDesecho FROM [PKG-Externas-Diario] e)",
+        "externas_detalle AS (SELECT LTRIM(RTRIM(x.Planta)) AS Planta, LTRIM(RTRIM(x.Tipo)) AS Tipo, x.Temporada, "
+        f"x.Fecha, {texto('x.Exportadora')} AS Exportadora, {texto('x.Especie')} AS Especie, "
+        f"{texto('x.Variedad')} AS Variedad, {texto('x.Productor')} AS Productor, {texto('x.Envase')} AS Envase, "
+        f"{texto('x.Tipo_proceso')} AS TipoProceso, {texto('x.Tipo_categoria')} AS TipoCategoria, "
+        f"{texto('x.Categoria')} AS Categoria, {texto('x.Calibre')} AS Calibre, CAST(x.Bultos AS FLOAT) AS Bultos, "
+        "CAST(x.Kilos AS FLOAT) AS Kilos FROM [PKG-Externas] x)",
+    ]
+
 def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA["ambas"]):
     """Antepone el WITH "datos": la tabla real + Zonal, con la temporada oficial por fecha,
     sin las filas duplicadas sin kilos (las mismas que excluyen todas las consultas del bot)
@@ -2890,6 +2964,8 @@ def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA[
     if embarques:
         nivel_emb = 2 if embarques is True else int(embarques)
         ctes += [cte for nombre, cte in _ctes_embarques(nivel_emb).items() if nombre in _tablas_embarques(embarques)]
+    if getattr(bases, "externas", False):
+        ctes += _ctes_externas()
     resto = re.sub(r"^\s*with\s+", "", consulta, flags=re.I)
     if resto != consulta:
         return f"WITH {', '.join(ctes)}, {resto}"
@@ -3713,6 +3789,27 @@ _SQL_PACKING_EDGE = (
     "exportadora, con FuenteReal = 'Edge' (en el resto FuenteReal = 'FX'). Ya viene sin duplicar: no sumes nada "
     "aparte. Las filas de Edge no traen Categoria ni Calibre: si preguntan por calibre o categoría de esas "
     "plantas y temporadas, dilo. "
+)
+INSTRUCCION_EXTERNAS = (
+    "OTRAS EXPORTADORAS: las tablas `datos` y `packing` (y las herramientas de cosecha) traen SOLO la fruta de Agua "
+    "Santa. Las plantas Buin (El Carmelo), Lisonjera (Linares) y Almahue también reciben, vacían y embalan fruta de "
+    "OTRAS exportadoras (hoy Agrícola Alci SpA, San Francisco Lo Garces Ltda. y Exportadora del Sur S.A.), y este "
+    "usuario puede verla en consultar_sql y en las secciones de generar_informe con dos tablas. (1) `externas`, "
+    "kilos por día: Planta ('Buin (El Carmelo)' = 'PLANTA EL CARMELO' de `datos` y `packing`;'Lisonjera (Linares)' "
+    "= 'PLANTA LISONJERA'; Almahue cuando tenga datos), Temporada (int, va de JUNIO a MAYO: la 2027 es jun-2026 a "
+    "may-2027; no es la regla de `datos`), Fecha (date), Exportadora, Especie ('CHERRY', 'ORANGE // NARANJA'), "
+    "KgRecibidos, KgVaciados, KgPackingExportacion, KgPackingMercadoInterno y KgPackingDesecho. Úsala para totales "
+    "y comparaciones: ya trae las reglas (vaciado = proceso normal; packing separado en exportación, mercado "
+    "interno y desecho). (2) `externas_detalle`, un movimiento por fila: Planta, Tipo ('Recepcion', 'Vaciado', "
+    "'Packing'), Temporada, Fecha, Exportadora, Especie, Variedad, Productor, Envase, TipoProceso ('PRN' = proceso "
+    "normal; 'RPI' y 'RPP' = reprocesos), TipoCategoria ('Exportacion', 'Mercado Interno', 'Desecho'), Categoria, "
+    "Calibre, Bultos y Kilos. Úsala para productor, variedad, envase, categoría o calibre; para lo vaciado o "
+    "embalado filtra TipoProceso = 'PRN' (los reprocesos repiten kilos). REGLAS: (a) di SIEMPRE de qué "
+    "exportadora son los kilos. (b) Si preguntan cuánto recibió o procesó una planta, da lo de Agua Santa y lo de "
+    "las otras exportadoras por separado; si das un total de la planta, di que suma las dos. Nunca sumes sin "
+    "avisarlo. (c) Es información de terceros: no la mezcles en rankings de productores de Agua Santa y no la "
+    "ofrezcas si no la piden. (d) Sus productores no tienen zonal ni están en la asignación de Agua Santa. (e) Hay "
+    "datos desde junio de 2026 (temporada 2027) y se actualizan cada hora. "
 )
 _SQL_FIN = "Devuelve máximo 400 filas. Si da error, lee el mensaje, corrige y reintenta."
 
@@ -4553,6 +4650,17 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
             "herramientas de cosecha, así que ignora lo que digan estas instrucciones sobre consultarlas y no "
             "ofrezcas esos datos. Si los pide, explícale con amabilidad que no tiene habilitada la cosecha y que "
             "puede pedírsela a Edson Lazo."
+        )
+    if getattr(bases, "externas", False):
+        partes.append(INSTRUCCION_EXTERNAS)
+    elif bases:
+        partes.append(
+            "OTRAS EXPORTADORAS: las tablas `datos` y `packing` (y las herramientas de cosecha) traen SOLO la fruta de "
+            "Agua Santa. Las plantas también reciben y procesan fruta de otras exportadoras, pero esa información no "
+            "está habilitada para este usuario: si la pide, explícale con amabilidad que no la tiene habilitada y que "
+            "puede pedírsela a Edson Lazo. Cuando des lo recibido o procesado en una planta, aclara que es la fruta "
+            "de Agua Santa. Ojo con los nombres: a la 'PLANTA EL CARMELO' también le dicen Buin, y a la 'PLANTA "
+            "LISONJERA', Linares."
         )
 
     tablas_alcance = " y ".join(f"`{b}`" for b in bases)
@@ -9432,6 +9540,7 @@ def _estado_numero(numero):
         "plantas": plantas_de(num),
         "embarques": NOMBRE_NIVEL_EMBARQUES[nivel_embarques(num)],
         "bases": NOMBRE_BASES[bases_de(num)],
+        "externas": ve_externas(num),
         "email": email_de(num),
         "bases_externas": {b: bases_externas.BASES[b].estado() for b in bases_externas_de(num)},
         "ve_todo": ve_todo,
@@ -9543,7 +9652,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
                                rol: str = None, productor: str = None, fundos: str = None,
                                notificaciones: str = None, acceso_total: str = None, zonal: str = None,
                                plantas: str = None, embarques: str = None, bases: str = None,
-                               email: str = None):
+                               email: str = None, externas: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
@@ -9554,6 +9663,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     notificaciones: 1/si para que gerencia o eas reciba los avisos automáticos.
     bases: ambas | cosecha | packing | ninguna, lo que puede consultar de Control_EAS (sin elegir:
     lo de su perfil; solo cosecha, o ninguna para finanzas).
+    externas: si/no, ve la fruta de otras exportadoras que procesan las plantas (solo cuenta para gerencia;
+    el admin la ve siempre).
     email: correo de la persona (email=quitar lo borra). Cierre muestra los datos según este correo.
     cierre: si/no, le da o le quita la base de Cierre, sea cual sea su perfil (igual con cada base
     externa, por su nombre). Para ver datos, además su correo debe estar en dbo.Cierre_UsuarioAcceso.
@@ -9567,7 +9678,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email"}
+        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email", "externas"}
         | set(ALIAS_PARAMETROS) | PARAMETROS_BASES_EXTERNAS,
     )
     if error:
@@ -9598,6 +9709,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     try:
         notif = _parsear_si_no(notificaciones)
         acceso = _parsear_si_no(acceso_total)
+        ver_ext = _parsear_si_no(externas)
     except ValueError:
         return JSONResponse({"status": "error", "error": ERROR_SI_NO}, status_code=400)
     try:
@@ -9622,6 +9734,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
             fijar_nivel_embarques(numero_normalizado, nivel_emb)
         if bases_elegidas is not None:
             fijar_bases(numero_normalizado, bases_elegidas)
+        if ver_ext is not None:
+            fijar_externas(numero_normalizado, ver_ext)
         if email_real is not None:
             fijar_email(numero_normalizado, email_real)
         if cambios_externas:
@@ -9647,7 +9761,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
 async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str = None,
                             productor: str = None, fundos: str = None, notificaciones: str = None,
                             acceso_total: str = None, zonal: str = None, plantas: str = None,
-                            embarques: str = None, bases: str = None, email: str = None):
+                            embarques: str = None, bases: str = None, email: str = None,
+                            externas: str = None):
     """
     Cambia el rol, el zonal, los fundos asignados, las bases que lee y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
@@ -9655,6 +9770,7 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     (solo las bases que se le habiliten, ej. cierre=si).
     zonal: lo vincula a un zonal (ve sus productores); zonal=ninguno lo desvincula.
     bases: ambas | cosecha | packing | ninguna, lo que puede consultar de Control_EAS.
+    externas: si/no, ve la fruta de otras exportadoras (solo cuenta para gerencia).
     email: correo de la persona (email=quitar lo borra). cierre: si/no, le da o le quita la base de
     Cierre, sea cual sea su perfil (igual con cada base externa, por su nombre).
     Uso: .../admin/numeros/rol?clave=...&numero=56912345678&rol=zonal&zonal=Pedro Dominguez
@@ -9667,7 +9783,7 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email"}
+        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email", "externas"}
         | set(ALIAS_PARAMETROS) | PARAMETROS_BASES_EXTERNAS,
     )
     if error:
@@ -9680,10 +9796,10 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
         return error
     if (rol is None and productor is None and fundos is None and notificaciones is None
             and acceso_total is None and zonal is None and plantas is None and embarques is None and bases is None
-            and email_real is None and not cambios_externas):
+            and email_real is None and externas is None and not cambios_externas):
         return JSONResponse(
             {"status": "error",
-             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, bases, email, "
+             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, bases, externas, email, "
                       f"{', '.join(sorted(PARAMETROS_BASES_EXTERNAS))}, productor, notificaciones o acceso_total"},
             status_code=400,
         )
@@ -9707,6 +9823,7 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     try:
         notif = _parsear_si_no(notificaciones)
         acceso = _parsear_si_no(acceso_total)
+        ver_ext = _parsear_si_no(externas)
     except ValueError:
         return JSONResponse({"status": "error", "error": ERROR_SI_NO}, status_code=400)
     try:
@@ -9726,6 +9843,8 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
             fijar_nivel_embarques(numero, nivel_emb)
         if bases_elegidas is not None:
             fijar_bases(numero, bases_elegidas)
+        if ver_ext is not None:
+            fijar_externas(numero, ver_ext)
         if email_real is not None:
             fijar_email(numero, email_real)
         if cambios_externas:
