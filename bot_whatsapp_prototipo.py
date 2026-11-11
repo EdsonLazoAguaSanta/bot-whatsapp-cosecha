@@ -7594,7 +7594,11 @@ def _es_razon(encabezado):
     TOTAL, porque la suma de promedios no significa nada."""
     texto = str(encabezado).lower()
     palabras = _palabras(texto)
-    return ("/" in texto or "_caja" in texto or "por" in palabras
+    # "por" + verbo en infinitivo es lo que falta ("Kg por procesar", "por cosechar"), una cantidad y no una
+    # razón: como razón salía con 2 decimales y fuera del TOTAL.
+    por_razon = any(p == "por" and not re.search(r"(ar|er|ir)$", palabras[i + 1] if i + 1 < len(palabras) else "x")
+                    for i, p in enumerate(palabras))
+    return ("/" in texto or "_caja" in texto or por_razon
             or any(p.startswith(_PREFIJOS_RAZON) for p in palabras))
 
 def _tipo_columna(encabezado, valores):
@@ -7856,7 +7860,7 @@ def _estilo_eje_valores(eje, valores):
     eje.valueMin = min(0, min(numeros))
     if max(numeros) <= eje.valueMin:
         eje.valueMax = eje.valueMin + 1
-    eje.labelTextFormat = _fmt_compacto
+    eje.labelTextFormat = lambda v: _fmt_numero(round(v))  # enteros, sin "1,5 mill." (Edson, 11-11-2026)
     eje.labels.fontName = "Helvetica"
     eje.labels.fontSize = 6.5
     eje.labels.fillColor = _color(COLOR_TINTA_SUAVE)
