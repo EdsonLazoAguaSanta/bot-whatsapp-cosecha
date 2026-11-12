@@ -3394,6 +3394,18 @@ def cargar_plantas_consulta():
         return []
 
 PLANTAS_CONSULTA = cargar_plantas_consulta()
+# Casillas de las estimaciones que no son plantas: no se ofrecen para elegir.
+PLANTAS_SIN_PLANTA = {"POR DEFINIR", "MERCADO NACIONAL"}
+
+def plantas_consulta_vigentes():
+    """Las plantas que se ofrecen para elegir (Edson, 12-11-2026): con datos esta temporada o la anterior, sin las
+    casillas que no son plantas; primero Buin, Lisonjera y Almahue, que procesan también para otras exportadoras."""
+    vigente = TEMPORADA_ACTUAL or temporada_de(date.today())
+    orden_ext = list(PLANTA_DE_EXTERNAS.values())
+    lista = [{**p, "externas": p["nombre"] in orden_ext} for p in PLANTAS_CONSULTA
+             if (p["temporada"] or 0) >= vigente - 1 and p["nombre"] not in PLANTAS_SIN_PLANTA]
+    return sorted(lista, key=lambda p: (0, orden_ext.index(p["nombre"]), 0, "") if p["externas"]
+                  else (1, 0, -(p["temporada"] or 0), p["nombre"]))
 
 def cargar_envases_conocidos():
     """Carga los tipos de envase reales desde la base de datos (bins, totes, cajas, etc.)"""
@@ -9927,7 +9939,7 @@ def _plantas_consulta_param(valor):
     if texto.lower() in ("", "todas", "*"):
         return "todas", None
     pedidas = list(dict.fromkeys(p for p in (_clave_planta(x) for x in texto.split("|")) if p))
-    conocidas = {p["nombre"] for p in PLANTAS_CONSULTA}
+    conocidas = {p["nombre"] for p in plantas_consulta_vigentes()}
     desconocidas = [p for p in pedidas if conocidas and p not in conocidas]
     if desconocidas:
         return None, JSONResponse({"status": "error", "error": f"No conozco la planta '{desconocidas[0]}'. Plantas: "
@@ -10630,7 +10642,8 @@ async def admin_plantas_consulta(clave: str):
     (?plantas_consulta= en /admin/numeros/agregar y /rol), con la última temporada en que tienen datos."""
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
-    return {"total": len(PLANTAS_CONSULTA), "plantas": PLANTAS_CONSULTA}
+    plantas = plantas_consulta_vigentes()
+    return {"total": len(plantas), "plantas": plantas}
 
 @app.get("/admin/plantas/resumen")
 async def admin_resumen_plantas(clave: str, solo_ver: bool = False, fecha: str = None, planta: str = None):
