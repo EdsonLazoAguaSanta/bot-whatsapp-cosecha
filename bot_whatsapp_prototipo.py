@@ -445,6 +445,19 @@ def inicializar_db_local():
     # Vacío con ver_externas = 1 = las tres (así quedaron los que se activaron antes de poder elegir).
     if "externas_plantas" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN externas_plantas TEXT")
+    # Plantas que consulta (desde el 12-11-2026): lista JSON de nombres de planta en mayúsculas; vacío = todas.
+    # Limita todo lo que lee: recepción, packing, otras exportadoras, herramientas e informes (plantas_consulta_de).
+    if "plantas_consulta" not in columnas:
+        conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN plantas_consulta TEXT")
+        # Quien tenía elegidas solo algunas plantas de otras exportadoras (Jerónimo, 11-11) queda con esas plantas
+        # para todo: así lo pidió Edson el 12-11 (las mismas claves y nombres que PLANTA_DE_EXTERNAS).
+        nombres = {"buin": "PLANTA EL CARMELO", "lisonjera": "PLANTA LISONJERA", "almahue": "PLANTA ALMAHUE"}
+        for num, ext in conn.execute("SELECT numero, externas_plantas FROM numeros_permitidos WHERE ver_externas = 1 "
+                                     "AND externas_plantas IS NOT NULL AND externas_plantas <> ''").fetchall():
+            elegidas = sorted({nombres[k] for k in ext.split("|") if k in nombres})
+            if elegidas and len(elegidas) < len(nombres):
+                conn.execute("UPDATE numeros_permitidos SET plantas_consulta = ? WHERE numero = ?",
+                             (json.dumps(elegidas, ensure_ascii=False), num))
     # Avisos que recibe (desde el 11-11-2026): tipos de TIPOS_AVISO separados por "|", o "ninguno". Vacío = lo
     # de su perfil (avisos_por_defecto), así nadie deja de recibir algo sin que se decida.
     if "avisos" not in columnas:
@@ -742,17 +755,18 @@ def alcance_de(numero):
        [fundos]  -> rol acotado, solo esos fundos (los asignados a mano más los de su zonal)
     """
     rol = rol_de(numero)
+    # Quien ve todo puede tener elegidas solo algunas plantas (desde el 12-11-2026): ver _acotar_a_plantas.
     if rol is None or rol in ROLES_VEN_TODO:
-        return None
+        return _acotar_a_plantas(numero, rol)
     if rol == "planta":
         # Va antes del acceso total: una planta ve su planta y nada más.
         return AlcancePlanta(plantas_de(numero))
     if rol == "zonal":
         # Pedido de Edson (09-11-2026): un zonal CONSULTA todos los fundos aunque tenga fundos
         # asignados. Lo que confirma o ajusta sigue acotado a los suyos (fundos_que_confirma).
-        return None
+        return _acotar_a_plantas(numero, rol)
     if tiene_acceso_total(numero):
-        return None
+        return _acotar_a_plantas(numero, rol)
     return fundos_efectivos(numero)
 
 def fundos_que_confirma(numero):
@@ -861,6 +875,53 @@ class AlcancePlanta(list):
     """Alcance de un usuario con perfil planta: las plantas (columna Packing) que puede ver.
     Es una lista, como la de fundos, para que pase por los mismos caminos (vacía = no ve
     nada); los filtros la aplican sobre Packing en vez de Productor."""
+    perfil_planta = True
+
+class AlcancePlantasConsulta(AlcancePlanta):
+    """Plantas que consulta alguien que NO es del perfil planta (gerencia, EAS o zonal a quien Edson le eligió
+    algunas plantas, desde el 12-11-2026). Filtra igual que AlcancePlanta (recepción, packing, herramientas e
+    informes), pero la persona sigue con lo de su perfil (cuestionarios, historial, ajustes)."""
+    perfil_planta = False
+
+def _clave_planta(nombre):
+    """Nombre de planta para comparar: mayúsculas y un solo espacio ('Planta Almahue' = 'PLANTA ALMAHUE')."""
+    return " ".join(str(nombre or "").upper().split())
+
+def plantas_consulta_de(numero):
+    """Plantas a las que se limita lo que consulta (nombres en mayúsculas), o None = todas. Solo para los perfiles
+    que consultan todo (gerencia, EAS, zonal...): el admin y el perfil planta no se limitan por aquí."""
+    if numero is None:
+        return None
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute("SELECT rol, plantas_consulta FROM numeros_permitidos WHERE numero = ?",
+                            (normalizar_numero(numero),)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo las plantas que consulta: {str(e)}")
+        return None
+    if not fila or fila[0] in ("admin", "planta") or not fila[1] or fila[1] == "*":
+        return None
+    try:
+        return [p for p in (_clave_planta(x) for x in json.loads(fila[1])) if p]
+    except (ValueError, TypeError):
+        return None
+
+def fijar_plantas_consulta(numero, plantas):
+    """plantas: None (o vacía) = todas; lista de nombres = solo esas."""
+    lista = sorted({_clave_planta(p) for p in plantas or [] if _clave_planta(p)})
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    conn.execute("UPDATE numeros_permitidos SET plantas_consulta = ? WHERE numero = ?",
+                 (json.dumps(lista, ensure_ascii=False) if lista else None, normalizar_numero(numero)))
+    conn.commit()
+    conn.close()
+
+def _acotar_a_plantas(numero, rol):
+    """None (ve todo) salvo que se le hayan elegido algunas plantas: entonces solo esas (ver plantas_consulta_de)."""
+    if rol in (None, "admin"):
+        return None
+    plantas = plantas_consulta_de(numero)
+    return None if plantas is None else AlcancePlantasConsulta(plantas)
 
 def plantas_de(numero):
     """Plantas asignadas a ese número (perfil planta)."""
@@ -1060,6 +1121,7 @@ def listar_numeros_permitidos():
         fila["embarques"] = NOMBRE_NIVEL_EMBARQUES[nivel_embarques(fila["numero"])]
         fila["bases"] = NOMBRE_BASES[bases_de(fila["numero"])]
         fila["externas"] = list(ve_externas(fila["numero"]))
+        fila["plantas_consulta"] = plantas_consulta_de(fila["numero"]) or "todas"
         fila["avisos_elegidos"] = bool((fila["avisos"] or "").strip())
         fila["avisos"] = [a for a in TIPOS_AVISO if a in avisos_de_fila(fila)]
     conn.close()
@@ -2629,6 +2691,9 @@ ROLES_EXTERNAS = ("gerencia",)
 # Las plantas propias que procesan fruta de terceros (desde el 11-11-2026 se elige cuáles ve cada persona). La
 # columna Planta de PKG-Externas trae "Buin (El Carmelo)", "Lisonjera (Linares)" y, cuando tenga datos, Almahue.
 PLANTAS_EXTERNAS = {"buin": "Buin", "lisonjera": "Lisonjera", "almahue": "Almahue"}
+# Cada una con su nombre en `datos` y `packing`: desde el 12-11-2026 las plantas de otras exportadoras que ve una
+# persona son las mismas que consulta (plantas_consulta_de).
+PLANTA_DE_EXTERNAS = {"buin": "PLANTA EL CARMELO", "lisonjera": "PLANTA LISONJERA", "almahue": "PLANTA ALMAHUE"}
 NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES, *TABLAS_EXTERNAS}
 
 NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
@@ -2697,9 +2762,11 @@ def ve_externas(numero):
         return ()
     if not fila or not fila[0]:
         return ()
-    if not fila[1]:
+    # Desde el 12-11-2026 las plantas son las mismas que consulta (una sola lista por persona).
+    plantas = plantas_consulta_de(numero)
+    if plantas is None:
         return tuple(PLANTAS_EXTERNAS)
-    return tuple(p for p in PLANTAS_EXTERNAS if p in fila[1].split("|"))
+    return tuple(k for k in PLANTAS_EXTERNAS if PLANTA_DE_EXTERNAS[k] in plantas)
 
 def fijar_externas(numero, plantas):
     """plantas: claves de PLANTAS_EXTERNAS que ve (vacía = ninguna)."""
@@ -3304,6 +3371,30 @@ def cargar_packings_conocidos():
 
 PACKINGS_CONOCIDOS = cargar_packings_conocidos()
 
+def cargar_plantas_consulta():
+    """Plantas que se pueden elegir para lo que consulta cada persona: las de recepción y las de packing, en
+    mayúsculas, con la última temporada en que tienen datos."""
+    try:
+        conn = conectar_sql()
+        if not conn:
+            return []
+        cursor = conn.cursor()
+        cursor.execute("SELECT Packing, MAX(Temporada) FROM [Recepcion_Consolidada] WHERE Packing IS NOT NULL GROUP BY Packing "
+                       "UNION ALL SELECT Packing_name, MAX(Temporada) FROM [Packing_Consolidado] "
+                       "WHERE Packing_name IS NOT NULL GROUP BY Packing_name")
+        ultima = {}
+        for nombre, temporada in cursor.fetchall():
+            clave = _clave_planta(nombre)
+            if clave:
+                ultima[clave] = max(ultima.get(clave) or 0, int(temporada or 0))
+        conn.close()
+        return [{"nombre": n, "temporada": ultima[n] or None} for n in sorted(ultima)]
+    except Exception as e:
+        logger.error(f"Error cargando las plantas para consultar: {str(e)}")
+        return []
+
+PLANTAS_CONSULTA = cargar_plantas_consulta()
+
 def cargar_envases_conocidos():
     """Carga los tipos de envase reales desde la base de datos (bins, totes, cajas, etc.)"""
     try:
@@ -3422,9 +3513,10 @@ def recargar_catalogos():
     """Los catálogos se cargan al arrancar: si el bot arrancó con la base desconectada quedaron
     vacíos. Al reconectar se vuelven a leer (si una lectura falla, se conserva la anterior)."""
     global VARIEDADES_CONOCIDAS, PACKINGS_CONOCIDOS, ENVASES_CONOCIDOS, PRODUCTORES_CONOCIDOS, GRUPOS_CONOCIDOS
-    global VARIANTES_PRODUCTOR
+    global VARIANTES_PRODUCTOR, PLANTAS_CONSULTA
     VARIEDADES_CONOCIDAS = cargar_variedades_conocidas() or VARIEDADES_CONOCIDAS
     PACKINGS_CONOCIDOS = cargar_packings_conocidos() or PACKINGS_CONOCIDOS
+    PLANTAS_CONSULTA = cargar_plantas_consulta() or PLANTAS_CONSULTA
     ENVASES_CONOCIDOS = cargar_envases_conocidos() or ENVASES_CONOCIDOS
     PRODUCTORES_CONOCIDOS = cargar_productores_conocidos() or PRODUCTORES_CONOCIDOS
     GRUPOS_CONOCIDOS = cargar_grupos_conocidos() or GRUPOS_CONOCIDOS
@@ -4766,7 +4858,15 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
         )
 
     tablas_alcance = " y ".join(f"`{b}`" for b in bases)
-    if isinstance(alcance, AlcancePlanta):
+    if isinstance(alcance, AlcancePlanta) and not alcance.perfil_planta:
+        partes.append(f"""ALCANCE DE ESTE USUARIO: solo puede consultar estas plantas: {", ".join(alcance) or "ninguna"}
+(a la PLANTA EL CARMELO también le dicen Buin, y a la PLANTA LISONJERA, Linares). Las herramientas, {tablas_alcance}
+y las tablas de otras exportadoras ya vienen filtradas a esas plantas: todo lo que recibas es solo de ellas, y un
+"total" o "todas las plantas" es la suma de ESAS plantas (dilo así). Si pregunta por otra planta (también por su
+proyección, estimación, Precosecha o proceso proyectado) o por una exportadora en otra planta, explícale con
+amabilidad que solo tiene habilitadas esas plantas y que puede pedirle otras a Edson Lazo. Nunca des cifras de
+otras plantas ni digas que tuvieron 0 kg o que no tienen datos: simplemente no las tiene habilitadas.""")
+    elif isinstance(alcance, AlcancePlanta):
         partes.append(f"""ALCANCE DE ESTE USUARIO (perfil planta): solo puede ver lo que entra a estas plantas
 (columna Packing): {", ".join(alcance) or "ninguna"}.
 Las herramientas (y {tablas_alcance} en consultar_sql) ya filtran por esas plantas: todo lo que
@@ -4828,7 +4928,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
         return "La base de cosecha no está habilitada para este usuario: solo puede consultar packing."
 
     if tool_name == "historial_confirmaciones":
-        if isinstance(alcance, AlcancePlanta):
+        if isinstance(alcance, AlcancePlanta) and alcance.perfil_planta:
             return "El historial de reportes de los zonales no está disponible para el perfil planta."
         return historial_confirmaciones(
             numero_sender, persona=tool_input.get("persona"), productor=tool_input.get("productor"),
@@ -4842,7 +4942,7 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
         return consultar_confirmaciones(tool_input.get("consulta"))
 
     if tool_name == "registrar_respuesta_cuestionario":
-        if isinstance(alcance, AlcancePlanta):
+        if isinstance(alcance, AlcancePlanta) and alcance.perfil_planta:
             return ("Tu perfil es de planta: no registra ajustes. Si la cosecha viene distinta, "
                     "avísale al zonal del productor o al equipo EAS.")
         if not puede_reportar(numero_sender):
@@ -9764,6 +9864,8 @@ def _estado_numero(numero):
     zonal = zonal_de_numero(num)
     if not bases_de(num):
         detalle_alcance = "no consulta cosecha ni packing (bases: ninguna)"
+    elif rol in ROLES_VEN_TODO and plantas_consulta_de(num) is not None:
+        detalle_alcance = f"solo las plantas {', '.join(plantas_consulta_de(num)) or 'ninguna'}"
     elif rol in ROLES_VEN_TODO:
         detalle_alcance = f"todos los fundos (por su perfil {rol})"
     elif rol == "planta":
@@ -9788,6 +9890,7 @@ def _estado_numero(numero):
         "embarques": NOMBRE_NIVEL_EMBARQUES[nivel_embarques(num)],
         "bases": NOMBRE_BASES[bases_de(num)],
         "externas": list(ve_externas(num)),
+        "plantas_consulta": plantas_consulta_de(num) or "todas",
         "avisos": [a for a in TIPOS_AVISO if a in avisos_de(num)],
         "email": email_de(num),
         "bases_externas": {b: bases_externas.BASES[b].estado() for b in bases_externas_de(num)},
@@ -9814,6 +9917,22 @@ def _avisos_param(valor):
         return None, JSONResponse({"status": "error", "error": f"Tipo de aviso inválido: {malos[0]}. Válidos: "
                                    f"{', '.join(TIPOS_AVISO)}, ninguno o perfil"}, status_code=400)
     return tipos, None
+
+def _plantas_consulta_param(valor):
+    """Valida ?plantas_consulta= : 'todas' (o vacío) o plantas separadas por "|". (lista | "todas" | None si no
+    vino, error)."""
+    if valor is None:
+        return None, None
+    texto = valor.strip()
+    if texto.lower() in ("", "todas", "*"):
+        return "todas", None
+    pedidas = list(dict.fromkeys(p for p in (_clave_planta(x) for x in texto.split("|")) if p))
+    conocidas = {p["nombre"] for p in PLANTAS_CONSULTA}
+    desconocidas = [p for p in pedidas if conocidas and p not in conocidas]
+    if desconocidas:
+        return None, JSONResponse({"status": "error", "error": f"No conozco la planta '{desconocidas[0]}'. Plantas: "
+                                   f"{', '.join(sorted(conocidas))}."}, status_code=400)
+    return pedidas, None
 
 def _externas_param(valor):
     """Valida ?externas= : si (las tres plantas), no, o plantas separadas por "|" (buin|lisonjera|almahue).
@@ -9934,7 +10053,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
                                rol: str = None, productor: str = None, fundos: str = None,
                                notificaciones: str = None, acceso_total: str = None, zonal: str = None,
                                plantas: str = None, embarques: str = None, bases: str = None,
-                               email: str = None, externas: str = None, avisos: str = None):
+                               email: str = None, externas: str = None, avisos: str = None,
+                               plantas_consulta: str = None):
     """
     Da acceso a un número (protegido con clave). Si el número ya existía, actualiza solo los
     campos que vengan en la URL. Si es nuevo, además le envía la bienvenida por WhatsApp.
@@ -9945,6 +10065,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     notificaciones: 1/si para que gerencia o eas reciba los avisos automáticos.
     bases: ambas | cosecha | packing | ninguna, lo que puede consultar de Control_EAS (sin elegir:
     lo de su perfil; solo cosecha, o ninguna para finanzas).
+    plantas_consulta: todas, o las plantas (de /admin/plantas_consulta) separadas por "|" a las que se limita
+    todo lo que consulta: recepción, packing, otras exportadoras e informes (gerencia, EAS o zonal).
     avisos: tipos de aviso que recibe, separados por "|" (cuestionario, informes, ajustes, cierre, semanal,
     desviaciones), ninguno, o perfil (lo de su perfil).
     externas: si/no o las plantas (buin|lisonjera|almahue) de las que ve la fruta de otras exportadoras que
@@ -9963,7 +10085,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email", "externas", "avisos"}
+        {"clave", "numero", "nombre", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email", "externas", "avisos", "plantas_consulta"}
         | set(ALIAS_PARAMETROS) | PARAMETROS_BASES_EXTERNAS,
     )
     if error:
@@ -9995,6 +10117,9 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     if error:
         return error
     avisos_elegidos, error = _avisos_param(avisos)
+    if error:
+        return error
+    plantas_c, error = _plantas_consulta_param(plantas_consulta)
     if error:
         return error
     try:
@@ -10026,6 +10151,8 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
             fijar_bases(numero_normalizado, bases_elegidas)
         if ver_ext is not None:
             fijar_externas(numero_normalizado, ver_ext)
+        if plantas_c is not None:
+            fijar_plantas_consulta(numero_normalizado, None if plantas_c == "todas" else plantas_c)
         if avisos_elegidos is not None:
             fijar_avisos(numero_normalizado, None if avisos_elegidos == "perfil" else avisos_elegidos)
         if email_real is not None:
@@ -10054,7 +10181,7 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
                             productor: str = None, fundos: str = None, notificaciones: str = None,
                             acceso_total: str = None, zonal: str = None, plantas: str = None,
                             embarques: str = None, bases: str = None, email: str = None,
-                            externas: str = None, avisos: str = None):
+                            externas: str = None, avisos: str = None, plantas_consulta: str = None):
     """
     Cambia el rol, el zonal, los fundos asignados, las bases que lee y/o si recibe notificaciones.
     Roles: admin (todo + avisos siempre), gerencia y eas (consultan todo; avisos solo si
@@ -10076,7 +10203,7 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     fundos, notificaciones, acceso_total = valores["fundos"], valores["notificaciones"], valores["acceso_total"]
     error = _revisar_parametros(
         request,
-        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email", "externas", "avisos"}
+        {"clave", "numero", "rol", "productor", "fundos", "notificaciones", "acceso_total", "zonal", "plantas", "embarques", "bases", "email", "externas", "avisos", "plantas_consulta"}
         | set(ALIAS_PARAMETROS) | PARAMETROS_BASES_EXTERNAS,
     )
     if error:
@@ -10089,10 +10216,12 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
         return error
     if (rol is None and productor is None and fundos is None and notificaciones is None
             and acceso_total is None and zonal is None and plantas is None and embarques is None and bases is None
-            and email_real is None and externas is None and avisos is None and not cambios_externas):
+            and email_real is None and externas is None and avisos is None and plantas_consulta is None
+            and not cambios_externas):
         return JSONResponse(
             {"status": "error",
-             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, bases, externas, avisos, email, "
+             "error": "Indica al menos rol, zonal, fundos, plantas, embarques, bases, externas, avisos, "
+                      "plantas_consulta, email, "
                       f"{', '.join(sorted(PARAMETROS_BASES_EXTERNAS))}, productor, notificaciones o acceso_total"},
             status_code=400,
         )
@@ -10119,6 +10248,9 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     avisos_elegidos, error = _avisos_param(avisos)
     if error:
         return error
+    plantas_c, error = _plantas_consulta_param(plantas_consulta)
+    if error:
+        return error
     try:
         notif = _parsear_si_no(notificaciones)
         acceso = _parsear_si_no(acceso_total)
@@ -10143,6 +10275,8 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
             fijar_bases(numero, bases_elegidas)
         if ver_ext is not None:
             fijar_externas(numero, ver_ext)
+        if plantas_c is not None:
+            fijar_plantas_consulta(numero, None if plantas_c == "todas" else plantas_c)
         if avisos_elegidos is not None:
             fijar_avisos(numero, None if avisos_elegidos == "perfil" else avisos_elegidos)
         if email_real is not None:
@@ -10489,6 +10623,14 @@ async def admin_plantas(clave: str):
     if clave != ADMIN_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
     return {"total": len(PACKINGS_CONOCIDOS), "plantas": sorted(PACKINGS_CONOCIDOS)}
+
+@app.get("/admin/plantas_consulta")
+async def admin_plantas_consulta(clave: str):
+    """Plantas (de recepción y de packing) que se pueden elegir para lo que consulta cada persona
+    (?plantas_consulta= en /admin/numeros/agregar y /rol), con la última temporada en que tienen datos."""
+    if clave != ADMIN_CLAVE:
+        return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
+    return {"total": len(PLANTAS_CONSULTA), "plantas": PLANTAS_CONSULTA}
 
 @app.get("/admin/plantas/resumen")
 async def admin_resumen_plantas(clave: str, solo_ver: bool = False, fecha: str = None, planta: str = None):
