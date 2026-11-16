@@ -250,6 +250,12 @@ def inicializar_db_local():
             fecha_estado TEXT
         )
     """)
+    # Desde el 16-11-2026 se guarda qué se mandó (el texto, o el nombre del documento o de la plantilla): si Meta
+    # avisa que un texto no se entregó por la ventana de 24 h, queda en cola (ver reencolar_no_entregado).
+    columnas_estado = [fila[1] for fila in conn.execute("PRAGMA table_info(mensajes_estado)")]
+    for columna, tipo in (("mensaje", "TEXT"), ("tipo", "TEXT"), ("reencolado", "INTEGER DEFAULT 0")):
+        if columna not in columnas_estado:
+            conn.execute(f"ALTER TABLE mensajes_estado ADD COLUMN {columna} {tipo}")
     # Fundos (productores) que cada número tiene asignados. Zonal y productor solo pueden
     # consultar y recibir información de los suyos; admin, gerencia y EAS ven todo.
     conn.execute("""
@@ -383,6 +389,10 @@ def inicializar_db_local():
             cuestionario_id INTEGER
         )
     """)
+    if "detalle" not in [fila[1] for fila in conn.execute("PRAGMA table_info(kilos_confirmados)")]:
+        # Cómo se llegó a los kilos si no los dijo así (bins con la planilla, promedio de un rango, variedad única
+        # de la Trisemanal): va en la Observación de la proyección diaria (16-11-2026).
+        conn.execute("ALTER TABLE kilos_confirmados ADD COLUMN detalle TEXT")
     if not conn.execute("SELECT COUNT(*) FROM confirmaciones").fetchone()[0]:
         # Primera vez: se carga lo que ya había en `cuestionarios` (cada envío y la última
         # respuesta de cada uno; las correcciones anteriores no quedaron guardadas).
@@ -462,6 +472,15 @@ def inicializar_db_local():
     # de su perfil (avisos_por_defecto), así nadie deja de recibir algo sin que se decida.
     if "avisos" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN avisos TEXT")
+    # Cambios de datos que corren una sola vez.
+    conn.execute("CREATE TABLE IF NOT EXISTS migraciones (nombre TEXT PRIMARY KEY, "
+                 "fecha_hora TEXT DEFAULT (datetime('now', 'localtime')))")
+    if not conn.execute("SELECT 1 FROM migraciones WHERE nombre = 'avisos_proyeccion'").fetchone():
+        # La proyección diaria por planta (16-11-2026) parte para los mismos que reciben los informes (Edson): a
+        # quien ya le eligieron los avisos se le agrega aquí una vez; después se le quita a quien no corresponda.
+        conn.execute("UPDATE numeros_permitidos SET avisos = REPLACE(avisos, 'informes', 'informes|proyeccion') "
+                     "WHERE '|' || avisos || '|' LIKE '%|informes|%' AND '|' || avisos || '|' NOT LIKE '%|proyeccion|%'")
+        conn.execute("INSERT INTO migraciones (nombre) VALUES ('avisos_proyeccion')")
     # Bases externas por número (ids de bases_externas.BASES, ej. 'cierre'), además de las que traiga su
     # perfil: habilitada = 1 se la da, 0 se la quita aunque su perfil la traiga. Sin fila = lo del perfil.
     conn.execute("""
@@ -573,6 +592,7 @@ def perfil_de(numero):
 TIPOS_AVISO = {
     "cuestionario": "Cuestionario diario (08:00 y 15:00)",
     "informes": "Informes diarios (08:00 y 16:00)",
+    "proyeccion": "Proyección diaria de cosecha por planta (08:00 y 16:00)",
     "ajustes": "Aviso de cada ajuste, en el momento",
     "cierre": "Resumen al cierre del día (18:00)",
     "semanal": "Resumen de los lunes",
@@ -581,24 +601,25 @@ TIPOS_AVISO = {
 # Qué tipos tienen sentido en cada perfil: los demás se ignoran aunque se elijan.
 AVISOS_POR_PERFIL = {
     "admin": tuple(TIPOS_AVISO),
-    "gerencia": ("informes", "ajustes", "cierre", "semanal", "desviaciones"),
-    "eas": ("informes", "ajustes", "cierre", "semanal", "desviaciones"),
-    "zonal": ("cuestionario", "informes", "ajustes", "cierre", "semanal"),
-    "productor": ("cuestionario", "informes", "semanal"),
-    "planta": ("informes", "ajustes", "cierre"),
+    "gerencia": ("informes", "proyeccion", "ajustes", "cierre", "semanal", "desviaciones"),
+    "eas": ("informes", "proyeccion", "ajustes", "cierre", "semanal", "desviaciones"),
+    "zonal": ("cuestionario", "informes", "proyeccion", "ajustes", "cierre", "semanal"),
+    "productor": ("cuestionario", "informes", "proyeccion", "semanal"),
+    "planta": ("informes", "proyeccion", "ajustes", "cierre"),
     "finanzas": (),
 }
 
 def avisos_por_defecto(rol, recibe_notificaciones):
     """Lo que recibía cada perfil antes de poder elegir. Gerencia y EAS: solo los informes, salvo que
-    tuvieran activadas las notificaciones."""
+    tuvieran activadas las notificaciones. La proyección diaria (16-11-2026) va con los informes."""
     rol = rol or ROL_POR_DEFECTO
     if rol in ROLES_AVISOS_OPCIONALES:
-        return {"informes", "ajustes", "semanal", "desviaciones"} if recibe_notificaciones else {"informes"}
-    return {"admin": {"informes", "ajustes", "semanal", "desviaciones"},
-            "zonal": {"cuestionario", "informes", "ajustes", "semanal"},
-            "productor": {"cuestionario", "informes", "semanal"},
-            "planta": {"informes", "ajustes", "cierre"}}.get(rol, set())
+        return ({"informes", "proyeccion", "ajustes", "semanal", "desviaciones"} if recibe_notificaciones
+                else {"informes", "proyeccion"})
+    return {"admin": {"informes", "proyeccion", "ajustes", "semanal", "desviaciones"},
+            "zonal": {"cuestionario", "informes", "proyeccion", "ajustes", "semanal"},
+            "productor": {"cuestionario", "informes", "proyeccion", "semanal"},
+            "planta": {"informes", "proyeccion", "ajustes", "cierre"}}.get(rol, set())
 
 def avisos_de_fila(fila):
     """Tipos de aviso que recibe una fila de numeros_permitidos (con rol, avisos y recibe_notificaciones)."""
@@ -4299,13 +4320,25 @@ _ESQUEMA_KILOS = {
         "properties": {
             "fecha": {"type": "string", "description": "Día de cosecha al que se refiere, AAAA-MM-DD (hoy, mañana u otro día)."},
             "productor": {"type": "string", "description": "Nombre EXACTO de la lista de productores."},
-            "variedad": {"type": "string", "description": "Nombre EXACTO de la lista de variedades; vacío si no la dice."},
-            "kg": {"type": "number", "description": "Kilos que se cosechan ese día: el total, no la diferencia. 0 = no cosecha."},
+            "variedad": {"type": "string", "description": "Nombre EXACTO de la lista de variedades. OBLIGATORIA cuando informa una cifra: si no dice a qué variedad corresponde, pregúntaselo ANTES de registrar. Vacía solo si ese día no cosecha nada en el fundo (kg 0)."},
+            "kg": {"type": "number", "description": "Kilos que se cosechan ese día: el total, no la diferencia. 0 = no cosecha. Si da un rango ('entre 10 y 12 mil'), el menor, y el mayor en kg_hasta. Si da la cifra en bins, totes o cajas, no lo pongas: usa cantidad y unidad."},
+            "kg_hasta": {"type": "number", "description": "Solo si da un rango en kilos: el mayor. Se registra el promedio."},
+            "cantidad": {"type": "number", "description": "Solo si da la cifra en bins, totes o cajas eq en vez de kilos: cuántos (si es un rango, el menor, y el mayor en cantidad_hasta). Se pasa a kilos con la planilla de conversiones."},
+            "cantidad_hasta": {"type": "number", "description": "Solo si da un rango en bins, totes o cajas eq: el mayor."},
+            "unidad": {"type": "string", "enum": ["bins", "totes", "cajas eq"], "description": "Unidad de cantidad."},
             "planta": {"type": "string", "description": "Planta de destino, solo si la dice (ej. 'LISONJERA', 'EL CARMELO')."},
         },
-        "required": ["fecha", "productor", "kg"],
+        "required": ["fecha", "productor"],
     },
 }
+# Desde el 16-11-2026 (Edson, para la proyección diaria por planta): las cifras quedan por variedad y en kilos
+# desde el origen. registrar_respuesta_cuestionario no registra nada si falta la variedad (ver _completar_kilos).
+REGLA_CIFRAS_COSECHA = (
+    "CIFRAS DE COSECHA: cuando informe o corrija una cantidad, regístrala POR VARIEDAD. Si no dice a qué variedad "
+    "corresponde, pregúntaselo antes de registrar (si el fundo tiene una sola variedad en la Trisemanal de ese día, "
+    "el bot la completa sola). Si la da en bins, totes o cajas, o como rango, regístrala tal cual (cantidad y unidad, "
+    "o kg y kg_hasta): el bot la pasa a kilos con la planilla de conversiones o con el promedio y te dice cómo; "
+    "cuéntaselo a la persona y pídele que lo confirme.")
 
 TOOL_REGISTRAR_CUESTIONARIO = {
     "name": "registrar_respuesta_cuestionario",
@@ -4333,7 +4366,7 @@ TOOL_REGISTRAR_CUESTIONARIO = {
             },
             "kilos": {
                 **_ESQUEMA_KILOS,
-                "description": "Cómo queda la cosecha EN KILOS: una línea por productor y variedad y por cada día al que se refiere lo que informa (hoy, mañana u otro). Es la columna «Confirmado kg» del informe diario. Ponla SIEMPRE que dé kilos, también al corregir (repite las líneas de ese día como quedan). Ej.: 'mañana Santa Ana 10.000 de Santina y Cóndor 12.000' → dos líneas con la fecha de mañana (la del Cóndor sin variedad si no la dice). 'Santa Amelia no cosecha' → kg 0. Si solo da bins, cajas u otra unidad sin decir los kilos, no pongas esa línea (no conviertas). Si confirma lo previsto sin cambios, déjala vacía: se toma la Trisemanal de su cuestionario."
+                "description": "Cómo queda la cosecha EN KILOS: una línea por productor y variedad y por cada día al que se refiere lo que informa (hoy, mañana u otro). Es la columna «Confirmado kg» del informe diario. Ponla SIEMPRE que dé kilos, también al corregir (repite las líneas de ese día como quedan). Ej.: 'mañana Santa Ana 10.000 de Santina y 12.000 de Lapins' → dos líneas con la fecha de mañana. Siempre por VARIEDAD: si da una cifra sin decir la variedad ('Cóndor 12.000'), pregúntale a qué variedades corresponde antes de registrar (si no, el bot no registra nada y te lo recuerda). 'Santa Amelia no cosecha' → kg 0 sin variedad. Si da bins, totes o cajas: cantidad y unidad; si da un rango: el menor y el mayor (se usa el promedio). Si el resultado dice cómo pasó una cifra a kilos o qué variedad asumió, cuéntaselo a la persona y pídele que lo confirme. Si confirma lo previsto sin cambios, déjala vacía: se toma la Trisemanal de su cuestionario."
             }
         },
         "required": ["resultado", "aviso"]
@@ -4774,6 +4807,8 @@ corrección para avisar a los EAS"). Cuando el usuario INFORME un cambio así �
 por datos— usa la herramienta registrar_respuesta_cuestionario con resultado "ajustado" y el
 detalle concreto: queda registrado y se le avisa al equipo EAS. NUNCA le digas que no puedes
 registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con esa herramienta.""")
+    if numero_sender and puede_reportar(numero_sender):
+        partes.append(REGLA_CIFRAS_COSECHA)
 
     bases = bases_de(numero_sender)
     externas = [bases_externas.BASES[b] for b in bases_externas_de(numero_sender)
@@ -5377,15 +5412,16 @@ def _enviar_whatsapp_una_parte(numero_destino, mensaje_texto):
             return False
         # Un 200 solo significa "Meta aceptó el mensaje", no que se haya entregado: el
         # resultado real llega después por los statuses del webhook.
-        registrar_mensaje_enviado(response, numero_destino)
+        registrar_mensaje_enviado(response, numero_destino, mensaje_texto)
         logger.info(f"WhatsApp aceptado por Meta para {numero_destino}: {response.status_code}")
         return True
     except Exception as e:
         logger.error(f"Error enviando WhatsApp: {str(e)}")
         return False
 
-def registrar_mensaje_enviado(response, numero_destino):
-    """Guarda el id (wamid) que devuelve Meta, para poder cruzarlo con el estado de entrega."""
+def registrar_mensaje_enviado(response, numero_destino, mensaje=None, tipo="texto"):
+    """Guarda el id (wamid) que devuelve Meta, para poder cruzarlo con el estado de entrega, y qué se mandó
+    (tipo: texto, documento o plantilla:<nombre>): un texto que no se entrega vuelve a la cola."""
     try:
         mensajes = (response.json() or {}).get("messages") or []
         if not mensajes:
@@ -5393,8 +5429,9 @@ def registrar_mensaje_enviado(response, numero_destino):
         conn = sqlite3.connect(DB_LOCAL_PATH)
         for m in mensajes:
             conn.execute(
-                "INSERT OR REPLACE INTO mensajes_estado (wamid, numero, estado) VALUES (?, ?, 'aceptado')",
-                (m.get("id"), normalizar_numero(numero_destino))
+                "INSERT OR REPLACE INTO mensajes_estado (wamid, numero, estado, mensaje, tipo) "
+                "VALUES (?, ?, 'aceptado', ?, ?)",
+                (m.get("id"), normalizar_numero(numero_destino), mensaje, tipo)
             )
         conn.commit()
         conn.close()
@@ -5430,8 +5467,35 @@ def registrar_estado_entrega(status):
         )
         conn.commit()
         conn.close()
+        if estado == "failed" and error_code == "131047":
+            # Fuera del hilo del webhook: Meta espera su respuesta al tiro y aquí se manda una plantilla.
+            EJECUTOR_MENSAJES.submit(reencolar_no_entregado, wamid)
     except Exception as e:
         logger.error(f"Error registrando estado de entrega: {str(e)}")
+
+def reencolar_no_entregado(wamid):
+    """Meta avisó que un texto no se entregó porque la ventana de 24 h estaba cerrada (131047): queda en cola y la
+    persona recibe la plantilla de novedades; al tocar «Novedades» o escribir, le llega (pedido de Edson, 16-11-2026:
+    la plantilla «se debe enviar cada que falle una entrega»). Los documentos y las plantillas no se reencolan."""
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        conn.row_factory = sqlite3.Row
+        fila = conn.execute("SELECT numero, mensaje, tipo, reencolado FROM mensajes_estado WHERE wamid = ?",
+                            (wamid,)).fetchone()
+        if not fila or fila["reencolado"] or fila["tipo"] != "texto" or not fila["mensaje"]:
+            conn.close()
+            return False
+        conn.execute("UPDATE mensajes_estado SET reencolado = 1 WHERE wamid = ?", (wamid,))
+        conn.commit()
+        conn.close()
+        numero = fila["numero"]
+        encolar_mensaje_pendiente(numero, "no_entregado", fila["mensaje"])
+        enviar_plantilla_cuestionario(numero, datos_numero(numero).get("nombre"))
+        logger.info(f"Mensaje {wamid} no entregado a {numero}: quedó en cola y se le avisó con la plantilla")
+        return True
+    except Exception as e:
+        logger.error(f"Error reencolando el mensaje no entregado {wamid}: {str(e)}")
+        return False
 
 def enviar_whatsapp(numero_destino, mensaje_texto):
     """
@@ -5611,35 +5675,148 @@ def _planta_coincide(a, b):
     a, b = _planta_informe(a), _planta_informe(b)
     return bool(a and b) and (a in b or b in a)
 
+UNIDADES_KILOS = ("bins", "totes", "cajas eq")
+_UNIDAD_SINGULAR = {"bins": "bin", "totes": "tote", "cajas eq": "caja eq"}
+
 def _limpiar_kilos(kilos, fecha_defecto):
     """Las líneas de kilos que manda Claude, validadas: fecha AAAA-MM-DD (la del cuestionario si no
-    viene; fuera si está a más de 14 días), nombres como en la base y kg >= 0."""
+    viene; fuera si está a más de 14 días), nombres como en la base y kg >= 0. Desde el 16-11-2026 una
+    línea también puede venir en bins, totes o cajas eq (cantidad y unidad) o como rango (kg_hasta,
+    cantidad_hasta): queda en `_origen` con kg None y la pasa a kilos _completar_kilos."""
     productores = _productores_conocidos_normalizados()
     claves = {_clave_fundo(p): p for p in PRODUCTORES_CONOCIDOS}
     variedades = {_normalizar_nombre(v): v for v in VARIEDADES_CONOCIDAS}
+
+    def numero(valor):
+        try:
+            return None if valor is None or str(valor).strip() == "" else float(valor)
+        except (TypeError, ValueError):
+            return None
+
     limpias = []
     for linea in kilos or []:
         if not isinstance(linea, dict):
             continue
         productor = " ".join(str(linea.get("productor") or "").split())
-        try:
-            kg = float(linea.get("kg"))
-        except (TypeError, ValueError):
-            continue
-        if not productor or kg < 0:
+        unidad = " ".join(str(linea.get("unidad") or "").lower().split())
+        unidad = {"bin": "bins", "tote": "totes", "caja": "cajas eq", "cajas": "cajas eq", "caja eq": "cajas eq",
+                  "kg": "", "kgs": "", "kilos": ""}.get(unidad, unidad)
+        valor, hasta = ((numero(linea.get("cantidad")), numero(linea.get("cantidad_hasta"))) if unidad
+                        else (numero(linea.get("kg")), numero(linea.get("kg_hasta"))))
+        if unidad and valor is None and numero(linea.get("kg")) is not None:
+            unidad, valor, hasta = "", numero(linea.get("kg")), numero(linea.get("kg_hasta"))
+        if hasta is not None and valor is not None and hasta < valor:
+            valor, hasta = hasta, valor
+        if hasta == valor:
+            hasta = None
+        if not productor or valor is None or valor < 0 or (unidad and unidad not in UNIDADES_KILOS):
             continue
         fecha = _a_fecha(linea.get("fecha")) if linea.get("fecha") else fecha_defecto
         if abs((fecha - date.today()).days) > 14:
             continue
         variedad = " ".join(str(linea.get("variedad") or "").split())
-        limpias.append({
+        limpia = {
             "fecha": fecha.isoformat(),
             "productor": productores.get(_normalizar_nombre(productor)) or claves.get(_clave_fundo(productor)) or productor,
             "variedad": variedades.get(_normalizar_nombre(variedad), variedad) if variedad else "",
             "planta": " ".join(str(linea.get("planta") or "").split()),
-            "kg": kg,
-        })
+            "kg": None if unidad or hasta is not None else valor,
+        }
+        if unidad or hasta is not None:
+            limpia["_origen"] = {"valor": valor, "hasta": hasta, "unidad": unidad}
+        if linea.get("detalle"):
+            limpia["detalle"] = str(linea["detalle"])
+        limpias.append(limpia)
     return limpias
+
+def _factor_unidad(especie, unidad):
+    """Kilos por bin, tote o caja eq de una especie (en inglés, como en la base) según la planilla de conversiones:
+    (factor, texto) o (None, None) si la planilla no lo trae."""
+    filas = sorted((f for f in CONVERSIONES_ESPECIE if f[0] == (especie or "").strip().upper()), key=lambda f: -f[2])
+    for _esp, envase, _defecto, kg_caja, _exp, _com, kg_envase, _cajas_env, _env_bin, _cajas_pallet, kg_bin in filas:
+        if unidad == "bins" and kg_bin:
+            return kg_bin, "kg por bin"
+        if unidad == "totes" and envase == "TOTES" and kg_envase:
+            return kg_envase, "kg por tote"
+        if unidad == "cajas eq" and kg_caja:
+            return kg_caja, "kg por caja eq"
+    return None, None
+
+def _cifra(valor):
+    return _fmt_numero(valor, 0 if float(valor).is_integer() else 1)
+
+def _completar_kilos(lineas, herramienta="registrar_respuesta_cuestionario"):
+    """Deja cada línea en kilos y con su variedad: «así queda listo desde el origen para el informe» (Edson,
+    16-11-2026, por la proyección diaria por planta). Devuelve (líneas, problema, notas): con un problema no se
+    registra nada y Claude se lo pregunta a la persona; las notas se le cuentan para que confirme.
+    - Sin variedad: si el fundo tiene una sola en la Trisemanal de ese día, esa; si no, se pregunta. Kg 0 sin
+      variedad («no cosecha») vale para todo el fundo.
+    - Bins, totes o cajas eq: por el factor de la planilla de conversiones de la especie de esa variedad.
+    - Rango: el promedio."""
+    listas, faltan, sin_factor, notas = [], [], [], []
+    trisemanal = {}
+    for original in lineas or []:
+        l = dict(original)
+        origen = l.pop("_origen", None)
+        detalle = [l["detalle"]] if l.get("detalle") else []
+        dia = _a_fecha(l["fecha"])
+        if not l["variedad"] and (l["kg"] or origen):
+            clave = (l["fecha"], _clave_fundo(l["productor"]))
+            if clave not in trisemanal:
+                trisemanal[clave] = _trisemanal_por_variedad(dia, [l["productor"]])
+            del_dia = {}
+            for t in trisemanal[clave]:
+                if t["variedad"] and (not l["planta"] or _planta_coincide(l["planta"], t["planta"])):
+                    del_dia[t["variedad"]] = del_dia.get(t["variedad"], 0) + t["kg"]
+            if len(del_dia) != 1:
+                faltan.append((l, origen, del_dia))
+                continue
+            l["variedad"] = next(iter(del_dia))
+            detalle.append("variedad única de la Trisemanal")
+            notas.append(f"Anoté lo de {l['productor']} como {l['variedad']}: es su única variedad en la Trisemanal "
+                         f"del {dia:%d-%m}. Si no es así, dime la variedad y lo corrijo.")
+        if origen:
+            valor, hasta, unidad = origen["valor"], origen["hasta"], origen["unidad"]
+            medio = (valor + hasta) / 2 if hasta is not None else valor
+            cifra = _cifra(valor) + (f" a {_cifra(hasta)}" if hasta is not None else "")
+            if unidad:
+                especie = _especie_cruda_de_variedad(l["variedad"])
+                factor, nombre = _factor_unidad(especie, unidad)
+                if not factor:
+                    sin_factor.append((l, unidad, especie))
+                    continue
+                l["kg"] = round(medio * factor)
+                especie_txt = (traducir_especie(especie) if especie else l["variedad"]).lower()
+                detalle.append(f"{cifra} {unidad} x {_cifra(factor)} {nombre}" + (" (promedio)" if hasta is not None else ""))
+                notas.append(f"Pasé {cifra} {unidad} de {l['variedad']} ({l['productor']}) a {formatear_kg(l['kg'])} kg"
+                             + (", el promedio del rango" if hasta is not None else "")
+                             + f": {_cifra(factor)} {nombre} de {especie_txt}, según la planilla de conversiones. "
+                             "¿Está bien? Si no, dime los kilos y lo corrijo.")
+            else:
+                l["kg"] = round(medio)
+                detalle.append(f"rango {cifra} kg (promedio)")
+                notas.append(f"Para {l['variedad'] or l['productor']} anoté {formatear_kg(l['kg'])} kg, el promedio "
+                             f"entre {_cifra(valor)} y {_cifra(hasta)} kg. ¿Está bien?")
+        l["detalle"] = "; ".join(detalle) or None
+        listas.append(l)
+    problemas = []
+    for l, origen, del_dia in faltan:
+        cifra = (f"{formatear_kg(l['kg'])} kg" if l["kg"] is not None
+                 else f"{_cifra(origen['valor'])}{' a ' + _cifra(origen['hasta']) if origen['hasta'] is not None else ''} "
+                      f"{origen['unidad'] or 'kg'}")
+        opciones = (" En la Trisemanal de ese día tiene " + _enumerar(
+            f"{v} {formatear_kg(kg)} kg" for v, kg in sorted(del_dia.items(), key=lambda x: -x[1])) + "."
+                    if del_dia else " Ese día no tiene Trisemanal.")
+        problemas.append(f"Falta la variedad de los {cifra} de {l['productor']} del {_a_fecha(l['fecha']):%d-%m}.{opciones}")
+    for l, unidad, especie in sin_factor:
+        problemas.append(f"La planilla de conversiones no dice cuántos kg trae un {_UNIDAD_SINGULAR[unidad]} de "
+                         f"{(traducir_especie(especie) if especie else l['variedad']).lower()} ({l['variedad']} de "
+                         f"{l['productor']}): pídele los kilos.")
+    if problemas:
+        return lineas, ("NO REGISTRÉ NADA TODAVÍA: las cifras de cosecha se registran por variedad y en kilos. "
+                        + " ".join(problemas) + " Pregúntale a la persona lo que falta y vuelve a llamar a "
+                        f"{herramienta} con TODAS las líneas (una por variedad)."), []
+    return listas, None, notas
 
 def guardar_kilos(numero, lineas, origen, cuestionario_id=None, nombre=None, respetar_otros=False):
     """Guarda un lote de kilos confirmados. respetar_otros=True (confirmar lo previsto sin cambios):
@@ -5662,9 +5839,9 @@ def guardar_kilos(numero, lineas, origen, cuestionario_id=None, nombre=None, res
             lote = conn.execute("SELECT COALESCE(MAX(lote), 0) + 1 FROM kilos_confirmados").fetchone()[0]
             conn.executemany(
                 "INSERT INTO kilos_confirmados (fecha, lote, numero, nombre, productor, variedad, planta, kg, origen, "
-                "cuestionario_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "cuestionario_id, detalle) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [(l["fecha"], lote, num, nombre, l["productor"], l["variedad"], l["planta"], l["kg"], origen,
-                  cuestionario_id) for l in lineas])
+                  cuestionario_id, l.get("detalle")) for l in lineas])
             conn.commit()
         conn.close()
         return len(lineas)
@@ -5745,6 +5922,11 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
             return (f"No registré nada: solo puedes confirmar o ajustar la cosecha de tus fundos asignados "
                     f"({lista or 'no tienes fundos asignados'}). {_enumerar(ajenos)} no "
                     f"{'está' if len(ajenos) == 1 else 'están'} entre ellos: ese cambio lo informa su zonal o su productor.")
+    # Por variedad y en kilos desde el origen (16-11-2026): si falta algo, no se registra nada y se pregunta.
+    kilos, problema, notas_kilos = _completar_kilos(kilos)
+    if problema:
+        return problema
+    pie = "".join(f"\n{n}" for n in notas_kilos)
     productores = productores or nombrados
     # El aviso dice SOLO lo que la persona informó en este mensaje (antes iba el detalle completo,
     # que al corregir arrastraba todo lo anterior y llegaba como un historial ilegible).
@@ -5753,7 +5935,7 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
         respuesta = _respuesta_productor(numero, activo, resultado, detalle_ajuste, texto_usuario, aviso, productores,
                                          kilos)
         if respuesta is not None:
-            return respuesta
+            return respuesta + pie
         # Sin zonal que pueda confirmarlo: sigue el camino directo de siempre.
     es_correccion = bool(activo) and activo.get("estado") != "pendiente"
     es_espontaneo = not activo
@@ -5830,16 +6012,16 @@ def registrar_respuesta_cuestionario(numero, resultado, detalle_ajuste=None, tex
     if resultado == "ajustado":
         detalle = f":\n{aviso}"
         if es_correccion:
-            return f"✅ Corrección registrada{detalle}\nGracias, reemplacé lo anterior y le avisamos al equipo EAS."
+            return f"✅ Corrección registrada{detalle}\nGracias, reemplacé lo anterior y le avisamos al equipo EAS." + pie
         if es_espontaneo:
-            return f"✅ Reporte registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS."
-        return f"✅ Ajuste registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS."
+            return f"✅ Reporte registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS." + pie
+        return f"✅ Ajuste registrado{detalle}\nGracias, quedó guardado y le avisamos al equipo EAS." + pie
     if anula:
         return ("✅ Listo, dejé la proyección como estaba (sin ajustes) y le avisé al equipo EAS que tu "
-                "ajuste anterior ya no corre.")
+                "ajuste anterior ya no corre." + pie)
     if es_correccion:
-        return "✅ Listo, dejé la proyección registrada como confirmada (sin ajustes)."
-    return "✅ Proyección confirmada, quedó registrada. ¡Gracias!"
+        return "✅ Listo, dejé la proyección registrada como confirmada (sin ajustes)." + pie
+    return "✅ Proyección confirmada, quedó registrada. ¡Gracias!" + pie
 
 # ---------------------------------------------------------------------------------------------
 # Circuito de aprobación (09-11-2026, pedido de Edson): el PRODUCTOR responde el cuestionario o
@@ -6179,6 +6361,12 @@ def resolver_solicitud_ajuste(numero, solicitud, decision, detalle_final=None, a
                  "reemplazado": "el productor la reemplazó por una nueva",
                  "retirado": "el productor la retiró"}.get(ap["estado"], ap["estado"])
         return f"La solicitud #{solicitud} ya no está pendiente: {texto}."
+    lineas_zonal, notas_kilos = None, []
+    if decision == "confirmar" and kilos and ap["tipo"] != "anulacion":
+        lineas_zonal, problema, notas_kilos = _completar_kilos(_limpiar_kilos(kilos, _a_fecha(ap["fecha"])),
+                                                               "confirmar_ajuste_productor")
+        if problema:
+            return problema
     nombre_zonal = datos_numero(num).get("nombre") or num
     quien = ap["nombre_origen"] or ap["numero_origen"]
     fundos = [p for p in (ap["productores"] or "").split("; ") if p]
@@ -6210,7 +6398,7 @@ def resolver_solicitud_ajuste(numero, solicitud, decision, detalle_final=None, a
                 guardar_kilos(ap["numero_origen"], _trisemanal_por_variedad(dia, fundos), "trisemanal", cid,
                               nombre=quien, respetar_otros=True)
         else:
-            lineas = _limpiar_kilos(kilos, dia) if kilos else ([] if cambiado else _json_lista(ap.get("kilos")))
+            lineas = (lineas_zonal or []) if kilos else ([] if cambiado else _json_lista(ap.get("kilos")))
             guardar_kilos(ap["numero_origen"], lineas, "aprobado", cid, nombre=f"{quien} (confirmado por {nombre_zonal})")
         avisados = notificar_ajuste_cuestionario(
             ap["numero_origen"], final_aviso, es_correccion=(ap["estado_previo"] == "ajustado" and not anulacion),
@@ -6231,7 +6419,8 @@ def resolver_solicitud_ajuste(numero, solicitud, decision, detalle_final=None, a
             mensaje += f"\nComentario: {comentario}"
         _avisar_persona(ap["numero_origen"], mensaje, "aprobacion_respuesta", f"respuesta de {nombre_zonal} a tu ajuste")
         return (f"✅ Listo, confirmado{' con tu cambio' if cambiado else ''}: {final_aviso}\n"
-                f"Le avisé a {quien} y a {avisados} persona(s) de gerencia, admin, EAS y planta.")
+                f"Le avisé a {quien} y a {avisados} persona(s) de gerencia, admin, EAS y planta."
+                + "".join(f"\n{n}" for n in notas_kilos))
     # Rechazo: el cuestionario del productor vuelve a como estaba antes del pedido.
     nuevo_estado = ap["estado_previo"] if ap["estado_previo"] in ("pendiente", "confirmado", "ajustado") else "rechazado"
     conn.execute("UPDATE cuestionarios SET estado = ?, ajuste = ? WHERE id = ?",
@@ -6373,7 +6562,9 @@ def notificar_ajuste_cuestionario(numero_origen, detalle, es_correccion=False, a
         destinatarios = [d for d in destinatarios if d["numero"] != num and d["numero"] not in excluir]
         # Solo se registran los que Meta aceptó: antes se anotaba el aviso como enviado
         # aunque el envío hubiera fallado, y el panel mostraba entregas que nunca ocurrieron.
-        aceptados = [d for d in destinatarios if enviar_whatsapp(d["numero"], mensaje)]
+        # Desde el 16-11-2026 respeta la ventana de 24 h (antes iba directo y Meta lo rechazaba a quien no le había
+        # escrito al bot: 131047, casi todos los EAS): si está cerrada, plantilla de novedades y cola.
+        aceptados = [d for d in destinatarios if enviar_o_encolar(d, mensaje, "aviso_ajuste") != "error"]
         if aceptados:
             registrar_alerta_enviada("ajuste_cuestionario", mensaje, aceptados)
         if len(aceptados) < len(destinatarios):
@@ -7431,6 +7622,10 @@ def atender_mensaje(message):
                         "No pude entender tu nota de voz. ¿Puedes escribir tu pregunta como texto?"
                     )
                     return
+            elif msg_type in ("button", "interactive"):
+                # Botón de una plantilla: el «Novedades» de la plantilla de novedades (16-11-2026).
+                boton = message.get("button") or (message.get("interactive") or {}).get("button_reply") or {}
+                msg_text = (boton.get("text") or boton.get("title") or boton.get("payload") or "").strip()
             else:
                 enviar_whatsapp(
                     numero_sender,
@@ -7452,7 +7647,15 @@ def atender_mensaje(message):
             # Si tenía un cuestionario esperando (se le mandó la plantilla porque la ventana
             # de 24 h estaba cerrada), su mensaje la reabre: primero se le entrega la tabla y
             # recién después se atiende lo que escribió.
-            entregar_mensajes_pendientes(numero_sender)
+            entregados = entregar_mensajes_pendientes(numero_sender)
+            if msg_type in ("button", "interactive"):
+                # Tocó «Novedades»: lo que pide es lo que estaba en cola, no una pregunta para Claude.
+                respuesta = None if entregados else "No tienes novedades pendientes: ya te llegó todo. ¿En qué te ayudo?"
+                guardar_conversacion(numero_sender, msg_type, msg_text or "(botón)",
+                                     respuesta or f"(se le entregaron {entregados} mensajes que tenía en cola)")
+                if respuesta:
+                    enviar_whatsapp(numero_sender, respuesta)
+                return
 
             traza = []
             respuesta = procesar_mensaje(msg_text, numero_sender, es_audio=(msg_type == "audio"), traza=traza)
@@ -7648,11 +7851,20 @@ def enviar_plantilla_bienvenida(numero_destino, nombre=None):
         etiqueta="bienvenida",
     )
 
-def enviar_plantilla(numero_destino, nombre_plantilla, idioma, parametros, etiqueta=""):
+def enviar_plantilla(numero_destino, nombre_plantilla, idioma, parametros, etiqueta="", parametros_alternativos=None):
     """Envía una plantilla aprobada. A diferencia del texto libre, una plantilla SÍ llega
     fuera de la ventana de 24 h de WhatsApp (error 131047). OJO: los parámetros no pueden
     llevar saltos de línea, tabulaciones ni más de 4 espacios seguidos — Meta los rechaza con
-    132018, por eso las tablas nunca pueden ir dentro de una plantilla."""
+    132018, por eso las tablas nunca pueden ir dentro de una plantilla. parametros_alternativos: se
+    reintenta con ellos si Meta reclama por la cantidad de parámetros (132000), ej. mientras revisa un texto nuevo."""
+    if parametros_alternativos is not None:
+        _ULTIMO_ERROR_PLANTILLA.pop(normalizar_numero(numero_destino), None)
+        if enviar_plantilla(numero_destino, nombre_plantilla, idioma, parametros, etiqueta):
+            return True
+        if _ULTIMO_ERROR_PLANTILLA.get(normalizar_numero(numero_destino)) != 132000:
+            return False
+        logger.info(f"Plantilla '{nombre_plantilla}' con la cantidad de datos anterior para {numero_destino}")
+        return enviar_plantilla(numero_destino, nombre_plantilla, idioma, parametros_alternativos, etiqueta)
     try:
         payload = {
             "messaging_product": "whatsapp",
@@ -7674,8 +7886,12 @@ def enviar_plantilla(numero_destino, nombre_plantilla, idioma, parametros, etiqu
                 f"Plantilla '{nombre_plantilla}' ({etiqueta}) rechazada para {numero_destino}: "
                 f"{response.status_code} {response.text}"
             )
+            try:
+                _ULTIMO_ERROR_PLANTILLA[normalizar_numero(numero_destino)] = response.json()["error"]["code"]
+            except Exception:
+                _ULTIMO_ERROR_PLANTILLA[normalizar_numero(numero_destino)] = None
             return False
-        registrar_mensaje_enviado(response, numero_destino)
+        registrar_mensaje_enviado(response, numero_destino, tipo=f"plantilla:{nombre_plantilla}")
         logger.info(f"Plantilla '{nombre_plantilla}' ({etiqueta}) aceptada para {numero_destino}")
         return True
     except Exception as e:
@@ -7697,20 +7913,43 @@ def _descripcion_fundos(fundos):
         return str(fundos[0])
     return f"sus {len(fundos)} fundos"
 
-def enviar_plantilla_cuestionario(numero_destino, nombre, kg, fundos=None, descripcion=None):
-    """Plantilla de re-enganche del cuestionario diario. Los tres parámetros van en el orden
-    del texto aprobado en Meta: "Hola {{1}}, tienes tu cuestionario de cosecha de hoy:
-    {{2}} kg previstos en {{3}}." — o sea nombre, kilos y FUNDO (no bultos)."""
+_ULTIMO_ERROR_PLANTILLA = {}
+# No se repite la plantilla de novedades a quien ya la recibió hace menos de esto (ej. el informe y el cuestionario
+# de las 08:00, o varios avisos seguidos): lo nuevo queda igual en la cola y le llega todo junto.
+PLANTILLA_NOVEDADES_MINUTOS = int(os.getenv("PLANTILLA_NOVEDADES_MINUTOS", "120"))
+
+def _plantilla_reciente(numero):
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute(
+            "SELECT 1 FROM mensajes_estado WHERE numero = ? AND tipo = ? AND COALESCE(estado, '') <> 'failed' "
+            "AND fecha_envio >= datetime('now', 'localtime', ?) LIMIT 1",
+            (normalizar_numero(numero), f"plantilla:{PLANTILLA_CUESTIONARIO_NOMBRE}",
+             f"-{PLANTILLA_NOVEDADES_MINUTOS} minutes")).fetchone()
+        conn.close()
+        return fila is not None
+    except Exception as e:
+        logger.error(f"Error revisando la última plantilla de {numero}: {str(e)}")
+        return False
+
+def enviar_plantilla_cuestionario(numero_destino, nombre, kg=0, fundos=None, descripcion=None):
+    """Plantilla de novedades (en Meta se llama «cuestionario»): avisa que hay mensajes esperando cuando la ventana
+    de 24 h está cerrada. Desde el 16-11-2026 (Edson la cambió en Meta) dice "Hola {{1}}, tienes novedades en el
+    chat. Respóndeme para ver el detalle y confirmar." con un botón «Novedades» (ver atender_mensaje): solo lleva el
+    nombre. Si Meta todavía exige el texto anterior (nombre, kilos y descripción), se reintenta con esos tres. Si ya
+    la recibió hace menos de PLANTILLA_NOVEDADES_MINUTOS no se repite: lo nuevo queda en la cola igual."""
+    if _plantilla_reciente(numero_destino):
+        logger.info(f"Plantilla de novedades ya enviada hace poco a {numero_destino}: no se repite")
+        return True
+    nombre_txt = {"type": "text", "text": _texto_plantilla(nombre or "equipo")}
     return enviar_plantilla(
-        numero_destino,
-        PLANTILLA_CUESTIONARIO_NOMBRE,
-        PLANTILLA_CUESTIONARIO_IDIOMA,
-        [
-            {"type": "text", "text": _texto_plantilla(nombre or "equipo")},
-            {"type": "text", "text": _texto_plantilla(formatear_kg(kg))},
+        numero_destino, PLANTILLA_CUESTIONARIO_NOMBRE, PLANTILLA_CUESTIONARIO_IDIOMA, [nombre_txt],
+        etiqueta="novedades",
+        parametros_alternativos=[
+            nombre_txt,
+            {"type": "text", "text": _texto_plantilla(formatear_kg(kg or 0))},
             {"type": "text", "text": _texto_plantilla(descripcion or _descripcion_fundos(fundos))},
         ],
-        etiqueta="cuestionario",
     )
 
 # ============================================================================
@@ -8327,7 +8566,10 @@ def _tabla_pdf(seccion, disponible):
 
     datos = [[Paragraph(escape(h), estilo_enc_num if i in numericas else estilo_enc)
               for i, h in enumerate(encabezados)]]
-    datos += [[celda(t, i, estilo_celda) for i, t in enumerate(fila)] for fila in textos]
+    # Subtotales (ej. por planta en la proyección diaria): las filas cuya primera columna dice «Subtotal …».
+    subtotales = {r for r, fila in enumerate(textos, 1) if str(fila[0]).startswith("Subtotal")}
+    datos += [[celda(t, i, estilo_total if r in subtotales else estilo_celda) for i, t in enumerate(fila)]
+              for r, fila in enumerate(textos, 1)]
     if total:
         datos.append([celda(t, i, estilo_total) for i, t in enumerate(total)])
     ultima_dato = len(textos)
@@ -8346,6 +8588,10 @@ def _tabla_pdf(seccion, disponible):
     ]
     for i in numericas:
         estilo.append(("ALIGN", (i, 1), (i, -1), "RIGHT"))
+    for r in subtotales:
+        estilo += [("FONTNAME", (0, r), (-1, r), "Helvetica-Bold"),
+                   ("BACKGROUND", (0, r), (-1, r), _color(COLOR_FONDO_TOTAL)),
+                   ("LINEBELOW", (0, r), (-1, r), 0.6, _color(COLOR_MARCA))]
     if total:
         estilo += [
             ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
@@ -9148,7 +9394,7 @@ def enviar_documento_media(numero_destino, media_id, nombre_archivo, descripcion
         if envio.status_code != 200:
             logger.error(f"No pude enviar {nombre_archivo} a {numero_destino}: {envio.status_code} {envio.text[:300]}")
             return False
-        registrar_mensaje_enviado(envio, numero_destino)
+        registrar_mensaje_enviado(envio, numero_destino, nombre_archivo, tipo="documento")
         logger.info(f"Documento {nombre_archivo} aceptado para {numero_destino}")
         return True
     except Exception as e:
@@ -9216,7 +9462,10 @@ def enviar_informe(numero_destino, formato, informe):
 # un productor ve sus fundos, una planta su planta, y el de procesos va solo a quien tiene
 # habilitado Packing. La sección de confirmaciones va solo a admin, EAS y gerencia.
 
-TIPOS_INFORME_DIARIO = ("cosecha", "procesos")
+TIPOS_INFORME_DIARIO = ("cosecha", "procesos", "proyeccion")
+# Qué aviso tiene que tener cada uno para recibirlo (ver TIPOS_AVISO) y cómo se nombra en los mensajes.
+AVISO_INFORME_DIARIO = {"cosecha": "informes", "procesos": "informes", "proyeccion": "proyeccion"}
+NOMBRE_INFORME_DIARIO = {"cosecha": "cosecha", "procesos": "procesos", "proyeccion": "proyección de cosecha"}
 _INF_PLANTA = "REPLACE(Packing,'PLANTA ','')"
 _INF_PRODUCTOR = ("CASE WHEN Productor='SANTA ANA' THEN 'SANTA ANA DE HUIQUE' "
                   "WHEN Productor='AGRICOLA EL CARMELO LTDA' THEN 'AGRÍCOLA EL CARMELO LTDA' ELSE Productor END")
@@ -9240,8 +9489,8 @@ def _fechas_informe(fecha):
 
 _ESPECIE_POR_VARIEDAD = {}
 
-def _especie_de_variedad(variedad):
-    """Especie (en español) de una variedad, según la base; '' si no se encuentra."""
+def _especie_cruda_de_variedad(variedad):
+    """Especie de una variedad como la guarda la base (en inglés, ej. CHERRY); '' si no se encuentra."""
     v = (variedad or "").strip()
     if not v:
         return ""
@@ -9250,16 +9499,24 @@ def _especie_de_variedad(variedad):
         conn = conectar_sql()
         if conn:
             try:
-                fila = conn.cursor().execute(
-                    "SELECT TOP 1 Especie FROM [Recepcion_Consolidada] WHERE Variedad = ? AND Especie IS NOT NULL",
-                    (v,)).fetchone()
-                especie = traducir_especie(fila[0].strip()) if fila and fila[0] else ""
+                cursor = conn.cursor()
+                for tabla in ("[Recepcion_Consolidada]", "[PKG-Cos-Trisemanal-Vigente]"):
+                    fila = cursor.execute(f"SELECT TOP 1 Especie FROM {tabla} WHERE Variedad = ? AND Especie IS NOT NULL",
+                                          (v,)).fetchone()
+                    if fila and fila[0]:
+                        especie = fila[0].strip().upper()
+                        break
             except Exception as e:
                 logger.error(f"Error buscando la especie de {v}: {str(e)}")
             finally:
                 conn.close()
         _ESPECIE_POR_VARIEDAD[v] = especie
     return _ESPECIE_POR_VARIEDAD[v]
+
+def _especie_de_variedad(variedad):
+    """Especie (en español) de una variedad, según la base; '' si no se encuentra."""
+    especie = _especie_cruda_de_variedad(variedad)
+    return traducir_especie(especie) if especie else ""
 
 def _kilos_vigentes(fecha):
     """Kilos confirmados que valen para ese día: por productor y variedad, el último lote que los
@@ -9269,7 +9526,7 @@ def _kilos_vigentes(fecha):
         conn = sqlite3.connect(DB_LOCAL_PATH)
         conn.row_factory = sqlite3.Row
         filas = [dict(f) for f in conn.execute(
-            "SELECT productor, variedad, planta, kg, lote FROM kilos_confirmados WHERE fecha = ? ORDER BY lote, id",
+            "SELECT productor, variedad, planta, kg, lote, detalle FROM kilos_confirmados WHERE fecha = ? ORDER BY lote, id",
             (fecha.isoformat(),))]
         conn.close()
     except Exception as e:
@@ -9636,6 +9893,194 @@ def spec_informe_procesos(fecha, turno="pm"):
                           "Programa = Trisem Proceso"),
             "consulta_kpis": kpis, "secciones": secciones}
 
+# ----------------------------------------------------------------------------------------------
+# Proyección diaria de cosecha por planta (pedido de Edson, 16-11-2026): tercer informe de las 08:00 y 16:00, para
+# quien tenga el aviso «proyeccion». Los dos envíos proyectan HOY: a las 08:00 casi todo es Trisemanal (el
+# cuestionario sale a esa hora) y a las 16:00 ya trae lo confirmado en el de las 15:00.
+_NOMBRE_FUNDO_INFORME = {"SANTA ANA": "SANTA ANA DE HUIQUE", "AGRICOLA EL CARMELO LTDA": "AGRÍCOLA EL CARMELO LTDA"}
+PLANTA_POR_DEFINIR = "POR DEFINIR"
+
+def _orden_planta_proyeccion(planta):
+    return (9 if planta == PLANTA_POR_DEFINIR else {"LISONJERA": 0, "EL CARMELO": 1}.get(planta, 2), planta)
+
+def _plantas_precosecha(productor, variedad, fecha):
+    """Plantas de la Precosecha (Estim Primavera) de la temporada para ese fundo, de esa variedad si la tiene: al
+    comienzo de la temporada muchos fundos todavía no tienen recepción."""
+    conn = conectar_sql()
+    if not conn:
+        return []
+    try:
+        sql_f, params_f = _sql_fundos([productor])
+        cursor = conn.cursor()
+        for con_variedad in ((True, False) if variedad else (False,)):
+            cursor.execute(f"""
+                SELECT LTRIM(RTRIM(Packing)) FROM {RECEPCION_SQL} AS Recepcion_Consolidada
+                WHERE [Base Origen] = ? AND Temporada = ? AND Packing IS NOT NULL AND {sql_f}
+                  {"AND Variedad = ?" if con_variedad else ""}
+                GROUP BY LTRIM(RTRIM(Packing)) HAVING SUM(KgsRecepcionados) > 0
+            """, [BASE_ORIGEN_ESTIM_PRIMAVERA, temporada_de(fecha), *params_f] + ([variedad] if con_variedad else []))
+            plantas = [f[0] for f in cursor.fetchall() if f[0]]
+            if plantas:
+                return plantas
+        return []
+    except Exception as e:
+        logger.error(f"Error buscando la Precosecha de {productor}: {str(e)}")
+        return []
+    finally:
+        conn.close()
+
+def _completar_proyeccion(encabezados, filas, alcance, fecha, consulta=None):
+    """La tabla de la proyección. A la Trisemanal del día (la consulta: Planta, Fundo, Variedad, Trisemanal kg) le
+    suma lo confirmado por zonales y productores (kilos_confirmados, lo vigente de cada fundo y variedad):
+    Proyección = lo confirmado o, sin confirmación, la Trisemanal (una confirmación de 0 la deja en 0). La planta de
+    cada fila es la de la Trisemanal; lo confirmado que no está en ella y no trae planta va a la que ese fundo tiene
+    en la base (marcada para revisar) o a POR DEFINIR. Subtotal por planta y TOTAL al final, calculados aquí."""
+    if alcance is not None and consulta:
+        # La planta de cada confirmación se busca en la Trisemanal de TODAS las plantas: con solo la de su alcance,
+        # una variedad que va a otra planta caería en la suya. Al final queda solo lo de su alcance (en_alcance).
+        r, e = ejecutar_consulta_sql(consulta, None, max_filas=MAX_FILAS_INFORME, bases=BASES_LECTURA["ambas"])
+        if not e:
+            filas = [[_valor_normalizado(v) for v in f] for f in r["filas"]]
+    lineas = {}
+
+    def linea(planta, fundo, variedad):
+        clave = (planta, _clave_fundo(fundo), _variedad_informe(variedad))
+        if clave not in lineas:
+            lineas[clave] = {"planta": planta, "fundo": fundo, "variedad": variedad, "tri": 0, "conf": None, "obs": []}
+        return lineas[clave]
+
+    def observar(l, texto):
+        if texto and texto not in l["obs"]:
+            l["obs"].append(texto)
+
+    for planta, fundo, variedad, kg in filas:
+        if str(planta or "").strip().upper() != "TOTAL":
+            linea(_planta_informe(planta) or PLANTA_POR_DEFINIR, str(fundo or "").strip(),
+                  str(variedad or "").strip())["tri"] += kg or 0
+
+    plantas_fundo = {}
+
+    def planta_del_fundo(productor, variedad=None):
+        """(planta, posibles): la que ya tiene ese fundo en la base: la de sus otras variedades de hoy, la de su
+        Trisemanal y recepción recientes o la de su Precosecha. planta None si no hay una sola."""
+        clave = (_clave_fundo(productor), _variedad_informe(variedad))
+        if clave not in plantas_fundo:
+            posibles = {l["planta"] for l in lineas.values() if _clave_fundo(l["fundo"]) == clave[0] and l["tri"]}
+            if len(posibles) != 1:
+                posibles = {_planta_informe(p) for p in plantas_de_productores([productor], fecha) if p}
+            if not posibles:
+                posibles = {_planta_informe(p) for p in _plantas_precosecha(productor, variedad, fecha) if p}
+            posibles = sorted(posibles)
+            plantas_fundo[clave] = (posibles[0] if len(posibles) == 1 else None, posibles)
+        return plantas_fundo[clave]
+
+    for k in _kilos_vigentes(fecha):
+        prod, var = _clave_fundo(k["productor"]), _variedad_informe(k["variedad"])
+        kg, detalle = k["kg"] or 0, k.get("detalle")
+        del_fundo = [l for l in lineas.values() if _clave_fundo(l["fundo"]) == prod
+                     and (not k["planta"] or _planta_coincide(k["planta"], l["planta"]))]
+        if not var:
+            if not kg:  # «no cosecha»: todas sus variedades en 0
+                for l in del_fundo:
+                    l["conf"] = l["conf"] or 0
+                continue
+            # Total del fundo sin variedad (lo registrado antes del 16-11-2026): reemplaza a todas sus variedades.
+            plantas = {l["planta"] for l in del_fundo}
+            planta = (_planta_informe(k["planta"]) if k["planta"] else plantas.pop() if len(plantas) == 1
+                      else planta_del_fundo(k["productor"])[0] or PLANTA_POR_DEFINIR)
+            tri = sum(l["tri"] for l in del_fundo)
+            for l in del_fundo:
+                lineas.pop((l["planta"], _clave_fundo(l["fundo"]), _variedad_informe(l["variedad"])), None)
+            nueva = linea(planta, del_fundo[0]["fundo"] if del_fundo else k["productor"], "(todas las variedades)")
+            nueva["tri"] += tri
+            nueva["conf"] = (nueva["conf"] or 0) + kg
+            observar(nueva, "Total del fundo, sin variedad")
+            continue
+        candidatas = [l for l in del_fundo if _variedad_informe(l["variedad"]) == var]
+        if candidatas:
+            base = sum(l["tri"] for l in candidatas)
+            for l in candidatas:
+                l["conf"] = (l["conf"] or 0) + (kg * l["tri"] / base if base else kg / len(candidatas))
+                observar(l, detalle)
+                if len(candidatas) > 1:
+                    observar(l, "Repartido entre plantas según la Trisemanal")
+            continue
+        # Lo confirmado no está en la Trisemanal de hoy: fila nueva.
+        if k["planta"]:
+            planta, marca = _planta_informe(k["planta"]), None
+        else:
+            planta, posibles = planta_del_fundo(k["productor"], k["variedad"])
+            marca =("Planta según la base: revisar" if planta
+                     else f"Sin planta: puede ser {_enumerar(posibles)}" if posibles else "Sin planta en la base")
+            planta = planta or PLANTA_POR_DEFINIR
+        nueva = linea(planta, k["productor"], k["variedad"])
+        nueva["conf"] = (nueva["conf"] or 0) + kg
+        observar(nueva, marca)
+        observar(nueva, detalle)
+
+    def en_alcance(l):
+        if alcance is None:
+            return True
+        if isinstance(alcance, AlcancePlanta):
+            return any(_planta_coincide(l["planta"], p) for p in alcance)
+        return any(_fundo_coincide(f, l["fundo"]) for f in alcance)
+
+    vistas = []
+    for l in lineas.values():
+        if not en_alcance(l):
+            continue
+        tri = round(l["tri"])
+        conf = None if l["conf"] is None else round(l["conf"])
+        if tri or conf:
+            vistas.append({**l, "tri": tri, "conf": conf, "proy": tri if conf is None else conf,
+                           "fundo": _NOMBRE_FUNDO_INFORME.get(_normalizar_nombre(l["fundo"]), l["fundo"])})
+    con_obs = any(l["obs"] for l in vistas)
+    encabezados = (["Planta", "Fundo", "Variedad", "Trisemanal kg", "Confirmado kg", "Proyección kg"]
+                   + (["Observación"] if con_obs else []))
+
+    def fila(planta, fundo, variedad, grupo, obs=""):
+        confirmados = [l["conf"] for l in grupo if l["conf"] is not None]
+        valores = [planta, fundo, variedad, sum(l["tri"] for l in grupo), sum(confirmados) if confirmados else None,
+                   sum(l["proy"] for l in grupo)]
+        return valores + ([obs] if con_obs else [])
+
+    plantas = sorted({l["planta"] for l in vistas}, key=_orden_planta_proyeccion)
+    salida = []
+    for planta in plantas:
+        de_planta = sorted((l for l in vistas if l["planta"] == planta),
+                           key=lambda l: (-l["proy"], l["fundo"], l["variedad"]))
+        salida += [fila(planta, l["fundo"], l["variedad"], [l], "; ".join(l["obs"])) for l in de_planta]
+        if len(plantas) > 1:
+            salida.append(fila(f"Subtotal {planta}", "", "", de_planta))
+    if vistas:
+        salida.append(fila("TOTAL", "", "", vistas))
+    return encabezados, salida
+
+def spec_informe_proyeccion(fecha, turno="pm"):
+    t, D, d = temporada_de(fecha), fecha.strftime("%Y%m%d"), fecha.strftime("%d-%m")
+    tri = BASE_ORIGEN_TRISEMANAL
+    momento = ("informe de la mañana: casi todo es Trisemanal, los zonales confirman después del cuestionario de "
+               "las 08:00" if turno == "am" else f"con lo confirmado hasta las {datetime.now():%H:%M}")
+    consulta = (f"SELECT {_INF_PLANTA} AS Planta, Productor AS Fundo, {_INF_VARIEDAD} AS Variedad, "
+                f"SUM(KgsRecepcionados) AS [Trisemanal kg] FROM datos WHERE [Base Origen]='{tri}' "
+                f"AND CAST(Fecha AS DATE)='{D}' GROUP BY {_INF_PLANTA}, Productor, {_INF_VARIEDAD} "
+                "HAVING SUM(KgsRecepcionados)<>0")
+    return {"titulo": f"Proyección diaria de cosecha por planta – {DIAS_SEMANA[fecha.weekday()]} {fecha:%d-%m-%Y}",
+            "subtitulo": f"Temporada {t} · kilos de Agua Santa · cosecha de hoy {d} · {momento}",
+            "consulta_kpis": None,
+            "secciones": [
+                {"titulo": f"Proyección de hoy {d} por planta, fundo y variedad", "bases": ("datos",),
+                 "consulta_sql": consulta,
+                 "completar": lambda encabezados, filas, alcance: _completar_proyeccion(encabezados, filas, alcance,
+                                                                                        fecha, consulta),
+                 "grafico": {"tipo": "ninguno"},
+                 "nota": ("Proyección = lo confirmado por el zonal o el productor para hoy; sin confirmación, la "
+                          "Trisemanal. Una confirmación de 0 (no cosecha) la deja en 0. Lo que llega a cada planta es el "
+                          "subtotal de su Proyección. Las cifras en bins se pasan a kilos con la planilla de conversiones "
+                          "y los rangos, al promedio. «Planta según la base»: la confirmación no traía planta y se usó la "
+                          "que tiene ese fundo; POR DEFINIR: no se encontró. Rainier incluye Royal Rainier.")},
+            ]}
+
 def _permisos_informe_diario(numero):
     """(alcance, bases, confirmaciones) con que se arma el informe diario de ese número."""
     return alcance_de(numero), bases_de(numero), puede_ver_confirmaciones(numero)
@@ -9647,9 +10092,10 @@ def armar_informe_diario(tipo, fecha, numero, permisos=None, turno=None):
     turno = turno or turno_informe()
     if alcance is not None and not alcance:
         return None, "sin fundos ni planta asignados"
-    if ("datos" if tipo == "cosecha" else "packing") not in bases:
-        return None, f"no tiene habilitada la base de {'cosecha' if tipo == 'cosecha' else 'packing'}"
-    spec = spec_informe_cosecha(fecha, turno) if tipo == "cosecha" else spec_informe_procesos(fecha, turno)
+    if ("packing" if tipo == "procesos" else "datos") not in bases:
+        return None, f"no tiene habilitada la base de {'packing' if tipo == 'procesos' else 'cosecha'}"
+    spec = {"cosecha": spec_informe_cosecha, "procesos": spec_informe_procesos,
+            "proyeccion": spec_informe_proyeccion}[tipo](fecha, turno)
     # "sin": la variante para quien NO tiene esa base; "externas": solo para quien ve otras exportadoras.
     externas = getattr(bases, "externas", False)
     secciones = [s for s in spec["secciones"] if set(s.get("bases", ())) <= set(bases)
@@ -9673,6 +10119,12 @@ def armar_informe_diario(tipo, fecha, numero, permisos=None, turno=None):
 def _kg_plantilla(tipo, informe, fecha, turno, alcance, bases):
     """Kilos de la plantilla de aviso («{{2}} kg previstos»): la Trisemanal de hoy. El informe PM la trae
     entre sus cifras; el AM muestra el día anterior, así que se consulta aparte."""
+    if tipo == "proyeccion":
+        # El TOTAL de la columna Proyección (lo de hoy).
+        s = informe["secciones"][0] if informe.get("secciones") else None
+        if s and s.get("total") and "Proyección kg" in s["encabezados"]:
+            return s["total"][s["encabezados"].index("Proyección kg")] or 0
+        return 0
     if tipo != "cosecha":
         return 0
     if turno != "am":
@@ -9701,8 +10153,9 @@ def enviar_informe_diario_a(numero, tipo, fecha, turno=None):
     return "enviado" if ok else "error"
 
 def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
-    """Job diario (INFORMES_DIARIOS_HORAS, 08:00 y 16:00): el informe de cosecha y el de procesos a todos los
-    usuarios de INFORMES_DIARIOS_PERFILES, cada uno con su alcance y sus bases. Cada versión
+    """Job diario (INFORMES_DIARIOS_HORAS, 08:00 y 16:00): el informe de cosecha, el de procesos y la proyección
+    diaria por planta a los usuarios de INFORMES_DIARIOS_PERFILES que tengan su aviso (AVISO_INFORME_DIARIO), cada
+    uno con su alcance y sus bases. Cada versión
     distinta del PDF se arma y se sube una sola vez. Con la ventana de 24 h cerrada va la
     plantilla y el informe queda en cola (se arma de nuevo al entregarlo). En modo prueba va
     solo a los admin. numeros = solo a esos (para probar)."""
@@ -9716,10 +10169,13 @@ def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
             buscados = {normalizar_numero(n) for n in numeros}
             destinatarios = [d for d in numeros_por_rol(ROLES_VALIDOS) if d["numero"] in buscados]
         elif ENVIOS_AUTOMATICOS_PRODUCCION:
-            destinatarios = [d for d in numeros_por_rol(INFORMES_DIARIOS_PERFILES) if "informes" in d["avisos"]]
+            destinatarios = [d for d in numeros_por_rol(INFORMES_DIARIOS_PERFILES)
+                             if d["avisos"] & set(AVISO_INFORME_DIARIO.values())]
         else:
             destinatarios = numeros_por_rol(("admin",))
         versiones = {}
+        # En producción cada informe va a quien tenga su aviso; al probar (admin o números puntuales), todos.
+        filtrar_avisos = bool(ENVIOS_AUTOMATICOS_PRODUCCION and not numeros)
         cuenta = {"documentos": 0, "personas_directo": 0, "personas_plantilla": 0, "sin_informe": 0, "errores": 0}
         recibieron = {tipo: [] for tipo in TIPOS_INFORME_DIARIO}
         for d in destinatarios:
@@ -9728,6 +10184,8 @@ def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
             alcance, bases, confirmaciones = permisos
             archivos = []
             for tipo in TIPOS_INFORME_DIARIO:
+                if filtrar_avisos and AVISO_INFORME_DIARIO[tipo] not in d["avisos"]:
+                    continue
                 clave = (tipo, type(alcance).__name__, tuple(alcance) if alcance is not None else None,
                          tuple(bases), getattr(bases, "externas", False), confirmaciones)
                 if clave not in versiones:
@@ -9754,8 +10212,8 @@ def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
                 for t in enviados:
                     recibieron[t].append(d)
                 continue
-            nombres = " y ".join(t for t, _ in archivos)
-            kg = next((a["kg"] for t, a in archivos if t == "cosecha"), 0)
+            nombres = _enumerar(NOMBRE_INFORME_DIARIO[t] for t, _ in archivos)
+            kg = next((a["kg"] for t, a in archivos if t in ("cosecha", "proyeccion") and a["kg"]), 0)
             ok = enviar_plantilla_cuestionario(
                 num, d.get("nombre"), kg, descripcion=f"el informe diario de {nombres} (respóndeme para recibirlo)")
             if not ok:
@@ -9775,7 +10233,8 @@ def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
         for tipo, personas in recibieron.items():
             if personas:
                 registrar_alerta_enviada(f"informe_diario_{tipo}",
-                                         f"Informe diario de {tipo} {turno.upper()} del {fecha:%d-%m-%Y}", personas)
+                                         f"Informe diario de {NOMBRE_INFORME_DIARIO[tipo]} {turno.upper()} del "
+                                         f"{fecha:%d-%m-%Y}", personas)
         logger.info(f"Informes diarios {fecha} {turno.upper()}: {cuenta}")
         return cuenta
     except Exception as e:
@@ -10672,7 +11131,7 @@ async def admin_resumen_plantas(clave: str, solo_ver: bool = False, fecha: str =
 def admin_informes_diarios(clave: str, fecha: str = None, numero: str = None, solo_ver: bool = False,
                            turno: str = None):
     """
-    Dispara los informes diarios de cosecha y procesos (mismo envío que el job, respeta el modo
+    Dispara los informes diarios de cosecha, procesos y proyección (mismo envío que el job, respeta el modo
     prueba/producción). numero=569... los manda solo a ese usuario. Con solo_ver=true arma los PDF
     de ese número (o del admin) SIN enviarlos y los deja en la carpeta temporal del servidor.
     turno=am|pm elige el corte (AM: cierre del día anterior; PM: hoy hasta la hora); sin turno, según la hora.
