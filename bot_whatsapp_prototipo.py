@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 # Bases que se consultan además de la de cosecha (Control_EAS): Cierre y las que se sumen. Va después
 # de load_dotenv y del logging porque lee su configuración del .env al importarse.
 import bases_externas
+import calidad_inglobo
 
 # ============================================================================
 # CONFIGURACIÓN
@@ -481,6 +482,12 @@ def inicializar_db_local():
         conn.execute("UPDATE numeros_permitidos SET avisos = REPLACE(avisos, 'informes', 'informes|proyeccion') "
                      "WHERE '|' || avisos || '|' LIKE '%|informes|%' AND '|' || avisos || '|' NOT LIKE '%|proyeccion|%'")
         conn.execute("INSERT INTO migraciones (nombre) VALUES ('avisos_proyeccion')")
+    if not conn.execute("SELECT 1 FROM migraciones WHERE nombre = 'avisos_calidad'").fetchone():
+        # El informe diario de calidad (18-11-2026) parte marcado para quien ya eligió sus avisos (solo le llega a
+        # quien tiene el permiso Calidad); a quien eligió «ninguno» no se le agrega.
+        conn.execute("UPDATE numeros_permitidos SET avisos = avisos || '|calidad' WHERE avisos IS NOT NULL "
+                     "AND avisos NOT IN ('', 'ninguno') AND '|' || avisos || '|' NOT LIKE '%|calidad|%'")
+        conn.execute("INSERT INTO migraciones (nombre) VALUES ('avisos_calidad')")
     # Bases externas por número (ids de bases_externas.BASES, ej. 'cierre'), además de las que traiga su
     # perfil: habilitada = 1 se la da, 0 se la quita aunque su perfil la traiga. Sin fila = lo del perfil.
     conn.execute("""
@@ -593,6 +600,7 @@ TIPOS_AVISO = {
     "cuestionario": "Cuestionario diario (08:00 y 15:00)",
     "informes": "Informes diarios (08:00 y 16:00)",
     "proyeccion": "Proyección diaria de cosecha por planta (08:00 y 16:00)",
+    "calidad": "Informe diario de calidad (08:00, día anterior; solo con el permiso Calidad)",
     "ajustes": "Aviso de cada ajuste, en el momento",
     "cierre": "Resumen al cierre del día (18:00)",
     "semanal": "Resumen de los lunes",
@@ -601,25 +609,26 @@ TIPOS_AVISO = {
 # Qué tipos tienen sentido en cada perfil: los demás se ignoran aunque se elijan.
 AVISOS_POR_PERFIL = {
     "admin": tuple(TIPOS_AVISO),
-    "gerencia": ("informes", "proyeccion", "ajustes", "cierre", "semanal", "desviaciones"),
-    "eas": ("informes", "proyeccion", "ajustes", "cierre", "semanal", "desviaciones"),
-    "zonal": ("cuestionario", "informes", "proyeccion", "ajustes", "cierre", "semanal"),
-    "productor": ("cuestionario", "informes", "proyeccion", "semanal"),
-    "planta": ("informes", "proyeccion", "ajustes", "cierre"),
+    "gerencia": ("informes", "proyeccion", "calidad", "ajustes", "cierre", "semanal", "desviaciones"),
+    "eas": ("informes", "proyeccion", "calidad", "ajustes", "cierre", "semanal", "desviaciones"),
+    "zonal": ("cuestionario", "informes", "proyeccion", "calidad", "ajustes", "cierre", "semanal"),
+    "productor": ("cuestionario", "informes", "proyeccion", "calidad", "semanal"),
+    "planta": ("informes", "proyeccion", "calidad", "ajustes", "cierre"),
     "finanzas": (),
 }
 
 def avisos_por_defecto(rol, recibe_notificaciones):
     """Lo que recibía cada perfil antes de poder elegir. Gerencia y EAS: solo los informes, salvo que
-    tuvieran activadas las notificaciones. La proyección diaria (16-11-2026) va con los informes."""
+    tuvieran activadas las notificaciones. La proyección diaria (16-11-2026) va con los informes. El de calidad
+    (18-11-2026) parte marcado para todos: solo le llega a quien tiene el permiso Calidad."""
     rol = rol or ROL_POR_DEFECTO
     if rol in ROLES_AVISOS_OPCIONALES:
-        return ({"informes", "proyeccion", "ajustes", "semanal", "desviaciones"} if recibe_notificaciones
-                else {"informes", "proyeccion"})
-    return {"admin": {"informes", "proyeccion", "ajustes", "semanal", "desviaciones"},
-            "zonal": {"cuestionario", "informes", "proyeccion", "ajustes", "semanal"},
-            "productor": {"cuestionario", "informes", "proyeccion", "semanal"},
-            "planta": {"informes", "proyeccion", "ajustes", "cierre"}}.get(rol, set())
+        return ({"informes", "proyeccion", "calidad", "ajustes", "semanal", "desviaciones"} if recibe_notificaciones
+                else {"informes", "proyeccion", "calidad"})
+    return {"admin": {"informes", "proyeccion", "calidad", "ajustes", "semanal", "desviaciones"},
+            "zonal": {"cuestionario", "informes", "proyeccion", "calidad", "ajustes", "semanal"},
+            "productor": {"cuestionario", "informes", "proyeccion", "calidad", "semanal"},
+            "planta": {"informes", "proyeccion", "calidad", "ajustes", "cierre"}}.get(rol, set())
 
 def avisos_de_fila(fila):
     """Tipos de aviso que recibe una fila de numeros_permitidos (con rol, avisos y recibe_notificaciones)."""
@@ -1134,6 +1143,7 @@ def listar_numeros_permitidos():
     filas = [dict(row) for row in cursor.fetchall()]
     for fila in filas:
         fila["bases_externas"] = list(bases_externas_de(fila["numero"]))
+        fila["calidad"] = ve_calidad(fila["numero"])
         fila["fundos"] = fundos_de(fila["numero"])
         if fila["zonal"]:
             fila["fundos_de_su_zonal"] = len(productores_de_zonal(fila["zonal"]))
@@ -2896,6 +2906,29 @@ def fijar_bases_externas(numero, cambios):
                      (num, base, 1 if habilitada else 0))
     conn.commit()
     conn.close()
+
+# Calidad de producto terminado (Inglobo, desde el 17-11-2026): permiso por persona, guardado en numeros_bases como
+# una base más ('calidad'). El admin la ve siempre; los demás, solo si se les da (?calidad=si en /admin, o el panel).
+# Lo que ve cada uno sigue su alcance: la planta, su planta; el productor, sus fundos (ver _permitido_calidad).
+PERMISO_CALIDAD = "calidad"
+
+def ve_calidad(numero):
+    if numero is None:
+        return True  # prueba local de administración
+    rol = rol_de(numero)
+    if rol is None:
+        return False
+    if rol == "admin":
+        return True
+    try:
+        conn = sqlite3.connect(DB_LOCAL_PATH)
+        fila = conn.execute("SELECT habilitada FROM numeros_bases WHERE numero = ? AND base = ?",
+                            (normalizar_numero(numero), PERMISO_CALIDAD)).fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error leyendo si ve calidad: {str(e)}")
+        return False
+    return bool(fila and fila[0])
 
 def _texto_tablas(tablas):
     """"la tabla 'datos'" o "las tablas 'datos' y 'packing'", para los mensajes de error."""
@@ -4904,6 +4937,12 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
             "LISONJERA', Linares."
         )
 
+    if calidad_inglobo.configurada():
+        partes.append(INSTRUCCION_CALIDAD if ve_calidad(numero_sender) else
+                      "CALIDAD: la calidad de producto terminado (Inglobo: cajas evaluadas, semáforo, fotos) no está "
+                      "habilitada para este usuario. Si la pide, explícale con amabilidad que puede pedírsela a Edson "
+                      "Lazo.")
+
     tablas_alcance = " y ".join(f"`{b}`" for b in bases)
     if isinstance(alcance, AlcancePlanta) and not alcance.perfil_planta:
         partes.append(f"""ALCANCE DE ESTE USUARIO: solo puede consultar estas plantas: {", ".join(alcance) or "ninguna"}
@@ -4954,6 +4993,9 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
             return f"La base {base_externa.nombre} no está habilitada para este usuario."
         return base_externa.ejecutar(tool_name, tool_input, email=email_de(numero_sender),
                                      quien=numero_sender or "prueba")
+    # Calidad (Inglobo): su propio permiso y su alcance, aparte de las bases de Control_EAS.
+    if tool_name in HERRAMIENTAS_CALIDAD:
+        return _ejecutar_calidad(tool_name, tool_input, numero_sender)
 
     # Barrera de bases: no basta con no ofrecerle la herramienta al modelo. Quien no lee Control_EAS
     # (ej. finanzas) recibe este aviso, y no el de "sin fundos" de más abajo.
@@ -5142,6 +5184,196 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
 # que Claude sepa qué se consultó y qué salió, sin arrastrar tablas enteras a cada mensaje.
 LIMITE_RESULTADO_HISTORIAL = 1500
 
+TOOL_CALIDAD_RESUMEN = {
+    "name": "consultar_calidad",
+    "description": (
+        "Calidad de producto terminado según Inglobo: la verificación de las cajas embaladas en las plantas. Da el "
+        "semáforo de cada caja (🟢 verde, 🟡 amarillo, 🔴 rojo, ya con la resolución de la contramuestra), el conteo "
+        "por planta y por productor, y las cajas con amarillo o rojo con sus defectos fuera de norma. Úsala para "
+        "'¿cómo va la calidad hoy?', 'cajas rechazadas en Lisonjera', 'problemas de calidad de Villaseca ayer'. "
+        "Sin fecha es hoy; hasta 7 días seguidos. Los filtros son por texto (basta parte del nombre). Lo que "
+        "devuelve ya viene limitado a lo que esta persona puede ver."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "fecha": {"type": "string", "description": "Día (AAAA-MM-DD), o el primero de un rango. Sin fecha: hoy."},
+            "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD), máximo 7 días."},
+            "planta": {"type": "string", "description": "Planta o packing (ej. Lisonjera)."},
+            "productor": {"type": "string", "description": "Productor o fundo (ej. Villaseca)."},
+            "variedad": {"type": "string"},
+            "especie": {"type": "string"},
+            "turno": {"type": "string", "description": "Turno, ej. 1 o 2."},
+            "solo_problemas": {"type": "boolean",
+                               "description": "true (por defecto): lista solo las cajas con amarillo o rojo. "
+                                              "false: lista todas."},
+        },
+    },
+}
+
+TOOL_CALIDAD_CAJA = {
+    "name": "detalle_caja_calidad",
+    "description": (
+        "Detalle de UNA caja evaluada en Inglobo y sus fotos: muestra, contramuestras y promedio, defectos fuera de "
+        "norma y todas las mediciones. El folio es el N° de proceso, y un folio suele tener VARIAS cajas en el día "
+        "(muestras a distintas horas y calibres): si queda más de una, la herramienta las lista; pregunta cuál (o "
+        "elige tú si el usuario ya lo dijo, ej. «la roja de las 08:59») y vuelve a llamarla con hora o calibre. Las "
+        "fotos las manda el bot solo, por WhatsApp, justo después de tu respuesta (primero las de los defectos fuera "
+        "de norma): no pongas links ni digas que no puedes mandar fotos."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "folio": {"type": "string", "description": "Folio o número de proceso de la caja (ej. 117)."},
+            "fecha": {"type": "string", "description": "Día de la evaluación (AAAA-MM-DD). Sin fecha: hoy."},
+            "planta": {"type": "string", "description": "Para elegir entre dos cajas con el mismo folio."},
+            "productor": {"type": "string", "description": "Para elegir entre dos cajas con el mismo folio."},
+            "hora": {"type": "string", "description": "Hora de la caja (HH:MM, o solo la hora), para elegir entre las "
+                                                      "cajas de un mismo folio."},
+            "calibre": {"type": "string", "description": "Calibre de la caja, para elegir entre las de un folio."},
+            "todas_las_fotos": {"type": "boolean", "description": "true si pide TODAS las fotos: por defecto van "
+                                                                  "solo las de los defectos fuera de norma."},
+            "fotos": {"type": "boolean", "description": "false para no mandar fotos. Por defecto, sí."},
+            "max_fotos": {"type": "integer", "description": "Cuántas fotos mandar (0 a 8, por defecto 4)."},
+        },
+        "required": ["folio"],
+    },
+}
+
+HERRAMIENTAS_CALIDAD = {TOOL_CALIDAD_RESUMEN["name"], TOOL_CALIDAD_CAJA["name"]}
+
+INSTRUCCION_CALIDAD = (
+    "CALIDAD DE PRODUCTO TERMINADO (Inglobo): con consultar_calidad das el semáforo de las cajas evaluadas por día, "
+    "planta y productor, y las cajas con problema; con detalle_caja_calidad, el detalle de una caja por su folio, con "
+    "sus fotos (el bot las manda solo después de tu respuesta; tú solo avisa cuántas van). Es otra fuente (la "
+    "verificación de Inglobo, no Control_EAS): no la mezcles con kilos sin decirlo. Responde corto: primero el conteo "
+    "(ej. «75 cajas: 🟢 68 · 🟡 4 · 🔴 3»), después las rojas con su defecto principal, y ofrece el detalle y las "
+    "fotos de un folio. Las mediciones completas, solo si las pide. Si Inglobo no responde, dilo tal cual. "
+    "Inglobo agrupa por la fecha de su planilla: las cajas del turno 2 de madrugada pueden quedar en el día anterior."
+)
+
+_PRODUCTORES_POR_CODIGO = {"cargado": 0.0, "mapa": {}}
+
+def _productor_por_codigo(codigo):
+    """Nombre en Control_EAS del código de productor que trae Inglobo (dbo.Expo-Growers: mismos códigos, visto el
+    17-11-2026). '' si no está. Se recarga cada hora."""
+    codigo = str(codigo or "").strip()
+    if not codigo:
+        return ""
+    if time.monotonic() - _PRODUCTORES_POR_CODIGO["cargado"] > 3600:
+        conn = conectar_sql()
+        if conn:
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT CAST(code AS varchar(30)), name FROM [dbo].[Expo-Growers] WHERE code IS NOT NULL")
+                mapa = {}
+                for cod, nombre in cursor.fetchall():
+                    if cod and nombre:
+                        mapa.setdefault(str(cod).strip(), str(nombre).strip())
+                _PRODUCTORES_POR_CODIGO.update(cargado=time.monotonic(), mapa=mapa)
+            except Exception as e:
+                logger.error(f"Error leyendo los códigos de productor: {str(e)}")
+            finally:
+                conn.close()
+    return _PRODUCTORES_POR_CODIGO["mapa"].get(codigo, "")
+
+def _permitido_calidad(alcance):
+    """Qué cajas de Inglobo ve cada uno, según su alcance: todo; la planta (o las plantas que consulta), las de su
+    packing; el productor, las de sus fundos, por nombre o por el código de productor (Inglobo los escribe distinto:
+    «AGRICOLA SANTA ANA DEL HUIQUE SPA» es SANTA ANA DE HUIQUE). Sin packing o sin productor no la ve quien tiene
+    alcance."""
+    if alcance is None:
+        return lambda caja: True
+    if isinstance(alcance, AlcancePlanta):
+        return lambda caja: any(_planta_coincide(p, caja["packing"]) for p in alcance)
+
+    def del_productor(caja):
+        por_codigo = _clave_fundo(_productor_por_codigo(caja.get("codigo_productor")))
+        return any(_fundo_coincide(f, caja["productor"]) or (por_codigo and _clave_fundo(f) == por_codigo)
+                   for f in alcance)
+    return del_productor
+
+def _ejecutar_calidad(tool_name, entrada, numero_sender):
+    if not ve_calidad(numero_sender):
+        return "La calidad de producto terminado (Inglobo) no está habilitada para este usuario."
+    alcance = alcance_de(numero_sender) if numero_sender else None
+    if alcance is not None and not alcance:
+        return MENSAJE_SIN_PLANTA if isinstance(alcance, AlcancePlanta) else MENSAJE_SIN_FUNDOS
+    permitido = _permitido_calidad(alcance)
+    try:
+        if tool_name == "consultar_calidad":
+            desde = calidad_inglobo.leer_fecha(entrada.get("fecha"))
+            hasta = calidad_inglobo.leer_fecha(entrada.get("fecha_hasta"), desde)
+            return calidad_inglobo.resumen(
+                min(desde, hasta), max(desde, hasta), permitido, planta=entrada.get("planta"),
+                productor=entrada.get("productor"), variedad=entrada.get("variedad"), especie=entrada.get("especie"),
+                turno=entrada.get("turno"), solo_problemas=entrada.get("solo_problemas", True) is not False)
+        dia = calidad_inglobo.leer_fecha(entrada.get("fecha"))
+        try:
+            max_fotos = max(0, min(8, int(entrada.get("max_fotos", 4))))
+        except (TypeError, ValueError):
+            max_fotos = 4
+        if entrada.get("fotos") is False:
+            max_fotos = 0
+        texto, fotos = calidad_inglobo.detalle_caja(dia, str(entrada.get("folio") or "").strip(), permitido,
+                                                    planta=entrada.get("planta"), productor=entrada.get("productor"),
+                                                    hora=entrada.get("hora"), calibre=entrada.get("calibre"),
+                                                    max_fotos=max_fotos,
+                                                    todas_las_fotos=entrada.get("todas_las_fotos") is True)
+        if fotos and numero_sender:
+            n = _encolar_fotos(numero_sender, fotos)
+            texto += (f"\nEl bot le manda {n} foto(s) por WhatsApp justo después de tu respuesta: avísale y no "
+                      "pongas los links." if n else "\nYa van muchas fotos en esta respuesta: no se agregan más.")
+        elif fotos:
+            texto += f"\n(Prueba sin número: {len(fotos)} foto(s) no se mandan.)"
+        return texto
+    except calidad_inglobo.ErrorCalidad as e:
+        return f"No pude consultar Inglobo: {e}"
+
+# Fotos de calidad: la herramienta las deja aquí y atender_mensaje las manda DESPUÉS de la respuesta de Claude
+# (si salieran durante la herramienta llegarían antes del texto que las explica).
+MAX_FOTOS_POR_RESPUESTA = 8
+_FOTOS_POR_ENVIAR = {}
+_candado_fotos = threading.Lock()
+
+def _encolar_fotos(numero, fotos):
+    with _candado_fotos:
+        lista = _FOTOS_POR_ENVIAR.setdefault(normalizar_numero(numero), [])
+        nuevas = fotos[:max(0, MAX_FOTOS_POR_RESPUESTA - len(lista))]
+        lista += nuevas
+        return len(nuevas)
+
+def _tomar_fotos(numero):
+    with _candado_fotos:
+        return _FOTOS_POR_ENVIAR.pop(normalizar_numero(numero), [])
+
+def enviar_imagen(numero_destino, url, leyenda=""):
+    """Manda una imagen por su link (Meta la descarga). Necesita la ventana de 24 h abierta."""
+    try:
+        response = requests.post(
+            f"https://graph.facebook.com/v22.0/{WHATSAPP_PHONE_ID}/messages",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"},
+            json={"messaging_product": "whatsapp", "to": numero_destino, "type": "image",
+                  "image": {"link": url, **({"caption": leyenda[:1024]} if leyenda else {})}},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            logger.error(f"WhatsApp respondió {response.status_code} a la imagen para {numero_destino}: "
+                         f"{response.text[:300]}")
+            return False
+        registrar_mensaje_enviado(response, numero_destino, leyenda or url, tipo="imagen")
+        return True
+    except Exception as e:
+        logger.error(f"Error enviando imagen: {str(e)}")
+        return False
+
+def enviar_fotos_pendientes(numero):
+    fotos = _tomar_fotos(numero)
+    enviadas = sum(1 for f in fotos if enviar_imagen(numero, f["url"], f.get("caption", "")))
+    if fotos:
+        logger.info(f"Fotos de calidad para {numero}: {enviadas} de {len(fotos)} aceptadas por Meta")
+    return enviadas
+
 def herramientas_disponibles(numero_sender=None):
     # La herramienta de reporte va siempre que haya número: un ajuste de proyección se avisa
     # cuando pasa, no solo mientras hay un cuestionario vigente.
@@ -5164,7 +5396,9 @@ def herramientas_disponibles(numero_sender=None):
     cosecha = TOOLS + [TOOL_PROYECCION] if "datos" in bases else []
     # El zonal confirma lo que piden sus productores (y, en modo prueba, el admin que las recibe).
     resuelve = bool(numero_sender) and (rol_de(numero_sender) == "zonal" or bool(aprobaciones_para(numero_sender)))
-    return (cosecha + sql + externas
+    calidad = ([TOOL_CALIDAD_RESUMEN, TOOL_CALIDAD_CAJA]
+               if calidad_inglobo.configurada() and ve_calidad(numero_sender) else [])
+    return (cosecha + sql + externas + calidad
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
             + ([TOOL_CONFIRMAR_AJUSTE] if resuelve else [])
             + ([TOOL_HISTORIAL_CONFIRMACIONES] if reporta else []))
@@ -7658,9 +7892,11 @@ def atender_mensaje(message):
                 return
 
             traza = []
+            _tomar_fotos(numero_sender)
             respuesta = procesar_mensaje(msg_text, numero_sender, es_audio=(msg_type == "audio"), traza=traza)
             guardar_conversacion(numero_sender, msg_type, msg_text, respuesta, herramientas=traza)
             enviar_whatsapp(numero_sender, respuesta)
+            enviar_fotos_pendientes(numero_sender)
     except Exception as e:
         logger.exception(f"Error atendiendo mensaje de {numero_sender}: {str(e)}")
         enviar_whatsapp(numero_sender, "Tuve un problema procesando tu mensaje. Intenta de nuevo en un momento.")
@@ -8275,7 +8511,10 @@ def _preparar_informe(informe):
     return informe
 
 def _colores_grafico(grafico):
-    """Un color por serie, o por porción en la torta; "Otros" siempre en gris."""
+    """Un color por serie, o por porción en la torta; "Otros" siempre en gris. Un gráfico puede traer los suyos
+    (`colores`, ej. el semáforo del informe de calidad)."""
+    if grafico.get("colores"):
+        return list(grafico["colores"])
     if grafico["tipo"] == "torta":
         return [COLOR_OTROS if c == "Otros" else COLORES_SERIES[i % len(COLORES_SERIES)]
                 for i, c in enumerate(grafico["categorias"])]
@@ -8566,7 +8805,7 @@ def _tabla_pdf(seccion, disponible):
 
     datos = [[Paragraph(escape(h), estilo_enc_num if i in numericas else estilo_enc)
               for i, h in enumerate(encabezados)]]
-    # Subtotales (ej. por planta en la proyección diaria): las filas cuya primera columna dice «Subtotal …».
+    # Subtotales (ej. por especie en la proyección diaria): las filas cuya primera columna dice «Subtotal …».
     subtotales = {r for r, fila in enumerate(textos, 1) if str(fila[0]).startswith("Subtotal")}
     datos += [[celda(t, i, estilo_total if r in subtotales else estilo_celda) for i, t in enumerate(fila)]
               for r, fila in enumerate(textos, 1)]
@@ -8658,6 +8897,33 @@ def _tabla_kpis(kpis, ancho):
     ]))
     return tabla
 
+def _grilla_fotos_pdf(fotos, ancho, por_fila=3):
+    """Fotos [{contenido (JPEG), leyenda}] en una grilla, cada una con su leyenda debajo."""
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.utils import ImageReader
+    from reportlab.platypus import Image, Paragraph, Table, TableStyle
+    from xml.sax.saxutils import escape
+    separacion = 8
+    ancho_celda = ancho / por_fila
+    ancho_foto = ancho_celda - separacion
+    estilo = ParagraphStyle("leyenda_foto", fontName="Helvetica", fontSize=7, leading=9,
+                            textColor=_color(COLOR_TINTA_2))
+    celdas = []
+    for foto in fotos:
+        w, h = ImageReader(io.BytesIO(foto["contenido"])).getSize()
+        ancho_img, alto_img = ancho_foto, ancho_foto * h / w
+        if alto_img > ancho_foto * 1.1:  # las verticales no más altas que anchas (+10%)
+            ancho_img, alto_img = ancho_img * ancho_foto * 1.1 / alto_img, ancho_foto * 1.1
+        celdas.append([Image(io.BytesIO(foto["contenido"]), width=ancho_img, height=alto_img),
+                       Paragraph(escape(foto.get("leyenda") or ""), estilo)])
+    filas = [celdas[i:i + por_fila] for i in range(0, len(celdas), por_fila)]
+    filas[-1] += [""] * (por_fila - len(filas[-1]))
+    tabla = Table(filas, colWidths=[ancho_celda] * por_fila, hAlign="LEFT")
+    tabla.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                               ("RIGHTPADDING", (0, 0), (-1, -1), separacion),
+                               ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 9)]))
+    return tabla
+
 def generar_pdf_informe(informe):
     """PDF con formato de informe: franja de encabezado, título y periodo, cifras clave,
     resumen, gráfico, tabla (con encabezado repetido en cada página) y notas al pie."""
@@ -8743,6 +9009,8 @@ def generar_pdf_informe(informe):
             historia.append(KeepTogether(bloque))
         if seccion["filas"]:
             historia.append(_tabla_pdf(seccion, doc.width))
+        if seccion.get("fotos"):
+            historia.append(_grilla_fotos_pdf(seccion["fotos"], doc.width))
         if seccion.get("nota"):
             historia.append(Paragraph(escape(seccion["nota"]), est_nota))
         historia.append(Spacer(1, 6 * mm))
@@ -9356,8 +9624,10 @@ def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None,
                 f"Se muestran las primeras {MAX_FILAS_INFORME} filas; resume más la consulta para ver todo.")
         if omitir_vacias and not filas:
             continue
-        informe["secciones"].append({"titulo": nombre, "encabezados": encabezados, "filas": filas,
-                                     "total": total, "grafico": dibujo, "nota": nota})
+        armada = {"titulo": nombre, "encabezados": encabezados, "filas": filas, "total": total, "grafico": dibujo,
+                  "nota": nota}
+        # Informes automáticos: una sección puede repartirse en varias (la proyección diaria, una por planta).
+        informe["secciones"] += seccion["dividir"](armada) if callable(seccion.get("dividir")) else [armada]
     return informe, None
 
 def subir_media(contenido, nombre_archivo, mime):
@@ -9462,10 +9732,13 @@ def enviar_informe(numero_destino, formato, informe):
 # un productor ve sus fundos, una planta su planta, y el de procesos va solo a quien tiene
 # habilitado Packing. La sección de confirmaciones va solo a admin, EAS y gerencia.
 
-TIPOS_INFORME_DIARIO = ("cosecha", "procesos", "proyeccion")
+# «calidad» (18-11-2026): calidad de producto terminado según Inglobo, solo a las 08:00 (el día anterior completo) y
+# solo a quien tiene el permiso Calidad (ver armar_informe_calidad).
+TIPOS_INFORME_DIARIO = ("cosecha", "procesos", "proyeccion", "calidad")
 # Qué aviso tiene que tener cada uno para recibirlo (ver TIPOS_AVISO) y cómo se nombra en los mensajes.
-AVISO_INFORME_DIARIO = {"cosecha": "informes", "procesos": "informes", "proyeccion": "proyeccion"}
-NOMBRE_INFORME_DIARIO = {"cosecha": "cosecha", "procesos": "procesos", "proyeccion": "proyección de cosecha"}
+AVISO_INFORME_DIARIO = {"cosecha": "informes", "procesos": "informes", "proyeccion": "proyeccion", "calidad": "calidad"}
+NOMBRE_INFORME_DIARIO = {"cosecha": "cosecha", "procesos": "procesos", "proyeccion": "proyección de cosecha",
+                         "calidad": "calidad"}
 _INF_PLANTA = "REPLACE(Packing,'PLANTA ','')"
 _INF_PRODUCTOR = ("CASE WHEN Productor='SANTA ANA' THEN 'SANTA ANA DE HUIQUE' "
                   "WHEN Productor='AGRICOLA EL CARMELO LTDA' THEN 'AGRÍCOLA EL CARMELO LTDA' ELSE Productor END")
@@ -9930,11 +10203,12 @@ def _plantas_precosecha(productor, variedad, fecha):
         conn.close()
 
 def _completar_proyeccion(encabezados, filas, alcance, fecha, consulta=None):
-    """La tabla de la proyección. A la Trisemanal del día (la consulta: Planta, Fundo, Variedad, Trisemanal kg) le
-    suma lo confirmado por zonales y productores (kilos_confirmados, lo vigente de cada fundo y variedad):
-    Proyección = lo confirmado o, sin confirmación, la Trisemanal (una confirmación de 0 la deja en 0). La planta de
-    cada fila es la de la Trisemanal; lo confirmado que no está en ella y no trae planta va a la que ese fundo tiene
-    en la base (marcada para revisar) o a POR DEFINIR. Subtotal por planta y TOTAL al final, calculados aquí."""
+    """Las filas de la proyección: Planta | Especie | Variedad | Fundo | Trisemanal | Confirmado | Proyección |
+    Observación, ordenadas por planta y especie (_dividir_proyeccion arma una tabla por planta). A la Trisemanal del
+    día (la consulta: Planta, Especie, Fundo, Variedad, Trisemanal kg) le suma lo confirmado por zonales y productores
+    (kilos_confirmados, lo vigente de cada fundo y variedad): Proyección = lo confirmado o, sin confirmación, la
+    Trisemanal (una confirmación de 0 la deja en 0). La planta de cada fila es la de la Trisemanal; lo confirmado que
+    no está en ella y no trae planta va a la que ese fundo tiene en la base (marcada para revisar) o a POR DEFINIR."""
     if alcance is not None and consulta:
         # La planta de cada confirmación se busca en la Trisemanal de TODAS las plantas: con solo la de su alcance,
         # una variedad que va a otra planta caería en la suya. Al final queda solo lo de su alcance (en_alcance).
@@ -9943,20 +10217,22 @@ def _completar_proyeccion(encabezados, filas, alcance, fecha, consulta=None):
             filas = [[_valor_normalizado(v) for v in f] for f in r["filas"]]
     lineas = {}
 
-    def linea(planta, fundo, variedad):
+    def linea(planta, fundo, variedad, especie=""):
         clave = (planta, _clave_fundo(fundo), _variedad_informe(variedad))
         if clave not in lineas:
-            lineas[clave] = {"planta": planta, "fundo": fundo, "variedad": variedad, "tri": 0, "conf": None, "obs": []}
+            lineas[clave] = {"planta": planta, "fundo": fundo, "variedad": variedad, "especie": especie, "tri": 0,
+                             "conf": None, "obs": []}
+        lineas[clave]["especie"] = lineas[clave]["especie"] or especie
         return lineas[clave]
 
     def observar(l, texto):
         if texto and texto not in l["obs"]:
             l["obs"].append(texto)
 
-    for planta, fundo, variedad, kg in filas:
+    for planta, especie, fundo, variedad, kg in filas:
         if str(planta or "").strip().upper() != "TOTAL":
-            linea(_planta_informe(planta) or PLANTA_POR_DEFINIR, str(fundo or "").strip(),
-                  str(variedad or "").strip())["tri"] += kg or 0
+            linea(_planta_informe(planta) or PLANTA_POR_DEFINIR, str(fundo or "").strip(), str(variedad or "").strip(),
+                  traducir_especie(str(especie or "").strip()))["tri"] += kg or 0
 
     plantas_fundo = {}
 
@@ -9989,9 +10265,11 @@ def _completar_proyeccion(encabezados, filas, alcance, fecha, consulta=None):
             planta = (_planta_informe(k["planta"]) if k["planta"] else plantas.pop() if len(plantas) == 1
                       else planta_del_fundo(k["productor"])[0] or PLANTA_POR_DEFINIR)
             tri = sum(l["tri"] for l in del_fundo)
+            especies = sorted({l["especie"] for l in del_fundo if l["especie"]})
             for l in del_fundo:
                 lineas.pop((l["planta"], _clave_fundo(l["fundo"]), _variedad_informe(l["variedad"])), None)
-            nueva = linea(planta, del_fundo[0]["fundo"] if del_fundo else k["productor"], "(todas las variedades)")
+            nueva = linea(planta, del_fundo[0]["fundo"] if del_fundo else k["productor"], "(todas las variedades)",
+                          "/".join(especies))
             nueva["tri"] += tri
             nueva["conf"] = (nueva["conf"] or 0) + kg
             observar(nueva, "Total del fundo, sin variedad")
@@ -10013,7 +10291,7 @@ def _completar_proyeccion(encabezados, filas, alcance, fecha, consulta=None):
             marca =("Planta según la base: revisar" if planta
                      else f"Sin planta: puede ser {_enumerar(posibles)}" if posibles else "Sin planta en la base")
             planta = planta or PLANTA_POR_DEFINIR
-        nueva = linea(planta, k["productor"], k["variedad"])
+        nueva = linea(planta, k["productor"], k["variedad"], _especie_de_variedad(k["variedad"]))
         nueva["conf"] = (nueva["conf"] or 0) + kg
         observar(nueva, marca)
         observar(nueva, detalle)
@@ -10034,52 +10312,231 @@ def _completar_proyeccion(encabezados, filas, alcance, fecha, consulta=None):
         if tri or conf:
             vistas.append({**l, "tri": tri, "conf": conf, "proy": tri if conf is None else conf,
                            "fundo": _NOMBRE_FUNDO_INFORME.get(_normalizar_nombre(l["fundo"]), l["fundo"])})
-    con_obs = any(l["obs"] for l in vistas)
-    encabezados = (["Planta", "Fundo", "Variedad", "Trisemanal kg", "Confirmado kg", "Proyección kg"]
-                   + (["Observación"] if con_obs else []))
+    # Dentro de cada planta: la especie con más kilos primero, por variedad y, en cada una, el fundo con más kilos.
+    por_especie = {}
+    for l in vistas:
+        l["especie"] = l["especie"] or SIN_ESPECIE
+        por_especie[(l["planta"], l["especie"])] = por_especie.get((l["planta"], l["especie"]), 0) + l["proy"]
+    vistas.sort(key=lambda l: (_orden_planta_proyeccion(l["planta"]), -por_especie[(l["planta"], l["especie"])],
+                               l["especie"], l["variedad"], -l["proy"], l["fundo"]))
+    return (["Planta", "Especie", "Variedad", "Fundo", "Trisemanal kg", "Confirmado kg", "Proyección kg", "Observación"],
+            [[l["planta"], l["especie"], l["variedad"], l["fundo"], l["tri"], l["conf"], l["proy"], "; ".join(l["obs"])]
+             for l in vistas])
 
-    def fila(planta, fundo, variedad, grupo, obs=""):
-        confirmados = [l["conf"] for l in grupo if l["conf"] is not None]
-        valores = [planta, fundo, variedad, sum(l["tri"] for l in grupo), sum(confirmados) if confirmados else None,
-                   sum(l["proy"] for l in grupo)]
-        return valores + ([obs] if con_obs else [])
+SIN_ESPECIE = "Sin especie"
 
-    plantas = sorted({l["planta"] for l in vistas}, key=_orden_planta_proyeccion)
-    salida = []
+def _dividir_proyeccion(seccion):
+    """Una tabla por planta (la planta es el título): Especie | Variedad | Fundo | Trisemanal | Confirmado |
+    Proyección | Observación, con subtotal por especie (si la planta tiene más de una) y el total de la planta al pie.
+    Con más de una planta, al final el total por planta. Todo sumado aquí, de las mismas filas."""
+    encabezados, filas = seccion["encabezados"], seccion["filas"]
+    i_tri, i_conf, i_proy = (encabezados.index(h) for h in ("Trisemanal kg", "Confirmado kg", "Proyección kg"))
+
+    def sumas(grupo):
+        confirmados = [f[i_conf] for f in grupo if f[i_conf] is not None]
+        return [sum(f[i_tri] or 0 for f in grupo), sum(confirmados) if confirmados else None,
+                sum(f[i_proy] or 0 for f in grupo)]
+
+    plantas = list(dict.fromkeys(f[0] for f in filas))
+    secciones = []
     for planta in plantas:
-        de_planta = sorted((l for l in vistas if l["planta"] == planta),
-                           key=lambda l: (-l["proy"], l["fundo"], l["variedad"]))
-        salida += [fila(planta, l["fundo"], l["variedad"], [l], "; ".join(l["obs"])) for l in de_planta]
-        if len(plantas) > 1:
-            salida.append(fila(f"Subtotal {planta}", "", "", de_planta))
-    if vistas:
-        salida.append(fila("TOTAL", "", "", vistas))
-    return encabezados, salida
+        de_planta = [f for f in filas if f[0] == planta]
+        especies = list(dict.fromkeys(f[1] for f in de_planta))
+        salida = []
+        for especie in especies:
+            grupo = [f for f in de_planta if f[1] == especie]
+            salida += [f[1:] for f in grupo]
+            if len(especies) > 1:
+                salida.append([f"Subtotal {especie}", "", "", *sumas(grupo), ""])
+        total = sumas(de_planta)
+        secciones.append({"titulo": "Planta por definir" if planta == PLANTA_POR_DEFINIR else f"Planta {planta}",
+                          "encabezados": encabezados[1:], "filas": salida,
+                          "total": [f"Total {planta.lower() if planta == PLANTA_POR_DEFINIR else planta}", "", "",
+                                    *total, ""],
+                          "grafico": None, "nota": None, "kg_proyeccion": total[2]})
+    if len(plantas) > 1:
+        secciones.append({"titulo": "Total por planta",
+                          "encabezados": ["Planta", "Trisemanal kg", "Confirmado kg", "Proyección kg"],
+                          "filas": [[planta, *sumas([f for f in filas if f[0] == planta])] for planta in plantas],
+                          "total": ["TOTAL", *sumas(filas)], "grafico": None, "nota": None})
+    if secciones:
+        secciones[-1]["nota"] = seccion.get("nota")
+    return secciones
 
 def spec_informe_proyeccion(fecha, turno="pm"):
     t, D, d = temporada_de(fecha), fecha.strftime("%Y%m%d"), fecha.strftime("%d-%m")
     tri = BASE_ORIGEN_TRISEMANAL
     momento = ("informe de la mañana: casi todo es Trisemanal, los zonales confirman después del cuestionario de "
                "las 08:00" if turno == "am" else f"con lo confirmado hasta las {datetime.now():%H:%M}")
-    consulta = (f"SELECT {_INF_PLANTA} AS Planta, Productor AS Fundo, {_INF_VARIEDAD} AS Variedad, "
+    consulta = (f"SELECT {_INF_PLANTA} AS Planta, Especie, Productor AS Fundo, {_INF_VARIEDAD} AS Variedad, "
                 f"SUM(KgsRecepcionados) AS [Trisemanal kg] FROM datos WHERE [Base Origen]='{tri}' "
-                f"AND CAST(Fecha AS DATE)='{D}' GROUP BY {_INF_PLANTA}, Productor, {_INF_VARIEDAD} "
+                f"AND CAST(Fecha AS DATE)='{D}' GROUP BY {_INF_PLANTA}, Especie, Productor, {_INF_VARIEDAD} "
                 "HAVING SUM(KgsRecepcionados)<>0")
     return {"titulo": f"Proyección diaria de cosecha por planta – {DIAS_SEMANA[fecha.weekday()]} {fecha:%d-%m-%Y}",
             "subtitulo": f"Temporada {t} · kilos de Agua Santa · cosecha de hoy {d} · {momento}",
             "consulta_kpis": None,
             "secciones": [
-                {"titulo": f"Proyección de hoy {d} por planta, fundo y variedad", "bases": ("datos",),
+                {"titulo": f"Proyección de hoy {d}", "bases": ("datos",),
                  "consulta_sql": consulta,
                  "completar": lambda encabezados, filas, alcance: _completar_proyeccion(encabezados, filas, alcance,
                                                                                         fecha, consulta),
+                 "dividir": _dividir_proyeccion, "total": False,
                  "grafico": {"tipo": "ninguno"},
                  "nota": ("Proyección = lo confirmado por el zonal o el productor para hoy; sin confirmación, la "
                           "Trisemanal. Una confirmación de 0 (no cosecha) la deja en 0. Lo que llega a cada planta es el "
-                          "subtotal de su Proyección. Las cifras en bins se pasan a kilos con la planilla de conversiones "
+                          "total de su Proyección. Las cifras en bins se pasan a kilos con la planilla de conversiones "
                           "y los rangos, al promedio. «Planta según la base»: la confirmación no traía planta y se usó la "
                           "que tiene ese fundo; POR DEFINIR: no se encontró. Rainier incluye Royal Rainier.")},
             ]}
+
+COLORES_SEMAFORO = ("#2e9e5b", "#e0a800", "#d64541")
+MAX_FOTOS_INFORME_CALIDAD = 12
+
+def _texto_defectos(lista, maximo=4):
+    texto = "; ".join(f"{h} {calidad_inglobo._valor(v)}".strip() for h, v, _ in lista[:maximo])
+    return texto + (f" (+{len(lista) - maximo} más)" if len(lista) > maximo else "")
+
+def armar_informe_calidad(fecha, numero, alcance, turno):
+    """Informe diario de calidad de producto terminado según Inglobo (pedido de Edson el 17-11-2026): a las 08:00 el
+    día anterior completo (turno AM); con turno PM, lo de hoy hasta la hora. Solo para quien tiene el permiso Calidad,
+    con su alcance (_permitido_calidad). Cifras clave, por planta (con gráfico), defectos que más rechazan, por
+    productor y variedad, cajas rojas y amarillas, y una foto por caja roja (la de su defecto). (informe, None) o
+    (None, motivo)."""
+    if not calidad_inglobo.configurada():
+        return None, "Inglobo no está configurado"
+    if not ve_calidad(numero):
+        return None, "no tiene el permiso Calidad"
+    dia = fecha - timedelta(days=1) if turno == "am" else fecha
+    try:
+        todas = calidad_inglobo.cajas(calidad_inglobo.reporte_dia(dia))
+    except calidad_inglobo.ErrorCalidad as e:
+        return None, f"Inglobo: {e}"
+    permitido = _permitido_calidad(alcance)
+    cajas = [c for c in todas if permitido(c)]
+    if not cajas:
+        return None, "sin datos"
+
+    def planta(c):
+        return _planta_informe(c["packing"]) or "(sin planta)"
+
+    def pct(parte, total):
+        return round(100 * parte / total, 1) if total else 0
+
+    def conteo(grupo):
+        rojas_g = sum(c["nota"] == "ROJO" for c in grupo)
+        return [len(grupo), sum(c["nota"] == "VERDE" for c in grupo), sum(c["nota"] == "AMARILLO" for c in grupo),
+                rojas_g, pct(rojas_g, len(grupo))]
+
+    rojas = [c for c in cajas if c["nota"] == "ROJO"]
+    amarillas = [c for c in cajas if c["nota"] == "AMARILLO"]
+    aprobadas = sum(1 for c in cajas if c["nota"] == "VERDE" and "CONTRAMUESTRA" in _normalizar_nombre(c["resolucion"]))
+    secciones = []
+    plantas = sorted({planta(c) for c in cajas}, key=_orden_planta_proyeccion)
+    filas_p = [[p, *conteo([c for c in cajas if planta(c) == p])] for p in plantas]
+    secciones.append({
+        "titulo": "Por planta", "encabezados": ["Planta", "Cajas", "Verdes", "Amarillas", "Rojas", "% rojo"],
+        "filas": filas_p, "total": ["TOTAL", *conteo(cajas)] if len(plantas) > 1 else None,
+        "grafico": {"tipo": "barras", "titulo": "Cajas evaluadas por planta", "categorias": plantas,
+                    "series": [("Verdes", [f[2] for f in filas_p]), ("Amarillas", [f[3] for f in filas_p]),
+                               ("Rojas", [f[4] for f in filas_p])], "colores": list(COLORES_SEMAFORO)},
+        "nota": None})
+    por_defecto = {}
+    for c in rojas:
+        for defecto in {d[0] for d in calidad_inglobo.defectos_rechazo(c)}:
+            por_defecto[defecto] = por_defecto.get(defecto, 0) + 1
+    filas_d = sorted(([d, n, pct(n, len(rojas))] for d, n in por_defecto.items()), key=lambda f: (-f[1], f[0]))
+    if filas_d:
+        secciones.append({
+            "titulo": "Defectos que más rechazan", "encabezados": ["Defecto", "Cajas rojas", "% de las cajas rojas"],
+            "filas": filas_d[:15], "total": None, "grafico": None,
+            "nota": "Cuántas cajas rojas tienen cada defecto fuera de norma (una caja puede tener más de uno). Los "
+                    "totales (Total calidad, Total condición) cuentan solo cuando son lo único marcado."})
+    grupos = {}
+    for c in cajas:
+        variedad = " ".join(x for x in (c["especie"].capitalize(), c["variedad"]) if x)
+        grupos.setdefault((c["productor"] or "(sin productor)", variedad), []).append(c)
+    filas_pv = sorted(([p, v, *conteo(g)] for (p, v), g in grupos.items()), key=lambda f: (-f[6], -f[2], f[0], f[1]))
+    secciones.append({
+        "titulo": "Por productor y variedad",
+        "encabezados": ["Productor", "Especie y variedad", "Cajas", "Verdes", "Amarillas", "Rojas", "% rojo"],
+        "filas": filas_pv, "total": ["TOTAL", "", *conteo(cajas)] if len(filas_pv) > 1 else None, "grafico": None,
+        "nota": None})
+    problemas = sorted(rojas + amarillas, key=lambda c: (c["nota"] != "ROJO", _orden_planta_proyeccion(planta(c)),
+                                                          c["hora"]))
+    if problemas:
+        secciones.append({
+            "titulo": "Cajas rojas y amarillas",
+            "encabezados": ["Nota", "Folio", "Hora", "Turno", "Planta", "Productor", "Variedad", "Calibre",
+                            "Defectos fuera de norma"],
+            "filas": [["Rojo" if c["nota"] == "ROJO" else "Amarillo", c["folio"], c["hora"],
+                       re.sub(r"(?i)^turno\s*", "", c["turno"]), planta(c), c["productor"], c["variedad"], c["calibre"],
+                       _texto_defectos(calidad_inglobo.defectos_rechazo(c))] for c in problemas],
+            "total": None, "grafico": None,
+            "nota": "Rojo = rechazada; amarillo = advertencia. El folio es el N° de proceso y puede tener varias cajas: "
+                    "el detalle y todas las fotos de una caja se le piden al bot con su folio y hora."})
+    # Una foto por caja roja, primero una por productor y defecto principal (para que se vea lo distinto).
+    orden = sorted(rojas, key=lambda c: (-len(calidad_inglobo.defectos_rechazo(c)), c["hora"]))
+    elegidas, vistos = [], set()
+    for c in orden:
+        clave = (c["productor"], calidad_inglobo.defectos_rechazo(c)[0][0] if c["fuera"] else "")
+        if clave not in vistos:
+            vistos.add(clave)
+            elegidas.append(c)
+    elegidas += [c for c in orden if not any(c is e for e in elegidas)]
+    fotos, usadas = [], set()
+    for intento, c in enumerate(elegidas):
+        if len(fotos) >= MAX_FOTOS_INFORME_CALIDAD or intento >= 60:
+            break
+        try:
+            foto = calidad_inglobo.foto_principal(dia, c)
+        except calidad_inglobo.ErrorCalidad as e:
+            logger.warning(f"Informe de calidad: sin fotos ({e})")
+            break
+        if not foto or foto["url"] in usadas:
+            continue
+        contenido = calidad_inglobo.miniatura(foto["url"])
+        if contenido:
+            usadas.add(foto["url"])
+            # Sin hora: la galería de Inglobo dice de qué folio es la foto, no de cuál de sus cajas.
+            fotos.append({"contenido": contenido,
+                          "leyenda": f"Folio {c['folio']} · {planta(c)} · {c['productor']} · {c['variedad']} · "
+                                     f"{foto['defecto']}: {foto['valor']}"})
+    if fotos:
+        secciones.append({
+            "titulo": "Fotos de las cajas rojas", "encabezados": [], "filas": [], "total": None, "grafico": None,
+            "fotos": fotos,
+            "nota": f"Una foto por caja roja, la del defecto que la rechazó (de su folio): {len(fotos)} de {len(rojas)} "
+                    "cajas rojas" + ("; las demás, al bot con su folio y hora." if len(rojas) > len(fotos) else ".")})
+    for i, seccion in enumerate(secciones, 1):
+        seccion["titulo"] = f"{i}. {seccion['titulo']}"
+    momento = "día completo (turnos 1 y 2)" if turno == "am" else f"hoy hasta las {datetime.now():%H:%M}"
+    kpis = [{"etiqueta": "Cajas evaluadas", "valor": len(cajas), "tipo": "numero", "signo": False},
+            {"etiqueta": "Rojas", "valor": len(rojas), "tipo": "numero", "signo": False},
+            {"etiqueta": "% rojo", "valor": pct(len(rojas), len(cajas)), "tipo": "porcentaje", "signo": False},
+            {"etiqueta": "Amarillas", "valor": len(amarillas), "tipo": "numero", "signo": False},
+            {"etiqueta": "Aprobadas por contramuestra", "valor": aprobadas, "tipo": "numero", "signo": False}]
+    return {"titulo": f"Informe diario de calidad – {DIAS_SEMANA[dia.weekday()]} {dia:%d-%m-%Y}",
+            "subtitulo": f"Producto terminado según Inglobo · {momento} · semáforo por caja muestreada",
+            "resumen": None, "kpis": kpis, "secciones": secciones, "kg_plantilla": 0,
+            "notas": ["Fuente: Inglobo (verificación de producto terminado). El semáforo es por caja muestreada, no "
+                      "por kilo, y ya incluye la resolución de la contramuestra (las aprobadas por contramuestra "
+                      "cuentan como verdes).",
+                      "Inglobo agrupa por la fecha de su planilla: las cajas del turno 2 de madrugada pueden quedar "
+                      "en el día anterior."]}, None
+
+def _precargar_calidad(dia, intentos=3, espera=30):
+    """Trae de Inglobo el día del informe de calidad antes de repartirlo, con reintentos. False si no respondió."""
+    for i in range(intentos):
+        try:
+            calidad_inglobo.reporte_dia(dia)
+            calidad_inglobo.filtros_dia(dia)
+            return True
+        except calidad_inglobo.ErrorCalidad as e:
+            logger.warning(f"Informe de calidad: Inglobo no respondió (intento {i + 1} de {intentos}): {e}")
+            if i < intentos - 1:
+                time.sleep(espera)
+    logger.error(f"Informe de calidad del {dia:%d-%m-%Y}: Inglobo no respondió; hoy no sale")
+    return False
 
 def _permisos_informe_diario(numero):
     """(alcance, bases, confirmaciones) con que se arma el informe diario de ese número."""
@@ -10092,6 +10549,9 @@ def armar_informe_diario(tipo, fecha, numero, permisos=None, turno=None):
     turno = turno or turno_informe()
     if alcance is not None and not alcance:
         return None, "sin fundos ni planta asignados"
+    if tipo == "calidad":
+        # Calidad (Inglobo) no lee Control_EAS: tiene su propio permiso y no depende de las bases.
+        return armar_informe_calidad(fecha, numero, alcance, turno)
     if ("packing" if tipo == "procesos" else "datos") not in bases:
         return None, f"no tiene habilitada la base de {'packing' if tipo == 'procesos' else 'cosecha'}"
     spec = {"cosecha": spec_informe_cosecha, "procesos": spec_informe_procesos,
@@ -10120,11 +10580,8 @@ def _kg_plantilla(tipo, informe, fecha, turno, alcance, bases):
     """Kilos de la plantilla de aviso («{{2}} kg previstos»): la Trisemanal de hoy. El informe PM la trae
     entre sus cifras; el AM muestra el día anterior, así que se consulta aparte."""
     if tipo == "proyeccion":
-        # El TOTAL de la columna Proyección (lo de hoy).
-        s = informe["secciones"][0] if informe.get("secciones") else None
-        if s and s.get("total") and "Proyección kg" in s["encabezados"]:
-            return s["total"][s["encabezados"].index("Proyección kg")] or 0
-        return 0
+        # La Proyección de hoy: la suma de las tablas de cada planta.
+        return sum(s.get("kg_proyeccion") or 0 for s in informe.get("secciones", []))
     if tipo != "cosecha":
         return 0
     if turno != "am":
@@ -10153,9 +10610,9 @@ def enviar_informe_diario_a(numero, tipo, fecha, turno=None):
     return "enviado" if ok else "error"
 
 def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
-    """Job diario (INFORMES_DIARIOS_HORAS, 08:00 y 16:00): el informe de cosecha, el de procesos y la proyección
-    diaria por planta a los usuarios de INFORMES_DIARIOS_PERFILES que tengan su aviso (AVISO_INFORME_DIARIO), cada
-    uno con su alcance y sus bases. Cada versión
+    """Job diario (INFORMES_DIARIOS_HORAS, 08:00 y 16:00): el informe de cosecha, el de procesos, la proyección
+    diaria por planta y (solo a las 08:00, con el permiso Calidad) el de calidad a los usuarios de
+    INFORMES_DIARIOS_PERFILES que tengan su aviso (AVISO_INFORME_DIARIO), cada uno con su alcance y sus bases. Cada versión
     distinta del PDF se arma y se sube una sola vez. Con la ventana de 24 h cerrada va la
     plantilla y el informe queda en cola (se arma de nuevo al entregarlo). En modo prueba va
     solo a los admin. numeros = solo a esos (para probar)."""
@@ -10176,6 +10633,12 @@ def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
         versiones = {}
         # En producción cada informe va a quien tenga su aviso; al probar (admin o números puntuales), todos.
         filtrar_avisos = bool(ENVIOS_AUTOMATICOS_PRODUCCION and not numeros)
+        # Calidad (Inglobo): solo a las 08:00, con el día anterior completo, y solo a quien tiene el permiso. Inglobo
+        # se consulta una vez antes de repartir (con reintentos): si no responde, ese informe no sale hoy.
+        con_calidad = {d["numero"] for d in destinatarios if ve_calidad(d["numero"])
+                       and (not filtrar_avisos or "calidad" in d["avisos"])}
+        calidad_hoy = (turno == "am" and bool(con_calidad) and calidad_inglobo.configurada()
+                       and _precargar_calidad(fecha - timedelta(days=1)))
         cuenta = {"documentos": 0, "personas_directo": 0, "personas_plantilla": 0, "sin_informe": 0, "errores": 0}
         recibieron = {tipo: [] for tipo in TIPOS_INFORME_DIARIO}
         for d in destinatarios:
@@ -10185,6 +10648,8 @@ def enviar_informes_diarios(fecha=None, numeros=None, turno=None):
             archivos = []
             for tipo in TIPOS_INFORME_DIARIO:
                 if filtrar_avisos and AVISO_INFORME_DIARIO[tipo] not in d["avisos"]:
+                    continue
+                if tipo == "calidad" and not (calidad_hoy and num in con_calidad):
                     continue
                 clave = (tipo, type(alcance).__name__, tuple(alcance) if alcance is not None else None,
                          tuple(bases), getattr(bases, "externas", False), confirmaciones)
@@ -10365,6 +10830,7 @@ def _estado_numero(numero):
         "avisos": [a for a in TIPOS_AVISO if a in avisos_de(num)],
         "email": email_de(num),
         "bases_externas": {b: bases_externas.BASES[b].estado() for b in bases_externas_de(num)},
+        "calidad": ve_calidad(num),
         "ve_todo": ve_todo,
         "acceso_total": acceso_total,
         "alcance": detalle_alcance,
@@ -10462,12 +10928,13 @@ def _email_param(valor):
     return texto, None
 
 # Cada base externa es un parámetro con su nombre (?cierre=si|no), en /admin/numeros/agregar y /rol.
-PARAMETROS_BASES_EXTERNAS = set(bases_externas.BASES)
+PARAMETROS_BASES_EXTERNAS = set(bases_externas.BASES) | {PERMISO_CALIDAD}
 
 def _bases_externas_param(request):
-    """Lee ?cierre=si|no (uno por base externa): ({id: True|False}, error). Vacío si no vino ninguno."""
+    """Lee ?cierre=si|no (uno por base externa, más ?calidad=si|no): ({id: True|False}, error). Vacío si no vino
+    ninguno."""
     cambios = {}
-    for id_ in bases_externas.BASES:
+    for id_ in (*bases_externas.BASES, PERMISO_CALIDAD):
         try:
             valor = _parsear_si_no(request.query_params.get(id_))
         except ValueError:
@@ -10546,6 +11013,7 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     email: correo de la persona (email=quitar lo borra). Cierre muestra los datos según este correo.
     cierre: si/no, le da o le quita la base de Cierre, sea cual sea su perfil (igual con cada base
     externa, por su nombre). Para ver datos, además su correo debe estar en dbo.Cierre_UsuarioAcceso.
+    calidad: si/no, le da o le quita la calidad de producto terminado (Inglobo), con su alcance.
     Uso: .../admin/numeros/agregar?clave=...&numero=56912345678&nombre=Joaquin&zonal=Joaquin Llano
          .../admin/numeros/agregar?clave=...&numero=569...&nombre=Ana&rol=finanzas&email=ana@aguasanta.cl&cierre=si
     """
@@ -10663,7 +11131,8 @@ async def admin_cambiar_rol(request: Request, clave: str, numero: str, rol: str 
     externas: si/no o las plantas (buin|lisonjera|almahue) de las que ve la fruta de otras exportadoras (solo
     cuenta para gerencia). avisos: tipos de aviso que recibe separados por "|", ninguno, o perfil.
     email: correo de la persona (email=quitar lo borra). cierre: si/no, le da o le quita la base de
-    Cierre, sea cual sea su perfil (igual con cada base externa, por su nombre).
+    Cierre, sea cual sea su perfil (igual con cada base externa, por su nombre). calidad: si/no, la calidad
+    de producto terminado (Inglobo).
     Uso: .../admin/numeros/rol?clave=...&numero=56912345678&rol=zonal&zonal=Pedro Dominguez
          .../admin/numeros/rol?clave=...&numero=56912345678&email=juan@aguasanta.cl&cierre=si
     """
@@ -11269,7 +11738,9 @@ def test_mensaje(clave: str, mensaje: str, numero: str = None, guardar: bool = F
     respuesta = procesar_mensaje(mensaje, numero, traza=traza)
     if guardar and numero:
         guardar_conversacion(numero, "text", mensaje, respuesta, herramientas=traza)
-    return {"pregunta": mensaje, "respuesta": respuesta, "herramientas": traza}
+    # Las fotos de calidad no se mandan en la prueba: se muestran.
+    fotos = _tomar_fotos(numero) if numero else []
+    return {"pregunta": mensaje, "respuesta": respuesta, "herramientas": traza, **({"fotos": fotos} if fotos else {})}
 
 @app.get("/test/conexion")
 def test_conexion(clave: str, base: str = None, numero: str = None, email: str = None):
