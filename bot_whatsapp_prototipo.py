@@ -453,11 +453,13 @@ def inicializar_db_local():
     if "ver_externas" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN ver_externas INTEGER")
     # Plantas de otras exportadoras que ve (desde el 11-11-2026): claves de PLANTAS_EXTERNAS separadas por "|".
-    # Vacío con ver_externas = 1 = las tres (así quedaron los que se activaron antes de poder elegir).
+    # Vacío con ver_externas = 1 = las tres (así quedaron los que se activaron antes de poder elegir). Desde el
+    # 18-11-2026 es su propia lista, aparte de plantas_consulta (el «doble ticket» por planta del panel).
     if "externas_plantas" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN externas_plantas TEXT")
     # Plantas que consulta (desde el 12-11-2026): lista JSON de nombres de planta en mayúsculas; vacío = todas.
-    # Limita todo lo que lee: recepción, packing, otras exportadoras, herramientas e informes (plantas_consulta_de).
+    # Limita lo que lee de Agua Santa: recepción, packing, herramientas e informes (plantas_consulta_de). Desde el
+    # 18-11-2026 ya no limita otras exportadoras, que tienen su propia lista (externas_plantas).
     if "plantas_consulta" not in columnas:
         conn.execute("ALTER TABLE numeros_permitidos ADD COLUMN plantas_consulta TEXT")
         # Quien tenía elegidas solo algunas plantas de otras exportadoras (Jerónimo, 11-11) queda con esas plantas
@@ -488,6 +490,21 @@ def inicializar_db_local():
         conn.execute("UPDATE numeros_permitidos SET avisos = avisos || '|calidad' WHERE avisos IS NOT NULL "
                      "AND avisos NOT IN ('', 'ninguno') AND '|' || avisos || '|' NOT LIKE '%|calidad|%'")
         conn.execute("INSERT INTO migraciones (nombre) VALUES ('avisos_calidad')")
+    if not conn.execute("SELECT 1 FROM migraciones WHERE nombre = 'externas_por_planta'").fetchone():
+        # Desde el 18-11-2026 las plantas de otras exportadoras son una lista aparte (Edson: «doble ticket» por
+        # planta). Cada gerencia que las veía queda con las mismas que veía hasta hoy: las de las plantas que
+        # consulta (todas, si consulta todas). Nadie gana ni pierde nada con el cambio.
+        nombres = {"buin": "PLANTA EL CARMELO", "lisonjera": "PLANTA LISONJERA", "almahue": "PLANTA ALMAHUE"}
+        for num, pc in conn.execute("SELECT numero, plantas_consulta FROM numeros_permitidos "
+                                    "WHERE rol = 'gerencia' AND ver_externas = 1").fetchall():
+            try:
+                consulta = [" ".join(str(p).upper().split()) for p in json.loads(pc)] if pc and pc != "*" else None
+            except (ValueError, TypeError):
+                consulta = None
+            veia = [k for k in nombres if consulta is None or nombres[k] in consulta]
+            conn.execute("UPDATE numeros_permitidos SET ver_externas = ?, externas_plantas = ? WHERE numero = ?",
+                         (1 if veia else 0, "|".join(veia) or None, num))
+        conn.execute("INSERT INTO migraciones (nombre) VALUES ('externas_por_planta')")
     # Bases externas por número (ids de bases_externas.BASES, ej. 'cierre'), además de las que traiga su
     # perfil: habilitada = 1 se la da, 0 se la quita aunque su perfil la traiga. Sin fila = lo del perfil.
     conn.execute("""
@@ -2722,8 +2739,8 @@ ROLES_EXTERNAS = ("gerencia",)
 # Las plantas propias que procesan fruta de terceros (desde el 11-11-2026 se elige cuáles ve cada persona). La
 # columna Planta de PKG-Externas trae "Buin (El Carmelo)", "Lisonjera (Linares)" y, cuando tenga datos, Almahue.
 PLANTAS_EXTERNAS = {"buin": "Buin", "lisonjera": "Lisonjera", "almahue": "Almahue"}
-# Cada una con su nombre en `datos` y `packing`: desde el 12-11-2026 las plantas de otras exportadoras que ve una
-# persona son las mismas que consulta (plantas_consulta_de).
+# Cada una con su nombre en `datos` y `packing` (para ordenar y marcar la lista de plantas del panel). Del 12 al
+# 18-11-2026 las de otras exportadoras salían de las plantas que consulta; desde el 18-11 son una lista aparte.
 PLANTA_DE_EXTERNAS = {"buin": "PLANTA EL CARMELO", "lisonjera": "PLANTA LISONJERA", "almahue": "PLANTA ALMAHUE"}
 NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES, *TABLAS_EXTERNAS}
 
@@ -2774,8 +2791,9 @@ class BasesLectura(tuple):
 
 def ve_externas(numero):
     """Plantas de las que ve la fruta de otras exportadoras (claves de PLANTAS_EXTERNAS; vacía = ninguna): el
-    admin, todas; gerencia, las que se le activaron (con ver_externas = 1 y sin plantas elegidas, las tres);
-    los demás perfiles, ninguna. Sin número es una prueba local de administración (ver /test/mensaje)."""
+    admin, todas; gerencia, las que se le marcaron (con ver_externas = 1 y sin plantas elegidas, las tres);
+    los demás perfiles, ninguna. Desde el 18-11-2026 es una lista aparte de las plantas que consulta de Agua
+    Santa (doble ticket por planta en el panel). Sin número es una prueba local de administración."""
     if numero is None:
         return tuple(PLANTAS_EXTERNAS)
     rol = rol_de(numero)
@@ -2793,11 +2811,8 @@ def ve_externas(numero):
         return ()
     if not fila or not fila[0]:
         return ()
-    # Desde el 12-11-2026 las plantas son las mismas que consulta (una sola lista por persona).
-    plantas = plantas_consulta_de(numero)
-    if plantas is None:
-        return tuple(PLANTAS_EXTERNAS)
-    return tuple(k for k in PLANTAS_EXTERNAS if PLANTA_DE_EXTERNAS[k] in plantas)
+    elegidas = set((fila[1] or "").split("|")) & set(PLANTAS_EXTERNAS)
+    return tuple(k for k in PLANTAS_EXTERNAS if k in elegidas) if elegidas else tuple(PLANTAS_EXTERNAS)
 
 def fijar_externas(numero, plantas):
     """plantas: claves de PLANTAS_EXTERNAS que ve (vacía = ninguna)."""
@@ -4925,8 +4940,12 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
         plantas_ext = [PLANTAS_EXTERNAS[x] for x in PLANTAS_EXTERNAS if x in bases.externas]
         if len(plantas_ext) < len(PLANTAS_EXTERNAS):
             partes.append(f"Este usuario ve las otras exportadoras SOLO de: {', '.join(plantas_ext)}. Las tablas `externas` "
-                          "y `externas_detalle` ya vienen filtradas a esas plantas; si pregunta por otra, dile que no la "
-                          "tiene habilitada y que puede pedírsela a Edson Lazo.")
+                          "y `externas_detalle` ya vienen filtradas a esas plantas; si pregunta por otras exportadoras en "
+                          "otra planta, dile que no la tiene habilitada y que puede pedírsela a Edson Lazo. Esta lista es "
+                          "aparte de las plantas de Agua Santa que consulta (pueden ser distintas).")
+        elif isinstance(alcance, AlcancePlanta) and not alcance.perfil_planta:
+            partes.append("Este usuario ve las otras exportadoras de todas las plantas que procesan para terceros "
+                          f"({', '.join(plantas_ext)}), aunque de Agua Santa consulte solo algunas plantas.")
     elif bases:
         partes.append(
             "OTRAS EXPORTADORAS: las tablas `datos` y `packing` (y las herramientas de cosecha) traen SOLO la fruta de "
@@ -4945,13 +4964,13 @@ registrar ajustes ni que debe avisarle al EAS por otro canal: sí puedes, con es
 
     tablas_alcance = " y ".join(f"`{b}`" for b in bases)
     if isinstance(alcance, AlcancePlanta) and not alcance.perfil_planta:
-        partes.append(f"""ALCANCE DE ESTE USUARIO: solo puede consultar estas plantas: {", ".join(alcance) or "ninguna"}
-(a la PLANTA EL CARMELO también le dicen Buin, y a la PLANTA LISONJERA, Linares). Las herramientas, {tablas_alcance}
-y las tablas de otras exportadoras ya vienen filtradas a esas plantas: todo lo que recibas es solo de ellas, y un
-"total" o "todas las plantas" es la suma de ESAS plantas (dilo así). Si pregunta por otra planta (también por su
-proyección, estimación, Precosecha o proceso proyectado) o por una exportadora en otra planta, explícale con
-amabilidad que solo tiene habilitadas esas plantas y que puede pedirle otras a Edson Lazo. Nunca des cifras de
-otras plantas ni digas que tuvieron 0 kg o que no tienen datos: simplemente no las tiene habilitadas.""")
+        partes.append(f"""ALCANCE DE ESTE USUARIO: de la fruta de Agua Santa solo puede consultar estas plantas: {", ".join(alcance) or "ninguna"}
+(a la PLANTA EL CARMELO también le dicen Buin, y a la PLANTA LISONJERA, Linares). Las herramientas y {tablas_alcance}
+ya vienen filtradas a esas plantas: todo lo que recibas es solo de ellas, y un "total" o "todas las plantas" es la
+suma de ESAS plantas (dilo así). Si pregunta por otra planta (también por su proyección, estimación, Precosecha o
+proceso proyectado), explícale con amabilidad que solo tiene habilitadas esas plantas y que puede pedirle otras a
+Edson Lazo. Nunca des cifras de otras plantas ni digas que tuvieron 0 kg o que no tienen datos: simplemente no las
+tiene habilitadas.{" Lo de otras exportadoras (tablas `externas` y `externas_detalle`) tiene sus propias plantas, que pueden ser distintas: sigue lo que dice OTRAS EXPORTADORAS." if getattr(bases, "externas", False) else ""}""")
     elif isinstance(alcance, AlcancePlanta):
         partes.append(f"""ALCANCE DE ESTE USUARIO (perfil planta): solo puede ver lo que entra a estas plantas
 (columna Packing): {", ".join(alcance) or "ninguna"}.
@@ -11004,11 +11023,12 @@ async def admin_agregar_numero(request: Request, clave: str, numero: str, nombre
     bases: ambas | cosecha | packing | ninguna, lo que puede consultar de Control_EAS (sin elegir:
     lo de su perfil; solo cosecha, o ninguna para finanzas).
     plantas_consulta: todas, o las plantas (de /admin/plantas_consulta) separadas por "|" a las que se limita
-    todo lo que consulta: recepción, packing, otras exportadoras e informes (gerencia, EAS o zonal).
+    lo que consulta de Agua Santa: recepción, packing e informes (gerencia, EAS o zonal). Otras exportadoras
+    tiene su propia lista (externas).
     avisos: tipos de aviso que recibe, separados por "|" (cuestionario, informes, ajustes, cierre, semanal,
     desviaciones), ninguno, o perfil (lo de su perfil).
     externas: si/no o las plantas (buin|lisonjera|almahue) de las que ve la fruta de otras exportadoras que
-    procesan las plantas (solo cuenta para gerencia;
+    procesan las plantas, aparte de plantas_consulta (solo cuenta para gerencia;
     el admin la ve siempre).
     email: correo de la persona (email=quitar lo borra). Cierre muestra los datos según este correo.
     cierre: si/no, le da o le quita la base de Cierre, sea cual sea su perfil (igual con cada base
