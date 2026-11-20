@@ -8041,10 +8041,11 @@ def admin_base(clave: str, estado: str = None, base: str = None):
             "bases_externas": _estado_bases_externas()}
 
 @app.get("/historial")
-async def historial(clave: str, limit: int = 50):
+async def historial(clave: str, limit: int = 0):
     """
-    Ver las últimas conversaciones registradas (protegido con clave).
-    Uso: https://bot-whatsapp-asa.com/historial?clave=Matias14&limit=100
+    Ver las conversaciones registradas, de la más nueva a la más antigua (protegido con clave).
+    Por defecto trae TODAS (pedido de Edson del 20-11-2026); con limit=N solo las últimas N.
+    Uso: https://bot-whatsapp-asa.com/historial?clave=...  (o &limit=100)
     """
     if clave != HISTORIAL_CLAVE:
         return JSONResponse({"status": "error", "error": "Clave inválida"}, status_code=403)
@@ -8054,7 +8055,7 @@ async def historial(clave: str, limit: int = 50):
         cursor = conn.execute(
             "SELECT numero_sender, tipo_mensaje, mensaje, respuesta, fecha_hora "
             "FROM conversaciones ORDER BY id DESC LIMIT ?",
-            (limit,)
+            (limit if limit > 0 else -1,)  # en SQLite, LIMIT -1 = sin límite
         )
         filas = [dict(row) for row in cursor.fetchall()]
         conn.close()
