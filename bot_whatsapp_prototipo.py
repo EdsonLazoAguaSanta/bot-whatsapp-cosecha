@@ -5259,7 +5259,37 @@ TOOL_CALIDAD_CAJA = {
     },
 }
 
-HERRAMIENTAS_CALIDAD = {TOOL_CALIDAD_RESUMEN["name"], TOOL_CALIDAD_CAJA["name"]}
+# Pedido de Edson del 20-11-2026: el bot no podía entregar «un informe en PDF de calidad de ayer» (generar_informe
+# lee Control_EAS y las bases externas, no Inglobo). Arma el mismo informe que el diario de calidad de las 08:00.
+TOOL_CALIDAD_INFORME = {
+    "name": "informe_calidad",
+    "description": (
+        "Arma el informe de calidad de producto terminado (Inglobo) como archivo y lo manda por WhatsApp: cifras "
+        "clave, cajas por planta con gráfico, defectos que más rechazan, por productor y variedad, la lista de cajas "
+        "rojas y amarillas y, en PDF, una foto por caja roja. Es el mismo informe diario de calidad de las 08:00, pero "
+        "del día o rango que pida (hasta 7 días seguidos) y con los filtros que diga. Úsala para 'informe de calidad "
+        "de ayer en PDF', 'mándame la calidad de la semana en Excel', 'PDF de calidad de Lisonjera'. generar_informe "
+        "NO lee Inglobo: los informes y archivos de calidad salen solo de aquí. Lo que trae ya viene limitado a lo que "
+        "esta persona puede ver."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "fecha": {"type": "string", "description": "Día (AAAA-MM-DD), o el primero de un rango. Sin fecha: hoy."},
+            "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD), máximo 7 días."},
+            "planta": {"type": "string", "description": "Planta o packing (ej. Lisonjera)."},
+            "productor": {"type": "string", "description": "Productor o fundo (ej. Villaseca)."},
+            "variedad": {"type": "string"},
+            "especie": {"type": "string"},
+            "turno": {"type": "string", "description": "Turno, ej. 1 o 2."},
+            "formato": {"type": "string", "enum": ["pdf", "excel"],
+                        "description": "'pdf' por defecto (lleva las fotos); 'excel' si lo quiere para trabajar los "
+                                       "datos (sin fotos)."},
+        },
+    },
+}
+
+HERRAMIENTAS_CALIDAD = {TOOL_CALIDAD_RESUMEN["name"], TOOL_CALIDAD_CAJA["name"], TOOL_CALIDAD_INFORME["name"]}
 
 INSTRUCCION_CALIDAD = (
     "CALIDAD DE PRODUCTO TERMINADO (Inglobo): con consultar_calidad das el semáforo de las cajas evaluadas por día, "
@@ -5268,6 +5298,8 @@ INSTRUCCION_CALIDAD = (
     "verificación de Inglobo, no Control_EAS): no la mezcles con kilos sin decirlo. Responde corto: primero el conteo "
     "(ej. «75 cajas: 🟢 68 · 🟡 4 · 🔴 3»), después las rojas con su defecto principal, y ofrece el detalle y las "
     "fotos de un folio. Las mediciones completas, solo si las pide. Si Inglobo no responde, dilo tal cual. "
+    "Si pide un informe, PDF o Excel de calidad, usa informe_calidad: manda el archivo solo (generar_informe no lee "
+    "Inglobo). "
     "Inglobo agrupa por la fecha de su planilla: las cajas del turno 2 de madrugada pueden quedar en el día anterior."
 )
 
@@ -5327,6 +5359,10 @@ def _ejecutar_calidad(tool_name, entrada, numero_sender):
                 min(desde, hasta), max(desde, hasta), permitido, planta=entrada.get("planta"),
                 productor=entrada.get("productor"), variedad=entrada.get("variedad"), especie=entrada.get("especie"),
                 turno=entrada.get("turno"), solo_problemas=entrada.get("solo_problemas", True) is not False)
+        if tool_name == "informe_calidad":
+            desde = calidad_inglobo.leer_fecha(entrada.get("fecha"))
+            hasta = calidad_inglobo.leer_fecha(entrada.get("fecha_hasta"), desde)
+            return generar_informe_calidad(numero_sender, min(desde, hasta), max(desde, hasta), alcance, entrada)
         dia = calidad_inglobo.leer_fecha(entrada.get("fecha"))
         try:
             max_fotos = max(0, min(8, int(entrada.get("max_fotos", 4))))
@@ -5415,7 +5451,7 @@ def herramientas_disponibles(numero_sender=None):
     cosecha = TOOLS + [TOOL_PROYECCION] if "datos" in bases else []
     # El zonal confirma lo que piden sus productores (y, en modo prueba, el admin que las recibe).
     resuelve = bool(numero_sender) and (rol_de(numero_sender) == "zonal" or bool(aprobaciones_para(numero_sender)))
-    calidad = ([TOOL_CALIDAD_RESUMEN, TOOL_CALIDAD_CAJA]
+    calidad = ([TOOL_CALIDAD_RESUMEN, TOOL_CALIDAD_CAJA, TOOL_CALIDAD_INFORME]
                if calidad_inglobo.configurada() and ve_calidad(numero_sender) else [])
     return (cosecha + sql + externas + calidad
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
@@ -5443,11 +5479,26 @@ def _historial_como_mensajes(numero_sender, nombres_herramientas):
                 for id_, h in zip(ids, ronda)
             ]})
             mensajes.append({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": id_, "content": str(h.get("resultado") or "(sin resultado)")}
+                {"type": "tool_result", "tool_use_id": id_,
+                 "content": _resultado_de_historial(h.get("resultado"), h.get("largo"))}
                 for id_, h in zip(ids, ronda)
             ]})
         mensajes.append({"role": "assistant", "content": turno["respuesta"] or "(sin respuesta)"})
     return mensajes
+
+def _resultado_de_historial(resultado, largo=None):
+    """El extracto guardado de un resultado, avisando ANTES del texto si se cortó: el 20-11-2026, con el resultado
+    cortado a LIMITE_RESULTADO_HISTORIAL, Claude creyó que en el turno anterior había inventado los folios y defectos
+    que sí venían en el resultado completo, y se lo «corrigió» a Edson. largo = el del resultado completo (se guarda
+    desde el 20-11)."""
+    texto = str(resultado or "(sin resultado)")
+    if len(texto) < LIMITE_RESULTADO_HISTORIAL and not (largo and largo > len(texto)):
+        return texto
+    cuanto = f"los primeros {len(texto):,} de {largo:,} caracteres".replace(",", ".") if largo else "solo el comienzo"
+    return (f"[EXTRACTO del historial: aquí va {cuanto} de este resultado. En ese turno viste el resultado COMPLETO y "
+            "tu respuesta se basó en él: lo que dijiste entonces y no aparece en este extracto SÍ venía en el "
+            "resultado, no lo inventaste y no lo corrijas por eso. Si necesitas el detalle de nuevo, vuelve a "
+            f"consultar.]\n{texto}\n[…]")
 
 def _llamar_claude(system, tools, messages, sin_herramientas=False):
     """Una llamada a la API de Claude. Se lee el JSON crudo de la respuesta en vez de los
@@ -5544,7 +5595,7 @@ def procesar_mensaje(texto_mensaje, numero_sender=None, es_audio=False, traza=No
                         bloque["is_error"] = True
                     resultados.append(bloque)
                     ronda.append({"nombre": uso.get("name"), "entrada": entrada,
-                                  "resultado": salida[:LIMITE_RESULTADO_HISTORIAL]})
+                                  "resultado": salida[:LIMITE_RESULTADO_HISTORIAL], "largo": len(salida)})
                 messages.append({"role": "user", "content": resultados})
                 if traza is not None:
                     traza.append(ronda)
@@ -10419,22 +10470,64 @@ def _texto_defectos(lista, maximo=4):
 def armar_informe_calidad(fecha, numero, alcance, turno):
     """Informe diario de calidad de producto terminado según Inglobo (pedido de Edson el 17-11-2026): a las 08:00 el
     día anterior completo (turno AM); con turno PM, lo de hoy hasta la hora. Solo para quien tiene el permiso Calidad,
-    con su alcance (_permitido_calidad). Cifras clave, por planta (con gráfico), defectos que más rechazan, por
-    productor y variedad, cajas rojas y amarillas, y una foto por caja roja (la de su defecto). (informe, None) o
-    (None, motivo)."""
+    con su alcance (_permitido_calidad). (informe, None) o (None, motivo)."""
     if not calidad_inglobo.configurada():
         return None, "Inglobo no está configurado"
     if not ve_calidad(numero):
         return None, "no tiene el permiso Calidad"
     dia = fecha - timedelta(days=1) if turno == "am" else fecha
+    momento = "día completo (turnos 1 y 2)" if turno == "am" else f"hoy hasta las {datetime.now():%H:%M}"
+    return _informe_calidad([dia], alcance, f"Informe diario de calidad – {DIAS_SEMANA[dia.weekday()]} {dia:%d-%m-%Y}",
+                            momento)
+
+FILTROS_INFORME_CALIDAD = (("planta", "packing"), ("productor", "productor"), ("especie", "especie"),
+                           ("variedad", "variedad"), ("turno", "turno"))
+
+def generar_informe_calidad(numero, desde, hasta, alcance, entrada):
+    """Herramienta informe_calidad: el informe diario de calidad, del día o rango pedido (hasta 7 días) y con sus
+    filtros, en PDF (con fotos) o Excel (sin fotos). El permiso y el alcance ya los revisó _ejecutar_calidad."""
+    dias = calidad_inglobo.dias_entre(desde, hasta)
+    filtros = {campo: str(entrada.get(nombre)).strip() for nombre, campo in FILTROS_INFORME_CALIDAD
+               if str(entrada.get(nombre) or "").strip()}
+    excel = str(entrada.get("formato") or "").strip().lower() in ("excel", "xlsx", "xls", "planilla")
+    hasta_hoy = f"hoy hasta las {datetime.now():%H:%M}" if hasta >= date.today() else ""
+    if desde == hasta:
+        periodo = f"{DIAS_SEMANA[desde.weekday()]} {desde:%d-%m-%Y}"
+        momento = hasta_hoy or "día completo (turnos 1 y 2)"
+    else:
+        periodo = f"{desde:%d-%m} al {hasta:%d-%m-%Y}"
+        momento = f"{len(dias)} días" + (f", {hasta_hoy}" if hasta_hoy else "")
+    informe, motivo = _informe_calidad(dias, alcance, f"Informe de calidad – {periodo}", momento, filtros,
+                                       fotos=not excel)
+    if not informe:
+        if motivo == "sin datos":
+            return (f"Inglobo no tiene cajas evaluadas (producto terminado) para {periodo}"
+                    + (" con esos filtros" if filtros else "") + " que esta persona pueda ver. No se mandó archivo.")
+        return f"No pude armar el informe de calidad ({motivo}). No se mandó archivo."
+    fotos = sum(len(s.get("fotos") or []) for s in informe["secciones"])
+    texto = enviar_informe(numero, "excel" if excel else "pdf", informe)
+    return texto + (f" Lleva {fotos} foto(s) de cajas rojas." if fotos else "")
+
+def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True):
+    """Arma el informe de calidad (Inglobo) de esos días con el alcance de quien lo recibe: cifras clave, por planta
+    (con gráfico), defectos que más rechazan, por productor y variedad, cajas rojas y amarillas y, con fotos=True, una
+    foto por caja roja (la de su defecto). filtros = {campo de la caja: texto} (basta parte del nombre).
+    (informe, None) o (None, motivo)."""
+    permitido = _permitido_calidad(alcance)
+    cajas = []
     try:
-        todas = calidad_inglobo.cajas(calidad_inglobo.reporte_dia(dia))
+        for dia in dias:
+            for c in calidad_inglobo.cajas(calidad_inglobo.reporte_dia(dia)):
+                if permitido(c):
+                    c["_dia"] = dia  # la foto se busca en la galería de su día
+                    cajas.append(c)
     except calidad_inglobo.ErrorCalidad as e:
         return None, f"Inglobo: {e}"
-    permitido = _permitido_calidad(alcance)
-    cajas = [c for c in todas if permitido(c)]
+    for campo, buscado in (filtros or {}).items():
+        cajas = [c for c in cajas if calidad_inglobo._coincide(buscado, c[campo])]
     if not cajas:
         return None, "sin datos"
+    varios_dias = len(dias) > 1
 
     def planta(c):
         return _planta_informe(c["packing"]) or "(sin planta)"
@@ -10481,16 +10574,18 @@ def armar_informe_calidad(fecha, numero, alcance, turno):
         "encabezados": ["Productor", "Especie y variedad", "Cajas", "Verdes", "Amarillas", "Rojas", "% rojo"],
         "filas": filas_pv, "total": ["TOTAL", "", *conteo(cajas)] if len(filas_pv) > 1 else None, "grafico": None,
         "nota": None})
-    problemas = sorted(rojas + amarillas, key=lambda c: (c["nota"] != "ROJO", _orden_planta_proyeccion(planta(c)),
-                                                          c["hora"]))
+    problemas = sorted(rojas + amarillas, key=lambda c: (c["nota"] != "ROJO", c["_dia"],
+                                                          _orden_planta_proyeccion(planta(c)), c["hora"]))
     if problemas:
+        # Con varios días va también el día de cada caja (un mismo folio puede repetirse en otro día).
         secciones.append({
             "titulo": "Cajas rojas y amarillas",
-            "encabezados": ["Nota", "Folio", "Hora", "Turno", "Planta", "Productor", "Variedad", "Calibre",
-                            "Defectos fuera de norma"],
-            "filas": [["Rojo" if c["nota"] == "ROJO" else "Amarillo", c["folio"], c["hora"],
-                       re.sub(r"(?i)^turno\s*", "", c["turno"]), planta(c), c["productor"], c["variedad"], c["calibre"],
-                       _texto_defectos(calidad_inglobo.defectos_rechazo(c))] for c in problemas],
+            "encabezados": ["Nota", *(["Día"] if varios_dias else []), "Folio", "Hora", "Turno", "Planta",
+                            "Productor", "Variedad", "Calibre", "Defectos fuera de norma"],
+            "filas": [["Rojo" if c["nota"] == "ROJO" else "Amarillo", *([f"{c['_dia']:%d-%m}"] if varios_dias else []),
+                       c["folio"], c["hora"], re.sub(r"(?i)^turno\s*", "", c["turno"]), planta(c), c["productor"],
+                       c["variedad"], c["calibre"], _texto_defectos(calidad_inglobo.defectos_rechazo(c))]
+                      for c in problemas],
             "total": None, "grafico": None,
             "nota": "Rojo = rechazada; amarillo = advertencia. El folio es el N° de proceso y puede tener varias cajas: "
                     "el detalle y todas las fotos de una caja se le piden al bot con su folio y hora."})
@@ -10503,12 +10598,12 @@ def armar_informe_calidad(fecha, numero, alcance, turno):
             vistos.add(clave)
             elegidas.append(c)
     elegidas += [c for c in orden if not any(c is e for e in elegidas)]
-    fotos, usadas = [], set()
-    for intento, c in enumerate(elegidas):
-        if len(fotos) >= MAX_FOTOS_INFORME_CALIDAD or intento >= 60:
+    lista_fotos, usadas = [], set()
+    for intento, c in enumerate(elegidas if fotos else []):
+        if len(lista_fotos) >= MAX_FOTOS_INFORME_CALIDAD or intento >= 60:
             break
         try:
-            foto = calidad_inglobo.foto_principal(dia, c)
+            foto = calidad_inglobo.foto_principal(c["_dia"], c)
         except calidad_inglobo.ErrorCalidad as e:
             logger.warning(f"Informe de calidad: sin fotos ({e})")
             break
@@ -10518,25 +10613,30 @@ def armar_informe_calidad(fecha, numero, alcance, turno):
         if contenido:
             usadas.add(foto["url"])
             # Sin hora: la galería de Inglobo dice de qué folio es la foto, no de cuál de sus cajas.
-            fotos.append({"contenido": contenido,
-                          "leyenda": f"Folio {c['folio']} · {planta(c)} · {c['productor']} · {c['variedad']} · "
-                                     f"{foto['defecto']}: {foto['valor']}"})
-    if fotos:
+            lista_fotos.append({"contenido": contenido,
+                                "leyenda": f"Folio {c['folio']}" + (f" ({c['_dia']:%d-%m})" if varios_dias else "")
+                                           + f" · {planta(c)} · {c['productor']} · {c['variedad']} · "
+                                             f"{foto['defecto']}: {foto['valor']}"})
+    if lista_fotos:
         secciones.append({
             "titulo": "Fotos de las cajas rojas", "encabezados": [], "filas": [], "total": None, "grafico": None,
-            "fotos": fotos,
-            "nota": f"Una foto por caja roja, la del defecto que la rechazó (de su folio): {len(fotos)} de {len(rojas)} "
-                    "cajas rojas" + ("; las demás, al bot con su folio y hora." if len(rojas) > len(fotos) else ".")})
+            "fotos": lista_fotos,
+            "nota": f"Una foto por caja roja, la del defecto que la rechazó (de su folio): {len(lista_fotos)} de "
+                    f"{len(rojas)} cajas rojas"
+                    + ("; las demás, al bot con su folio y hora." if len(rojas) > len(lista_fotos) else ".")})
     for i, seccion in enumerate(secciones, 1):
         seccion["titulo"] = f"{i}. {seccion['titulo']}"
-    momento = "día completo (turnos 1 y 2)" if turno == "am" else f"hoy hasta las {datetime.now():%H:%M}"
+    nombres_filtro = {"packing": "planta", "productor": "productor", "especie": "especie", "variedad": "variedad",
+                      "turno": "turno"}
+    filtro = ", ".join(f"{nombres_filtro.get(k, k)} {v}" for k, v in (filtros or {}).items())
     kpis = [{"etiqueta": "Cajas evaluadas", "valor": len(cajas), "tipo": "numero", "signo": False},
             {"etiqueta": "Rojas", "valor": len(rojas), "tipo": "numero", "signo": False},
             {"etiqueta": "% rojo", "valor": pct(len(rojas), len(cajas)), "tipo": "porcentaje", "signo": False},
             {"etiqueta": "Amarillas", "valor": len(amarillas), "tipo": "numero", "signo": False},
             {"etiqueta": "Aprobadas por contramuestra", "valor": aprobadas, "tipo": "numero", "signo": False}]
-    return {"titulo": f"Informe diario de calidad – {DIAS_SEMANA[dia.weekday()]} {dia:%d-%m-%Y}",
-            "subtitulo": f"Producto terminado según Inglobo · {momento} · semáforo por caja muestreada",
+    return {"titulo": titulo,
+            "subtitulo": f"Producto terminado según Inglobo · {momento}" + (f" · {filtro}" if filtro else "")
+                         + " · semáforo por caja muestreada",
             "resumen": None, "kpis": kpis, "secciones": secciones, "kg_plantilla": 0,
             "notas": ["Fuente: Inglobo (verificación de producto terminado). El semáforo es por caja muestreada, no "
                       "por kilo, y ya incluye la resolución de la contramuestra (las aprobadas por contramuestra "
