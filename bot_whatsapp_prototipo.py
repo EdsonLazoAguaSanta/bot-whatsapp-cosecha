@@ -8895,6 +8895,15 @@ def _tabla_pdf(seccion, disponible):
     grupos = sorted(set(seccion.get("grupos") or ()))
     vacios, resaltar = seccion.get("vacios") or {}, seccion.get("resaltar") or {}
     numericas = {i for i, t in enumerate(tipos) if t in ("numero", "porcentaje", "razon")}
+    # Subtotales (ej. por planta en la proyección diaria): las filas cuya primera columna dice «Subtotal …». Van en
+    # negrita, que es más ancha que la letra con que se midieron las columnas: si hay espacio, la columna se ensancha
+    # para que «Subtotal GREENVIC MAIPO» no se parta en dos líneas.
+    subtotales = {r for r, fila in enumerate(textos, 1) if str(fila[0]).startswith("Subtotal")}
+    for r in subtotales:
+        for i, texto in enumerate(textos[r - 1]):
+            falta = stringWidth(texto, "Helvetica-Bold", tamano) + 8 - anchos[i]
+            if i not in numericas and falta > 0 and sum(anchos) + falta <= disponible:
+                anchos[i] += falta
     estilo_celda = ParagraphStyle("celda", fontName="Helvetica", fontSize=tamano,
                                   leading=tamano + 1.6, textColor=_color(COLOR_TINTA))
     estilo_total = ParagraphStyle("celda_total", parent=estilo_celda, fontName="Helvetica-Bold")
@@ -8911,8 +8920,6 @@ def _tabla_pdf(seccion, disponible):
 
     datos = [[Paragraph(escape(h), estilo_enc_num if i in numericas else estilo_enc)
               for i, h in enumerate(encabezados)]]
-    # Subtotales (ej. por especie en la proyección diaria): las filas cuya primera columna dice «Subtotal …».
-    subtotales = {r for r, fila in enumerate(textos, 1) if str(fila[0]).startswith("Subtotal")}
     estilo_grupo = ParagraphStyle("celda_grupo", parent=estilo_total, fontSize=tamano + 0.5, leading=tamano + 2.5)
     datos += [[Paragraph(escape(fila[0]), estilo_grupo)] + [""] * (len(fila) - 1) if r - 1 in grupos
               else [celda(t, i, estilo_total if r in subtotales else estilo_celda) for i, t in enumerate(fila)]
@@ -8956,6 +8963,9 @@ def _tabla_pdf(seccion, disponible):
         for i, texto in vacios.items():
             if r - 1 not in grupos and i < len(fila) and fila[i] == texto:
                 estilo.append(("TEXTCOLOR", (i, r), (i, r), _color(COLOR_AVISO)))
+                if r in subtotales:  # sin negrita, como en el TOTAL (así no se parte en dos líneas)
+                    datos[r][i] = texto
+                    estilo.append(("FONTNAME", (i, r), (i, r), "Helvetica"))
     if total:
         estilo += [
             ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
@@ -10488,7 +10498,7 @@ def _variedad_titulo(variedad):
 def _dividir_proyeccion(seccion):
     """Por campo (pedido del 23-11-2026, con un PDF de ejemplo reordenado a mano): una tabla con el título de cada
     campo y debajo sus líneas, Planta destino | Especie | Variedad | Trisemanal | Confirmado | Proyección | Proy. −
-    Trisem. (+ Observación si alguna trae); al final, el total por planta (lo que llega a cada una). Un campo con varios
+    Trisem. (+ Observación si alguna trae); al final, el total por planta y especie (lo que llega a cada una). Un campo con varios
     fundos «CAMPO - FUNDO» va una sola vez y el fundo pasa a la planta («Greenvic Maipo (Buin)»). Lo no confirmado dice
     «sin confirmar» (no es una confirmación de 0) y una línea con más de KG_DIA_POR_VERIFICAR kg de Trisemanal en el día
     se marca para revisar. Todo sumado aquí, de las mismas filas de _completar_proyeccion."""
@@ -10544,15 +10554,25 @@ def _dividir_proyeccion(seccion):
     avisos += [{"texto": f"* Por verificar: {d}. Más de {_fmt_numero(KG_DIA_POR_VERIFICAR)} kg en un día suele ser un "
                          "error de carga en la Trisemanal; la cifra va tal como viene, sin cambios.", "color": COLOR_AVISO}
                for d in dudosas]
-    plantas = list(dict.fromkeys(f[ip] for f in filas))
+    # Total por planta abierto por especie (pedido de Edson, 23-11-2026): Planta | Especie | …, en el orden de
+    # _completar_proyeccion (la especie con más kilos primero). Si la planta tiene más de una especie, cierra con su
+    # «Subtotal», que es lo que llega a esa planta.
+    por_planta = {}
+    for f in filas:
+        por_planta.setdefault(f[ip], {}).setdefault(f[ie], []).append(f)
+    totales = []
+    for planta, especies in por_planta.items():
+        totales += [[planta, especie, *sumas(grupo)] for especie, grupo in especies.items()]
+        if len(especies) > 1:
+            totales.append([f"Subtotal {planta}", "", *sumas([f for g in especies.values() for f in g])])
     return [
         {"titulo": "Cosecha de hoy por campo", "encabezados": columnas, "filas": salida, "total": None,
          "grafico": None, "nota": None, "grupos": grupos, "resaltar": resaltar, "vacios": {4: SIN_CONFIRMAR},
          "avisos": avisos, "kg_proyeccion": total[2]},
-        {"titulo": "Total por planta (los kilos llegan a cada planta según su Proyección)",
-         "encabezados": ["Planta", "Trisemanal kg", "Confirmado kg", "Proyección kg", "Dif."],
-         "filas": [[planta, *sumas([f for f in filas if f[ip] == planta])] for planta in plantas],
-         "total": ["TOTAL", *total], "grafico": None, "nota": seccion.get("nota"), "vacios": {2: SIN_CONFIRMAR}},
+        {"titulo": "Total por planta y especie (los kilos llegan a cada planta según su Proyección)",
+         "encabezados": ["Planta", "Especie", "Trisemanal kg", "Confirmado kg", "Proyección kg", "Dif."],
+         "filas": totales, "total": ["TOTAL", "", *total], "grafico": None, "nota": seccion.get("nota"),
+         "vacios": {3: SIN_CONFIRMAR}},
     ]
 
 def spec_informe_proyeccion(fecha, turno="pm"):
