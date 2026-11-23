@@ -5224,14 +5224,15 @@ TOOL_CALIDAD_RESUMEN = {
         "semáforo de cada caja (🟢 verde, 🟡 amarillo, 🔴 rojo, ya con la resolución de la contramuestra), el conteo "
         "por planta y por productor, y las cajas con amarillo o rojo con sus defectos fuera de norma. Úsala para "
         "'¿cómo va la calidad hoy?', 'cajas rechazadas en Lisonjera', 'problemas de calidad de Villaseca ayer'. "
-        "Sin fecha es hoy; hasta 7 días seguidos. Los filtros son por texto (basta parte del nombre). Lo que "
+        "Sin fecha es hoy; acepta cualquier rango desde junio de 2026 (toda la temporada). Los filtros son por texto "
+        "(basta parte del nombre). Lo que "
         "devuelve ya viene limitado a lo que esta persona puede ver."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "fecha": {"type": "string", "description": "Día (AAAA-MM-DD), o el primero de un rango. Sin fecha: hoy."},
-            "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD), máximo 7 días."},
+            "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD)."},
             "planta": {"type": "string", "description": "Planta o packing (ej. Lisonjera)."},
             "productor": {"type": "string", "description": "Productor o fundo (ej. Villaseca)."},
             "variedad": {"type": "string"},
@@ -5281,7 +5282,7 @@ TOOL_CALIDAD_INFORME = {
         "Arma el informe de calidad de producto terminado (Inglobo) como archivo y lo manda por WhatsApp: cifras "
         "clave, cajas por planta con gráfico, defectos que más rechazan, por productor y variedad, la lista de cajas "
         "rojas y amarillas y, en PDF, una foto por caja roja. Es el mismo informe diario de calidad de las 08:00, pero "
-        "del día o rango que pida (hasta 7 días seguidos) y con los filtros que diga. Úsala para 'informe de calidad "
+        "del día o rango que pida (cualquier rango desde junio de 2026) y con los filtros que diga. Úsala para 'informe de calidad "
         "de ayer en PDF', 'mándame la calidad de la semana en Excel', 'PDF de calidad de Lisonjera'. generar_informe "
         "NO lee Inglobo: los informes y archivos de calidad salen solo de aquí. Lo que trae ya viene limitado a lo que "
         "esta persona puede ver."
@@ -5290,7 +5291,7 @@ TOOL_CALIDAD_INFORME = {
         "type": "object",
         "properties": {
             "fecha": {"type": "string", "description": "Día (AAAA-MM-DD), o el primero de un rango. Sin fecha: hoy."},
-            "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD), máximo 7 días."},
+            "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD)."},
             "planta": {"type": "string", "description": "Planta o packing (ej. Lisonjera)."},
             "productor": {"type": "string", "description": "Productor o fundo (ej. Villaseca)."},
             "variedad": {"type": "string"},
@@ -5303,7 +5304,37 @@ TOOL_CALIDAD_INFORME = {
     },
 }
 
-HERRAMIENTAS_CALIDAD = {TOOL_CALIDAD_RESUMEN["name"], TOOL_CALIDAD_CAJA["name"], TOOL_CALIDAD_INFORME["name"]}
+# Manual de Inglobo ampliado el 23-11-2026 (§6-B): el Brix promedio es lo que más piden. Solo Brix (decisión de Edson):
+# en otros defectos un 0 es un valor real y no se puede excluir como «sin medir».
+TOOL_CALIDAD_BRIX = {
+    "name": "promedio_brix_calidad",
+    "description": (
+        "Brix promedio (°Brix) de producto terminado según Inglobo, por variedad, productor, planta, turno, especie, "
+        "calibre o día, de cualquier día o rango desde junio de 2026. Excluye las mediciones «sin medir» (Brix 0 o "
+        "0,01 en Inglobo) y dice cuántas entraron y cuántas quedaron fuera. Úsala para 'Brix promedio de cerezas de "
+        "la semana pasada por variedad', 'Brix de Villaseca este mes', 'Brix de hoy en Lisonjera'. Solo Brix: no "
+        "promedia otros defectos. Lo que trae ya viene limitado a lo que esta persona puede ver."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "fecha": {"type": "string", "description": "Día (AAAA-MM-DD), o el primero de un rango. Sin fecha: hoy."},
+            "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD)."},
+            "agrupar": {"type": "string",
+                        "enum": ["variedad", "productor", "planta", "turno", "especie", "calibre", "dia", "total"],
+                        "description": "Cómo agrupar (por defecto variedad); 'total' da un solo promedio."},
+            "planta": {"type": "string", "description": "Planta o packing (ej. Lisonjera)."},
+            "productor": {"type": "string", "description": "Productor o fundo (ej. Villaseca)."},
+            "variedad": {"type": "string"},
+            "especie": {"type": "string", "description": "Ej. cereza, nectarín, mandarina."},
+            "turno": {"type": "string", "description": "Turno, ej. 1 o 2."},
+            "calibre": {"type": "string"},
+        },
+    },
+}
+
+HERRAMIENTAS_CALIDAD = {TOOL_CALIDAD_RESUMEN["name"], TOOL_CALIDAD_CAJA["name"], TOOL_CALIDAD_INFORME["name"],
+                        TOOL_CALIDAD_BRIX["name"]}
 
 INSTRUCCION_CALIDAD = (
     "CALIDAD DE PRODUCTO TERMINADO (Inglobo): con consultar_calidad das el semáforo de las cajas evaluadas por día, "
@@ -5314,7 +5345,11 @@ INSTRUCCION_CALIDAD = (
     "fotos de un folio. Las mediciones completas, solo si las pide. Si Inglobo no responde, dilo tal cual. "
     "Si pide un informe, PDF o Excel de calidad, usa informe_calidad: manda el archivo solo (generar_informe no lee "
     "Inglobo). "
-    "Inglobo agrupa por la fecha de su planilla: las cajas del turno 2 de madrugada pueden quedar en el día anterior."
+    "Inglobo agrupa por la fecha de su planilla: las cajas del turno 2 de madrugada pueden quedar en el día anterior. "
+    "Para el Brix promedio usa promedio_brix_calidad y di siempre cuántas mediciones entraron y cuántas quedaron fuera "
+    "por «sin medir». Brix o Peso neto en 0 en Inglobo es «sin medir / sin pesar», no un rechazo por ese defecto: si "
+    "una caja quedó roja solo por eso, dilo así (sigue contada como roja porque así la marca Inglobo). Las consultas "
+    "aceptan cualquier rango desde junio de 2026."
 )
 
 _PRODUCTORES_POR_CODIGO = {"cargado": 0.0, "mapa": {}}
@@ -5377,6 +5412,13 @@ def _ejecutar_calidad(tool_name, entrada, numero_sender):
             desde = calidad_inglobo.leer_fecha(entrada.get("fecha"))
             hasta = calidad_inglobo.leer_fecha(entrada.get("fecha_hasta"), desde)
             return generar_informe_calidad(numero_sender, min(desde, hasta), max(desde, hasta), alcance, entrada)
+        if tool_name == "promedio_brix_calidad":
+            desde = calidad_inglobo.leer_fecha(entrada.get("fecha"))
+            hasta = calidad_inglobo.leer_fecha(entrada.get("fecha_hasta"), desde)
+            return calidad_inglobo.promedio_brix(
+                min(desde, hasta), max(desde, hasta), permitido, agrupar=entrada.get("agrupar"),
+                planta=entrada.get("planta"), productor=entrada.get("productor"), variedad=entrada.get("variedad"),
+                especie=entrada.get("especie"), turno=entrada.get("turno"), calibre=entrada.get("calibre"))
         dia = calidad_inglobo.leer_fecha(entrada.get("fecha"))
         try:
             max_fotos = max(0, min(8, int(entrada.get("max_fotos", 4))))
@@ -5465,7 +5507,7 @@ def herramientas_disponibles(numero_sender=None):
     cosecha = TOOLS + [TOOL_PROYECCION] if "datos" in bases else []
     # El zonal confirma lo que piden sus productores (y, en modo prueba, el admin que las recibe).
     resuelve = bool(numero_sender) and (rol_de(numero_sender) == "zonal" or bool(aprobaciones_para(numero_sender)))
-    calidad = ([TOOL_CALIDAD_RESUMEN, TOOL_CALIDAD_CAJA, TOOL_CALIDAD_INFORME]
+    calidad = ([TOOL_CALIDAD_RESUMEN, TOOL_CALIDAD_CAJA, TOOL_CALIDAD_INFORME, TOOL_CALIDAD_BRIX]
                if calidad_inglobo.configurada() and ve_calidad(numero_sender) else [])
     return (cosecha + sql + externas + calidad
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
@@ -7830,6 +7872,13 @@ def iniciar_scheduler():
                           id=f"informes_diarios_{h_inf:02d}{m_inf:02d}", misfire_grace_time=900)
         horas_informes.append(f"{h_inf:02d}:{m_inf:02d}")
     informes = " y ".join(horas_informes) or "apagados"
+    # Caché de Inglobo (23-11-2026): cada noche a las 04:00 baja los días que falten y re-baja los últimos 14; también
+    # un minuto después de arrancar (la primera vez carga la temporada, ~5 minutos, sin frenar al bot).
+    if calidad_inglobo.configurada():
+        scheduler.add_job(calidad_inglobo.sincronizar, "cron", hour=4, minute=0, id="inglobo_sync",
+                          misfire_grace_time=3600)
+        scheduler.add_job(calidad_inglobo.sincronizar, "date", run_date=datetime.now() + timedelta(minutes=1),
+                          id="inglobo_sync_inicio")
     scheduler.start()
     modo = "PRODUCCIÓN" if ENVIOS_AUTOMATICOS_PRODUCCION else "PRUEBA (solo números admin)"
     logger.info(
@@ -10540,6 +10589,8 @@ def _dividir_proyeccion(seccion):
                 dudosas.append(f"{_fmt_numero(tri)} kg ({planta}, {_variedad_titulo(f[iv])}, {titulo})")
             salida.append([planta, f[ie], _variedad_titulo(f[iv]), tri, f[ic] if confirmado(f) else None, proy, proy - tri]
                           + ([f[io] or ""] if con_obs else []))
+        # Subtotal de cada campo (pedido de Edson, 23-11-2026): la suma de sus líneas, tal como se ven arriba.
+        salida.append(["Subtotal", "", "", *sumas([f for f, _ in campos[titulo]])] + ([""] if con_obs else []))
 
     total = sumas(filas)
     n_confirmadas = sum(1 for f in filas if confirmado(f))
@@ -10555,23 +10606,42 @@ def _dividir_proyeccion(seccion):
                          "error de carga en la Trisemanal; la cifra va tal como viene, sin cambios.", "color": COLOR_AVISO}
                for d in dudosas]
     # Total por planta abierto por especie (pedido de Edson, 23-11-2026): Planta | Especie | …, en el orden de
-    # _completar_proyeccion (la especie con más kilos primero). Si la planta tiene más de una especie, cierra con su
-    # «Subtotal», que es lo que llega a esa planta.
+    # _completar_proyeccion (la especie con más kilos primero). Es un resumen: si esa planta y especie tiene algo
+    # confirmado hoy, su Proyección es el total confirmado; si no tiene nada confirmado, la Trisemanal (regla de Edson
+    # del 23-11, para no sumar la Trisemanal de variedades que el zonal reemplazó por otras al confirmar). Si la planta
+    # tiene más de una especie, cierra con su «Subtotal», que es lo que llega a esa planta.
+    def resumen(grupo):
+        tri, conf = sum(f[it] or 0 for f in grupo), [f[ic] for f in grupo if confirmado(f)]
+        proy = sum(conf) if conf else tri
+        return [tri, sum(conf) if conf else None, proy, proy - tri]
+
+    def sumar(listas):
+        conf = [l[1] for l in listas if l[1] is not None]
+        tri, proy = sum(l[0] for l in listas), sum(l[2] for l in listas)
+        return [tri, sum(conf) if conf else None, proy, proy - tri]
+
     por_planta = {}
     for f in filas:
         por_planta.setdefault(f[ip], {}).setdefault(f[ie], []).append(f)
-    totales = []
+    totales, todas = [], []
     for planta, especies in por_planta.items():
-        totales += [[planta, especie, *sumas(grupo)] for especie, grupo in especies.items()]
+        de_planta = [resumen(grupo) for grupo in especies.values()]
+        todas += de_planta
+        totales += [[planta, especie, *r] for especie, r in zip(especies, de_planta)]
         if len(especies) > 1:
-            totales.append([f"Subtotal {planta}", "", *sumas([f for g in especies.values() for f in g])])
+            totales.append([f"Subtotal {planta}", "", *sumar(de_planta)])
+    total_resumen = sumar(todas)
     return [
         {"titulo": "Cosecha de hoy por campo", "encabezados": columnas, "filas": salida, "total": None,
          "grafico": None, "nota": None, "grupos": grupos, "resaltar": resaltar, "vacios": {4: SIN_CONFIRMAR},
-         "avisos": avisos, "kg_proyeccion": total[2]},
+         "avisos": avisos, "kg_proyeccion": total_resumen[2]},
         {"titulo": "Total por planta y especie (los kilos llegan a cada planta según su Proyección)",
          "encabezados": ["Planta", "Especie", "Trisemanal kg", "Confirmado kg", "Proyección kg", "Dif."],
-         "filas": totales, "total": ["TOTAL", "", *total], "grafico": None, "nota": seccion.get("nota"),
+         "filas": totales, "total": ["TOTAL", "", *total_resumen], "grafico": None,
+         "nota": "En este resumen, la Proyección de cada planta y especie es el total confirmado si hay alguna "
+                 "confirmación de esa especie para esa planta; si no hay ninguna, la Trisemanal. Por eso puede ser "
+                 "menor que la suma de las líneas del cuadro anterior: ahí cada línea sin confirmar suma su Trisemanal. "
+                 + (seccion.get("nota") or ""),
          "vacios": {3: SIN_CONFIRMAR}},
     ]
 
@@ -10609,6 +10679,63 @@ def _texto_defectos(lista, maximo=4):
     texto = "; ".join(f"{h} {calidad_inglobo._valor(v)}".strip() for h, v, _ in lista[:maximo])
     return texto + (f" (+{len(lista) - maximo} más)" if len(lista) > maximo else "")
 
+def _defectos_de_caja(c):
+    """Los defectos fuera de norma de una caja y, aparte, lo «sin medir» (Brix o Peso neto en 0, 23-11-2026)."""
+    partes = [_texto_defectos(calidad_inglobo.defectos_rechazo(c)) if c["fuera"] else ""]
+    if c.get("sin_medir"):
+        partes.append("sin medir: " + ", ".join(c["sin_medir"]))
+    return "; ".join(p for p in partes if p)
+
+# Primera parte del informe de calidad como el «Reporte diario» de Inglobo (pedido de Edson, 23-11-2026): cajas
+# embaladas contra muestras inspeccionadas, notas 1 a 4 por variedad y fundo, y el Brix. Decisiones de Edson: las cajas
+# embaladas salen del packing de Control_EAS (bultos de 'Packing Planta'; la API de Inglobo no trae sus «cajas
+# producidas»), el % de cada nota es sobre las cajas evaluadas y N° cajas = ese % × las embaladas, la Nota 3 son las
+# aprobadas por contramuestra y el fundo es el de Control_EAS (por el código de productor).
+NOTAS_CALIDAD = (1, 2, 3, 4)
+
+def _especie_clave(especie):
+    """'CEREZAS' (Inglobo) y 'CHERRY' (Control_EAS) -> 'CEREZA'; 'NECTARIN' y 'NECTARINE' -> 'NECTARIN'."""
+    texto = _normalizar_nombre(especie)
+    return re.sub(r"(?<=[AEIOU])S$", "", _normalizar_nombre(ESPECIE_TRADUCCION.get(texto, texto)))
+
+def _especie_titulo(especie):
+    """El nombre de la especie igual en las dos fuentes: 'CEREZAS' y 'CHERRY' -> 'Cereza'."""
+    clave = _especie_clave(especie)
+    return {_especie_clave(v): v for v in ESPECIE_TRADUCCION.values()}.get(clave, clave.capitalize())
+
+def _fundo_calidad(caja):
+    """El fundo de una caja de Inglobo como se llama en Control_EAS (por su código de productor); si no, el de Inglobo."""
+    return _productor_por_codigo(caja.get("codigo_productor")) or caja["productor"]
+
+def _nota_calidad(caja):
+    """1 verde, 2 amarilla, 3 aprobada por contramuestra (Inglobo la marca verde), 4 roja; 0 sin nota."""
+    if caja["nota"] == "ROJO":
+        return 4
+    if caja["nota"] == "AMARILLO":
+        return 2
+    if caja["nota"] == "VERDE":
+        return 3 if "CONTRAMUESTRA" in _normalizar_nombre(caja["resolucion"]) else 1
+    return 0
+
+def _embaladas_calidad(dias, alcance, bases):
+    """Bultos embalados de Control_EAS en esos días ('Packing Planta' de la tabla packing, con el alcance de quien
+    recibe): [{planta, especie, fundo, variedad (claves para cruzar), nombres originales y bultos}], o None si no tiene
+    la base de packing o la consulta falla."""
+    if not dias or "packing" not in bases:
+        return None
+    sql = (f"SELECT Packing, Especie, Productor, Variedad, SUM(Bultos) AS Bultos FROM packing "
+           f"WHERE [Base Origen] = N'Packing Planta' AND Fecha >= '{min(dias):%Y%m%d}' "
+           f"AND Fecha < '{max(dias) + timedelta(days=1):%Y%m%d}' "
+           "GROUP BY Packing, Especie, Productor, Variedad HAVING SUM(Bultos) > 0")
+    resultado, error = ejecutar_consulta_sql(sql, alcance, max_filas=50000, bases=bases)
+    if error or not resultado:
+        logger.warning(f"Informe de calidad: sin cajas embaladas de Control_EAS ({error})")
+        return None
+    return [{"planta": _planta_informe(p), "especie": _especie_clave(e), "fundo": _clave_fundo(prod),
+             "variedad": _variedad_informe(v), "nombre_productor": prod or "", "nombre_variedad": v or "",
+             "nombre_especie": traducir_especie(e) or "", "bultos": float(b or 0)}
+            for p, e, prod, v, b in resultado["filas"]]
+
 def armar_informe_calidad(fecha, numero, alcance, turno):
     """Informe diario de calidad de producto terminado según Inglobo (pedido de Edson el 17-11-2026): a las 08:00 el
     día anterior completo (turno AM); con turno PM, lo de hoy hasta la hora. Solo para quien tiene el permiso Calidad,
@@ -10620,7 +10747,7 @@ def armar_informe_calidad(fecha, numero, alcance, turno):
     dia = fecha - timedelta(days=1) if turno == "am" else fecha
     momento = "día completo (turnos 1 y 2)" if turno == "am" else f"hoy hasta las {datetime.now():%H:%M}"
     return _informe_calidad([dia], alcance, f"Informe diario de calidad – {DIAS_SEMANA[dia.weekday()]} {dia:%d-%m-%Y}",
-                            momento)
+                            momento, numero=numero)
 
 FILTROS_INFORME_CALIDAD = (("planta", "packing"), ("productor", "productor"), ("especie", "especie"),
                            ("variedad", "variedad"), ("turno", "turno"))
@@ -10640,7 +10767,7 @@ def generar_informe_calidad(numero, desde, hasta, alcance, entrada):
         periodo = f"{desde:%d-%m} al {hasta:%d-%m-%Y}"
         momento = f"{len(dias)} días" + (f", {hasta_hoy}" if hasta_hoy else "")
     informe, motivo = _informe_calidad(dias, alcance, f"Informe de calidad – {periodo}", momento, filtros,
-                                       fotos=not excel)
+                                       fotos=not excel, numero=numero)
     if not informe:
         if motivo == "sin datos":
             return (f"Inglobo no tiene cajas evaluadas (producto terminado) para {periodo}"
@@ -10650,11 +10777,12 @@ def generar_informe_calidad(numero, desde, hasta, alcance, entrada):
     texto = enviar_informe(numero, "excel" if excel else "pdf", informe)
     return texto + (f" Lleva {fotos} foto(s) de cajas rojas." if fotos else "")
 
-def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True):
-    """Arma el informe de calidad (Inglobo) de esos días con el alcance de quien lo recibe: cifras clave, por planta
-    (con gráfico), defectos que más rechazan, por productor y variedad, cajas rojas y amarillas y, con fotos=True, una
-    foto por caja roja (la de su defecto). filtros = {campo de la caja: texto} (basta parte del nombre).
-    (informe, None) o (None, motivo)."""
+def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True, numero=None):
+    """Arma el informe de calidad (Inglobo) de esos días con el alcance de quien lo recibe: resumen de cajas embaladas
+    (Control_EAS) contra muestras inspeccionadas, por variedad, por variedad, fundo y planta con las notas 1 a 4, por
+    planta (con gráfico), defectos que más rechazan, Brix promedio, cajas rojas y amarillas y, con fotos=True, una foto
+    por caja roja (la de su defecto). filtros = {campo de la caja: texto} (basta parte del nombre). numero: para sus
+    bases (las cajas embaladas solo van a quien tiene packing). (informe, None) o (None, motivo)."""
     permitido = _permitido_calidad(alcance)
     cajas = []
     try:
@@ -10686,6 +10814,131 @@ def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True):
     amarillas = [c for c in cajas if c["nota"] == "AMARILLO"]
     aprobadas = sum(1 for c in cajas if c["nota"] == "VERDE" and "CONTRAMUESTRA" in _normalizar_nombre(c["resolucion"]))
     secciones = []
+
+    # ---- Cajas embaladas (Control_EAS) contra muestras, como el «Reporte diario» de Inglobo (23-11-2026).
+    for c in cajas:
+        c["_fundo"] = _fundo_calidad(c)
+        c["_clave"] = (planta(c), _especie_clave(c["especie"]), _clave_fundo(c["_fundo"]), _variedad_informe(c["variedad"]))
+    bases = bases_de(numero) if numero else BASES_LECTURA["ambas"]
+    por_turno = bool((filtros or {}).get("turno"))
+    embaladas = None if por_turno else _embaladas_calidad(dias, alcance, bases)
+    if embaladas is not None:
+        # Solo lo de las plantas y especies que Inglobo evaluó, y con los mismos filtros de texto del informe.
+        pares = {(k[0], k[1]) for k in (c["_clave"] for c in cajas)}
+        embaladas = [e for e in embaladas if (e["planta"], e["especie"]) in pares]
+        for campo, buscado in (filtros or {}).items():
+            texto = {"packing": "planta", "productor": "nombre_productor", "variedad": "nombre_variedad",
+                     "especie": "nombre_especie"}.get(campo)
+            if texto:
+                embaladas = [e for e in embaladas if calidad_inglobo._coincide(buscado, e[texto])]
+    total_embaladas = sum(e["bultos"] for e in embaladas) if embaladas is not None else None
+    muestras = sum(c["muestras"] for c in cajas)
+
+    def notas_de(grupo):
+        n = len(grupo) or 1
+        return {k: 100 * sum(_nota_calidad(c) == k for c in grupo) / n for k in NOTAS_CALIDAD}
+
+    def promedio(valores):
+        validos = [v for v in valores if isinstance(v, (int, float))]
+        return round(sum(validos) / len(validos), 2) if validos else None
+
+    def causal(grupo):
+        conteo_def = {}
+        for c in grupo:
+            if c["nota"] == "ROJO":
+                for d in {d[0] for d in calidad_inglobo.defectos_rechazo(c)} if c["fuera"] else {"sin medir"}:
+                    conteo_def[d] = conteo_def.get(d, 0) + 1
+        orden = sorted(conteo_def.items(), key=lambda x: (-x[1], x[0]))
+        return "; ".join(f"{d} ({n})" for d, n in orden[:4]) + (f" (+{len(orden) - 4})" if len(orden) > 4 else "")
+
+    # Por variedad: lo embalado y lo evaluado de cada una (también las embaladas sin ninguna muestra).
+    por_var = {}
+    for c in cajas:
+        por_var.setdefault((c["_clave"][1], c["_clave"][3]), {"nombre": (_especie_titulo(c["especie"]), c["variedad"]),
+                                                              "cajas": [], "bultos": 0})["cajas"].append(c)
+    for e in embaladas or []:
+        g = por_var.setdefault((e["especie"], e["variedad"]), {"nombre": (_especie_titulo(e["especie"]), e["nombre_variedad"]),
+                                                               "cajas": [], "bultos": 0})
+        g["bultos"] += e["bultos"]
+    filas_v = []
+    for g in sorted(por_var.values(), key=lambda g: (-g["bultos"], -len(g["cajas"]))):
+        m = sum(c["muestras"] for c in g["cajas"])
+        notas = notas_de(g["cajas"]) if g["cajas"] else {}
+        filas_v.append([*g["nombre"], round(g["bultos"]) if embaladas is not None else None, len(g["cajas"]), m,
+                        round(100 * m / g["bultos"], 1) if g["bultos"] else None,
+                        *[round(notas[k], 1) if g["cajas"] else None for k in NOTAS_CALIDAD]])
+    notas_tot = notas_de(cajas)
+    secciones.append({
+        "titulo": "Por variedad",
+        "encabezados": ["Especie", "Variedad", "Cajas embaladas", "Cajas evaluadas", "Muestras", "% inspeccionado",
+                        "% Nota 1", "% Nota 2", "% Nota 3", "% Nota 4"],
+        "filas": filas_v,
+        "total": ["TOTAL", "", round(total_embaladas) if total_embaladas is not None else None, len(cajas), muestras,
+                  round(100 * muestras / total_embaladas, 1) if total_embaladas else None,
+                  *[round(notas_tot[k], 1) for k in NOTAS_CALIDAD]] if len(filas_v) > 1 else None,
+        "grafico": None,
+        "nota": "Cajas embaladas = bultos del packing de Control_EAS (Packing Planta) en el período; muestras = muestras y "
+                "contramuestras de Inglobo; % inspeccionado = muestras / cajas embaladas. Notas sobre las cajas "
+                "evaluadas: 1 verde, 2 amarilla, 3 aprobada por contramuestra, 4 rechazada."
+                + (" Con filtro de turno no hay cajas embaladas: Control_EAS no separa por turno." if por_turno else "")
+                + (" Sin cajas embaladas: no tiene habilitada la base de packing o Control_EAS no respondió."
+                   if embaladas is None and not por_turno else "")})
+
+    # Por variedad, fundo y planta: el cuadro de notas del reporte de Inglobo.
+    grupos_d = {}
+    for c in cajas:
+        grupos_d.setdefault(c["_clave"], []).append(c)
+    bultos_de = {}
+    for e in embaladas or []:
+        clave = (e["planta"], e["especie"], e["fundo"], e["variedad"])
+        bultos_de[clave] = bultos_de.get(clave, 0) + e["bultos"]
+    filas_d, ponderado, base_ponderada = [], {k: 0.0 for k in NOTAS_CALIDAD}, 0.0
+    for clave, grupo in sorted(grupos_d.items(), key=lambda g: (-bultos_de.get(g[0], 0), -len(g[1]), g[0])):
+        notas, bultos = notas_de(grupo), bultos_de.get(clave)
+
+        def celda(k):
+            return (f"{_fmt_numero(notas[k], 1)} %"
+                    + (f" ({_fmt_numero(round(notas[k] * bultos / 100))})" if bultos else ""))
+        if bultos:
+            base_ponderada += bultos
+            for k in NOTAS_CALIDAD:
+                ponderado[k] += notas[k] * bultos / 100
+        filas_d.append([grupo[0]["variedad"], grupo[0]["_fundo"], planta(grupo[0]),
+                        round(bultos) if bultos else None, sum(c["muestras"] for c in grupo),
+                        promedio([v for c in grupo for v in c["medidas"].get("TOTAL CALIDAD", [])]),
+                        promedio([v for c in grupo for v in c["medidas"].get("TOTAL CONDICION", [])]),
+                        *[celda(k) for k in NOTAS_CALIDAD], causal(grupo)])
+    secciones.append({
+        "titulo": "Por variedad, fundo y planta",
+        "encabezados": ["Variedad", "Fundo", "Planta", "Cajas embaladas", "Muestras", "Total calidad %",
+                        "Total condición %", "Nota 1", "Nota 2", "Nota 3", "Nota 4", "Causal de rechazo"],
+        "filas": filas_d, "total": None, "grafico": None,
+        "nota": "Cada nota: % de las cajas evaluadas y, entre paréntesis, ese % aplicado a las cajas embaladas del fundo "
+                "(Control_EAS). Total calidad % y Total condición % = promedio de las muestras y contramuestras. "
+                "Causal de rechazo: defectos de las cajas con nota 4 (cuántas cajas). Fundo con el nombre de Control_EAS."})
+    resumen = []
+    if total_embaladas is not None:
+        resumen.append(f"- *Cajas embaladas (packing de Control_EAS):* {_fmt_numero(round(total_embaladas))}")
+    resumen.append(f"- *Muestras inspeccionadas por calidad:* {_fmt_numero(muestras)} ({_fmt_numero(len(cajas))} cajas "
+                   f"evaluadas y {_fmt_numero(muestras - len(cajas))} contramuestras)")
+    if total_embaladas:
+        resumen.append(f"- *{_fmt_numero(100 * muestras / total_embaladas, 1)} %* de las cajas embaladas "
+                       "fueron inspeccionadas")
+    # Ponderada por las cajas embaladas solo si TODOS los fundos evaluados tienen embalado en Control_EAS; si alguno no
+    # calza (otra variedad u otro nombre en cada sistema), sobre las cajas evaluadas, para no dejar fuera sus rojas.
+    sin_embalado = [f for f in filas_d if not f[3]]
+    completa = bool(base_ponderada) and not sin_embalado
+    evaluacion = {k: 100 * ponderado[k] / base_ponderada for k in NOTAS_CALIDAD} if completa else notas_tot
+    resumen.append(("- *Evaluación, ponderada por cajas embaladas:* " if completa else "- *Evaluación (cajas evaluadas):* ")
+                   + " · ".join(f"Nota {k} {_fmt_numero(evaluacion[k], 1)} %" for k in NOTAS_CALIDAD))
+    if embaladas is not None and sin_embalado:
+        resumen.append(f"- {len(sin_embalado)} de {len(filas_d)} combinaciones de variedad y fundo evaluadas en Inglobo "
+                       "no tienen cajas embaladas en Control_EAS ese período (" + "; ".join(
+                           f"{f[0]} {f[1]}" for f in sin_embalado[:4]) + (" …" if len(sin_embalado) > 4 else "") + ")")
+    resumen.append(f"- *Turno:* {(filtros or {}).get('turno') or 'todos'}")
+    if total_embaladas is None:
+        resumen.append("- Sin cajas embaladas de Control_EAS" + (" (no separa por turno)" if por_turno else "") + ".")
+
     plantas = sorted({planta(c) for c in cajas}, key=_orden_planta_proyeccion)
     filas_p = [[p, *conteo([c for c in cajas if planta(c) == p])] for p in plantas]
     secciones.append({
@@ -10705,17 +10958,36 @@ def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True):
             "titulo": "Defectos que más rechazan", "encabezados": ["Defecto", "Cajas rojas", "% de las cajas rojas"],
             "filas": filas_d[:15], "total": None, "grafico": None,
             "nota": "Cuántas cajas rojas tienen cada defecto fuera de norma (una caja puede tener más de uno). Los "
-                    "totales (Total calidad, Total condición) cuentan solo cuando son lo único marcado."})
-    grupos = {}
+                    "totales (Total calidad, Total condición) cuentan solo cuando son lo único marcado. Brix o Peso "
+                    "neto en 0 es «sin medir» en Inglobo y no cuenta como defecto."})
+    # Brix promedio por planta, fundo, especie y variedad (pedido de Edson, 23-11-2026): mediciones de muestra y
+    # contramuestra; Brix 0 o 0,01 es «sin medir» y no entra al promedio.
+    por_brix = {}
     for c in cajas:
-        variedad = " ".join(x for x in (c["especie"].capitalize(), c["variedad"]) if x)
-        grupos.setdefault((c["productor"] or "(sin productor)", variedad), []).append(c)
-    filas_pv = sorted(([p, v, *conteo(g)] for (p, v), g in grupos.items()), key=lambda f: (-f[6], -f[2], f[0], f[1]))
-    secciones.append({
-        "titulo": "Por productor y variedad",
-        "encabezados": ["Productor", "Especie y variedad", "Cajas", "Verdes", "Amarillas", "Rojas", "% rojo"],
-        "filas": filas_pv, "total": ["TOTAL", "", *conteo(cajas)] if len(filas_pv) > 1 else None, "grafico": None,
-        "nota": None})
+        g = por_brix.setdefault((planta(c), c["_fundo"], _especie_titulo(c["especie"]), c["variedad"]), [0.0, 0, 0])
+        for v in c["medidas"].get("BRIX", []):
+            if isinstance(v, (int, float)) and v > calidad_inglobo.UMBRAL_SIN_MEDIR:
+                g[0] += v
+                g[1] += 1
+            else:
+                g[2] += 1
+    filas_b = [[*k, round(s / n, 1) if n else None, n, sm] for k, (s, n, sm) in por_brix.items() if n or sm]
+    filas_b.sort(key=lambda f: (_orden_planta_proyeccion(f[0]), f[2], f[3], f[1]))
+    if filas_b:
+        suma, n_b = sum(s for s, _, _ in por_brix.values()), sum(n for _, n, _ in por_brix.values())
+        sin_medir_b = sum(sm for _, _, sm in por_brix.values())
+        con_sm = sin_medir_b > 0
+        secciones.append({
+            "titulo": "Brix promedio",
+            "encabezados": ["Planta", "Fundo", "Especie", "Variedad", "Brix promedio", "Mediciones"]
+                           + (["Sin medir"] if con_sm else []),
+            "filas": [f if con_sm else f[:-1] for f in filas_b],
+            "total": (["TOTAL", "", "", "", round(suma / n_b, 1) if n_b else None, n_b] + ([sin_medir_b] if con_sm else []))
+                     if len(filas_b) > 1 else None,
+            "grafico": None,
+            "nota": "°Brix promedio de las mediciones de muestra y contramuestra (no las filas Promedio de Inglobo). "
+                    "Brix 0 o 0,01 es «sin medir» en Inglobo y queda fuera del promedio. Fundo con el nombre de "
+                    "Control_EAS."})
     problemas = sorted(rojas + amarillas, key=lambda c: (c["nota"] != "ROJO", c["_dia"],
                                                           _orden_planta_proyeccion(planta(c)), c["hora"]))
     if problemas:
@@ -10726,11 +10998,12 @@ def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True):
                             "Productor", "Variedad", "Calibre", "Defectos fuera de norma"],
             "filas": [["Rojo" if c["nota"] == "ROJO" else "Amarillo", *([f"{c['_dia']:%d-%m}"] if varios_dias else []),
                        c["folio"], c["hora"], re.sub(r"(?i)^turno\s*", "", c["turno"]), planta(c), c["productor"],
-                       c["variedad"], c["calibre"], _texto_defectos(calidad_inglobo.defectos_rechazo(c))]
+                       c["variedad"], c["calibre"], _defectos_de_caja(c)]
                       for c in problemas],
             "total": None, "grafico": None,
             "nota": "Rojo = rechazada; amarillo = advertencia. El folio es el N° de proceso y puede tener varias cajas: "
-                    "el detalle y todas las fotos de una caja se le piden al bot con su folio y hora."})
+                    "el detalle y todas las fotos de una caja se le piden al bot con su folio y hora. «Sin medir»: Brix "
+                    "o Peso neto en 0 en Inglobo (no es un rechazo por ese defecto)."})
     # Una foto por caja roja, primero una por productor y defecto principal (para que se vea lo distinto).
     orden = sorted(rojas, key=lambda c: (-len(calidad_inglobo.defectos_rechazo(c)), c["hora"]))
     elegidas, vistos = [], set()
@@ -10771,20 +11044,33 @@ def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True):
     nombres_filtro = {"packing": "planta", "productor": "productor", "especie": "especie", "variedad": "variedad",
                       "turno": "turno"}
     filtro = ", ".join(f"{nombres_filtro.get(k, k)} {v}" for k, v in (filtros or {}).items())
-    kpis = [{"etiqueta": "Cajas evaluadas", "valor": len(cajas), "tipo": "numero", "signo": False},
+    kpis = ([{"etiqueta": "Cajas embaladas", "valor": round(total_embaladas), "tipo": "numero", "signo": False},
+             {"etiqueta": "Muestras inspeccionadas", "valor": muestras, "tipo": "numero", "signo": False}]
+            + ([{"etiqueta": "% inspeccionado", "valor": round(100 * muestras / total_embaladas, 1),
+                 "tipo": "porcentaje", "signo": False}] if total_embaladas else [])
+            if total_embaladas is not None else []) + [
+            {"etiqueta": "Cajas evaluadas", "valor": len(cajas), "tipo": "numero", "signo": False},
             {"etiqueta": "Rojas", "valor": len(rojas), "tipo": "numero", "signo": False},
             {"etiqueta": "% rojo", "valor": pct(len(rojas), len(cajas)), "tipo": "porcentaje", "signo": False},
             {"etiqueta": "Amarillas", "valor": len(amarillas), "tipo": "numero", "signo": False},
             {"etiqueta": "Aprobadas por contramuestra", "valor": aprobadas, "tipo": "numero", "signo": False}]
+    solo_sin_medir = sum(1 for c in rojas if c.get("solo_sin_medir"))
+    if solo_sin_medir:
+        kpis.append({"etiqueta": "Rojas solo por algo sin medir", "valor": solo_sin_medir, "tipo": "numero",
+                     "signo": False})
     return {"titulo": titulo,
             "subtitulo": f"Producto terminado según Inglobo · {momento}" + (f" · {filtro}" if filtro else "")
                          + " · semáforo por caja muestreada",
-            "resumen": None, "kpis": kpis, "secciones": secciones, "kg_plantilla": 0,
+            "resumen": "\n".join(resumen), "kpis": kpis, "secciones": secciones, "kg_plantilla": 0,
             "notas": ["Fuente: Inglobo (verificación de producto terminado). El semáforo es por caja muestreada, no "
                       "por kilo, y ya incluye la resolución de la contramuestra (las aprobadas por contramuestra "
                       "cuentan como verdes).",
                       "Inglobo agrupa por la fecha de su planilla: las cajas del turno 2 de madrugada pueden quedar "
-                      "en el día anterior."]}, None
+                      "en el día anterior."]
+                     + ([(f"{solo_sin_medir} de las cajas rojas lo son" if solo_sin_medir > 1 else
+                          "1 de las cajas rojas lo es") + " solo por Brix o Peso neto en 0, que en Inglobo es «sin "
+                         "medir / sin pesar» y no un rechazo por ese defecto; se cuentan como rojas porque así las "
+                         "marca Inglobo."] if solo_sin_medir else [])}, None
 
 def _precargar_calidad(dia, intentos=3, espera=30):
     """Trae de Inglobo el día del informe de calidad antes de repartirlo, con reintentos. False si no respondió."""

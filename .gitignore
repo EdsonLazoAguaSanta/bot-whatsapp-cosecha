@@ -12,3 +12,4 @@ conversaciones.db-wal
 conversaciones.db-shm
 BASE_DESCONECTADA
 BASE_DESCONECTADA_*
+inglobo_cache.db*
