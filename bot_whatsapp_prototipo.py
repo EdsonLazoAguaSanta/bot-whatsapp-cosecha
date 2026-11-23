@@ -580,7 +580,7 @@ PERFILES = {
     "admin":     {"ve_todo": True,  "acotado": False, "embarques": True,  "confirmaciones": True,
                   "reporta": True,  "avisos_opcionales": False, "bases": "ambas",   "externas": ()},
     "gerencia":  {"ve_todo": True,  "acotado": False, "embarques": True,  "confirmaciones": True,
-                  "reporta": True,  "avisos_opcionales": True,  "bases": "cosecha", "externas": ()},
+                  "reporta": True,  "avisos_opcionales": True,  "bases": "cosecha", "externas": ("historico_plantas",)},
     "eas":       {"ve_todo": True,  "acotado": False, "embarques": True,  "confirmaciones": True,
                   "reporta": True,  "avisos_opcionales": True,  "bases": "cosecha", "externas": ()},
     "zonal":     {"ve_todo": False, "acotado": True,  "embarques": False, "confirmaciones": False,
@@ -2911,6 +2911,18 @@ def bases_externas_de(numero):
         (elegidas.add if habilitada else elegidas.discard)(base)
     return tuple(b for b in todas if b in elegidas)
 
+def acotar_base_externa(id_base, numero):
+    """Lo que el bot limita además dentro de una base externa (None = nada). Histórico de plantas (20-11-2026,
+    gerencia y admin): las filas de Agua Santa a las plantas que consulta (plantas_consulta_de) y las de otras
+    exportadoras a las que tiene en su ticket de otras exportadoras (ve_externas), como `datos` y `externas`."""
+    if id_base != "historico_plantas" or numero is None:
+        return None
+    agua_santa = plantas_consulta_de(numero)
+    externas = [PLANTA_DE_EXTERNAS[k] for k in ve_externas(numero)]
+    if agua_santa is None and len(externas) == len(PLANTA_DE_EXTERNAS):
+        return None
+    return {"agua_santa": agua_santa, "externas": externas}
+
 def fijar_bases_externas(numero, cambios):
     """cambios = {id_base: True para darla | False para quitarla}."""
     num = normalizar_numero(numero)
@@ -4078,8 +4090,9 @@ INSTRUCCION_EXTERNAS = (
     "exportadora son los kilos. (b) Si preguntan cuánto recibió o procesó una planta, da lo de Agua Santa y lo de "
     "las otras exportadoras por separado; si das un total de la planta, di que suma las dos. Nunca sumes sin "
     "avisarlo. (c) Es información de terceros: no la mezcles en rankings de productores de Agua Santa y no la "
-    "ofrezcas si no la piden. (d) Sus productores no tienen zonal ni están en la asignación de Agua Santa. (e) Hay "
-    "datos desde junio de 2026 (temporada 2027) y se actualizan cada hora. "
+    "ofrezcas si no la piden. (d) Sus productores no tienen zonal ni están en la asignación de Agua Santa. (e) Estas "
+    "dos tablas traen datos desde junio de 2026 (temporada 2027) y se actualizan cada hora; la temporada anterior "
+    "(2025-26) está en consultar_historico_plantas, si este usuario la tiene. "
 )
 _SQL_FIN = "Devuelve máximo 400 filas. Si da error, lee el mensaje, corrige y reintenta."
 
@@ -5011,7 +5024,8 @@ def ejecutar_tool(tool_name, tool_input, numero_sender=None, texto_usuario=None)
         if base_externa.id not in bases_externas_de(numero_sender):
             return f"La base {base_externa.nombre} no está habilitada para este usuario."
         return base_externa.ejecutar(tool_name, tool_input, email=email_de(numero_sender),
-                                     quien=numero_sender or "prueba")
+                                     quien=numero_sender or "prueba",
+                                     acotar=acotar_base_externa(base_externa.id, numero_sender))
     # Calidad (Inglobo): su propio permiso y su alcance, aparte de las bases de Control_EAS.
     if tool_name in HERRAMIENTAS_CALIDAD:
         return _ejecutar_calidad(tool_name, tool_input, numero_sender)
@@ -9560,7 +9574,8 @@ def _generar_informe_desde_tool(numero_sender, tool_input, alcance, bases):
         confirmaciones=puede_ver_confirmaciones(numero_sender),
         fuente_kpis=fuente_kpis,
         bases=bases,
-        externas={"ids": ids, "email": email_de(numero_sender), "quien": numero_sender or "prueba"},
+        externas={"ids": ids, "email": email_de(numero_sender), "quien": numero_sender or "prueba",
+                  "acotar": {b: acotar_base_externa(b, numero_sender) for b in ids}},
     )
 
 def _consulta_informe(sql, fuente, alcance, max_filas, embarques, confirmaciones, bases, externas=None):
@@ -9572,7 +9587,7 @@ def _consulta_informe(sql, fuente, alcance, max_filas, embarques, confirmaciones
         if not externas or fuente not in externas.get("ids", ()):
             return None, f"la base {base.nombre} no está habilitada para este usuario."
         return base.consulta_tabla(sql, email=externas.get("email"), quien=externas.get("quien") or "",
-                                   max_filas=max_filas)
+                                   max_filas=max_filas, acotar=(externas.get("acotar") or {}).get(fuente))
     if fuente == "confirmaciones":
         if not confirmaciones:
             return None, "el historial de confirmaciones es solo para admin, EAS y gerencia."

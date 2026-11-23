@@ -6,6 +6,8 @@ Cada base se declara en BASES (al final de este archivo) con:
         CIERRE_SQL_SERVER, CIERRE_SQL_PORT (opcional), CIERRE_SQL_DATABASE (por defecto Presupuesto),
         CIERRE_SQL_USER (por defecto claude_movil), CIERRE_SQL_PASSWORD, CIERRE_SQL_DRIVER (opcional)
     Mientras falte el servidor o la clave, la base queda "sin configurar" y no se le ofrece a nadie.
+    Histórico de plantas (desde el 20-11-2026) usa esas mismas variables: es la vista vw_Planta_Proceso de la
+    misma base, con su propio permiso en el bot (ver BaseHistoricoPlantas).
   - un interruptor de mantención propio: el archivo BASE_DESCONECTADA_<ID> junto al bot, que se crea
     y se borra con /admin/base?base=<id>&estado=desconectar|conectar. No toca la base de cosecha.
   - dos herramientas para Claude: consultar_<id> (UNA consulta SELECT) y ver_modelo_<id> (las vistas
@@ -213,6 +215,8 @@ class BaseExterna:
     # Instrucción que va en el prompt de quien tiene esta base: lo que no puede quedar solo en la
     # descripción de la herramienta (ahí el modelo la pierde cuando repite una cifra de antes).
     instruccion_prompt = ""
+    # Vistas que ve el usuario de esta base (None = todas las de su esquema). Ver BaseHistoricoPlantas.
+    vistas = None
 
     def __init__(self, id, nombre, prefijo_env, descripcion, reglas="", esquema="dbo",
                  base_defecto=None, usuario_defecto=None, max_filas=400):
@@ -356,14 +360,27 @@ class BaseExterna:
             ]
         return self._definiciones
 
-    def ejecutar(self, herramienta, entrada, email=None, quien=""):
-        """Ejecuta una de sus herramientas y devuelve el texto para Claude (los errores, como 'ERROR: ...')."""
+    def ejecutar(self, herramienta, entrada, email=None, quien="", acotar=None):
+        """Ejecuta una de sus herramientas y devuelve el texto para Claude (los errores, como 'ERROR: ...').
+        acotar: lo que el bot limita además para esta persona (lo entiende cada subclase; ver _preparar)."""
         inicio = time.perf_counter()
         if herramienta == self.herramienta_modelo:
-            return self._ver_modelo(email, quien, inicio)
+            return self._ver_modelo(email, quien, inicio, acotar)
         if herramienta == self.herramienta_consulta:
-            return self._consultar((entrada or {}).get("consulta"), email, quien, inicio)
+            return self._consultar((entrada or {}).get("consulta"), email, quien, inicio, acotar)
         return f"ERROR: la base {self.nombre} no tiene la herramienta {herramienta}."
+
+    def _preparar(self, consulta, acotar=None):
+        """La consulta lista para ejecutar (o ErrorBase con el motivo). Las subclases agregan aquí lo que el
+        bot limita por persona (ver BaseHistoricoPlantas)."""
+        return preparar_consulta(consulta, self.esquema)
+
+    def _texto_acotado(self, acotar):
+        """Cómo se dice lo que limita `acotar`, para el alcance que ve Claude ("" = nada)."""
+        return ""
+
+    def _alcance(self, alcance, acotar):
+        return "; ".join(t for t in (alcance, self._texto_acotado(acotar)) if t)
 
     def _registrar(self, quien, email, herramienta, inicio, filas=None, error=None, sql=None):
         ms = int((time.perf_counter() - inicio) * 1000)
@@ -371,10 +388,10 @@ class BaseExterna:
                     ms, filas, error or "ok", (sql or "").replace("\n", " ")[:1500])
         return ms
 
-    def _consultar(self, consulta, email, quien, inicio):
+    def _consultar(self, consulta, email, quien, inicio, acotar=None):
         herramienta = self.herramienta_consulta
         try:
-            sql = preparar_consulta(consulta, self.esquema)
+            sql = self._preparar(consulta, acotar)
         except ErrorBase as e:
             self._registrar(quien, email, herramienta, inicio, error=f"rechazada: {e}", sql=consulta)
             return f"ERROR: {e}"
@@ -401,6 +418,7 @@ class BaseExterna:
         self._registrar(quien, email, herramienta, inicio, filas=len(filas), sql=sql)
         if not filas:
             return "La consulta no devolvió filas (sin datos para esos filtros, o fuera del alcance del usuario)."
+        alcance = self._alcance(alcance, acotar)
         cabecera = f"{len(filas)} fila(s)" + (f" · alcance: {alcance}" if alcance else "") + ":"
         cuerpo = "\n".join([" | ".join(columnas)] + [" | ".join(_fmt(v) for v in f) for f in filas])
         if len(cuerpo) > self.max_caracteres:
@@ -409,7 +427,7 @@ class BaseExterna:
                 f"el total.)") if truncado else ""
         return f"{cabecera}\n{cuerpo}{nota}"
 
-    def consulta_tabla(self, consulta, email=None, quien="", max_filas=None):
+    def consulta_tabla(self, consulta, email=None, quien="", max_filas=None, acotar=None):
         """Para los informes PDF y Excel del bot (generar_informe con fuente=<id>): la misma validación,
         conexión y filtro por correo que consultar_<id>, pero devuelve la tabla en vez de texto:
         ({"columnas", "filas", "truncado", "alcance"}, None) o (None, motivo)."""
@@ -417,7 +435,7 @@ class BaseExterna:
         herramienta = f"informe_{self.id}"
         tope = max(1, int(max_filas or self.max_filas))
         try:
-            sql = preparar_consulta(consulta, self.esquema)
+            sql = self._preparar(consulta, acotar)
         except ErrorBase as e:
             self._registrar(quien, email, herramienta, inicio, error=f"rechazada: {e}", sql=consulta)
             return None, str(e)
@@ -441,21 +459,23 @@ class BaseExterna:
             conn.close()
         self._registrar(quien, email, herramienta, inicio, filas=min(len(filas), tope), sql=sql)
         return {"columnas": columnas, "filas": [list(f) for f in filas[:tope]], "truncado": len(filas) > tope,
-                "alcance": alcance}, None
+                "alcance": self._alcance(alcance, acotar)}, None
 
-    def _ver_modelo(self, email, quien, inicio):
+    def _ver_modelo(self, email, quien, inicio, acotar=None):
         herramienta = self.herramienta_modelo
         try:
             conn, cur, alcance = self.conectar(email)
         except ErrorBase as e:
             self._registrar(quien, email, herramienta, inicio, error=str(e))
             return f"ERROR: {e}"
+        alcance = self._alcance(alcance, acotar)
+        solo = f" AND o.name IN ({', '.join('?' for _ in self.vistas)})" if self.vistas else ""
         try:
             cur.execute(
                 "SELECT o.name, c.name, TYPE_NAME(c.user_type_id) FROM sys.objects o "
                 "JOIN sys.columns c ON c.object_id = o.object_id "
-                "WHERE o.schema_id = SCHEMA_ID(?) AND o.type IN ('V', 'U') ORDER BY o.name, c.column_id;",
-                self.esquema,
+                f"WHERE o.schema_id = SCHEMA_ID(?) AND o.type IN ('V', 'U'){solo} ORDER BY o.name, c.column_id;",
+                self.esquema, *(self.vistas or ()),
             )
             objetos = {}
             for objeto, columna, tipo in cur.fetchall():
@@ -543,10 +563,153 @@ class BaseCierre(BaseExterna):
 
 
 # ---------------------------------------------------------------------------
+# Histórico de plantas (vista vw_Planta_Proceso de la base Presupuesto, desde el 20-11-2026)
+# ---------------------------------------------------------------------------
+# Edson cargó ese día en la base de Cierre la temporada 2025-26 de El Carmelo, Almahue y Lisonjera con TODAS las
+# exportadoras, y pidió que la vean él y gerencia. Es un permiso aparte de Cierre: esta base solo lee estas vistas.
+VISTAS_PLANTAS = ("vw_Planta_Proceso",)
+_VISTAS_RE = "|".join(VISTAS_PLANTAS)
+# El nombre de una vista de plantas con su esquema (dbo. o movil.): se le quita para que lea el filtro de abajo.
+_PREFIJO_PLANTAS = re.compile(rf"(?:\[(?:dbo|movil)\]|\b(?:dbo|movil))\s*\.\s*(\[(?:{_VISTAS_RE})\]|\b(?:{_VISTAS_RE})\b)",
+                              re.IGNORECASE)
+# Lo que esta base no lee: el resto del esquema movil (Cierre_*, vw_Cierre_*, vw_Conta_*, vw_Expo_*, MiAcceso...), otro
+# esquema y el catálogo. La barrera real es SQL Server (la vista filtra por el correo); esto evita que el permiso de
+# plantas sirva en el bot para leer las finanzas de Cierre, que es otro permiso.
+_FUERA_DE_PLANTAS = re.compile(
+    rf"\b(?!(?:{_VISTAS_RE})\b)(?:vw_\w+|Cierre_\w+|Conta_\w+|Expo_\w+|MiAcceso\w*)\b"
+    r"|(?:\[(?:dbo|movil|sys)\]|\b(?:dbo|movil|sys))\s*\.|\bINFORMATION_SCHEMA\b",
+    re.IGNORECASE)
+
+DESCRIPCION_HISTORICO_PLANTAS = (
+    "Consulta el HISTÓRICO de las plantas El Carmelo (Buin), Almahue y Lisonjera: recepción, vaciado y packing de "
+    "temporadas anteriores, de TODAS las exportadoras que procesan ahí (Agua Santa y otras), en la vista "
+    "vw_Planta_Proceso (base Presupuesto, la misma del conector «Cierre SQL»). Hoy trae solo la temporada 2025-26 "
+    "(Temporada = 26), copiada una vez: no se actualiza. La temporada en curso NO está aquí: es `datos` y `packing` "
+    "(Agua Santa) y `externas` y `externas_detalle` (otras exportadoras) de consultar_sql.\n"
+    "- Temporada 26 = la temporada 2025-26, la anterior a la que corre (2027 en `datos` y `externas`). Si comparas con "
+    "la temporada actual, usa las dos herramientas y di de dónde sale cada cifra.\n"
+    "- Planta trae 'PLANTA EL CARMELO', 'PLANTA ALMAHUE' y 'PLANTA LISONJERA' (como `datos` y `packing`; en `externas` "
+    "son 'Buin (El Carmelo)' y 'Lisonjera (Linares)').\n"
+    "- Ya viene filtrada por lo que este usuario puede ver: las filas de Agua Santa de las plantas que consulta y las "
+    "de otras exportadoras de las plantas que tiene habilitadas. Si una planta o las otras exportadoras salen vacías, "
+    "no las tiene habilitadas: díselo y que las pida a Edson Lazo.\n"
+    "- Solo se lee vw_Planta_Proceso (no las vistas de Cierre). T-SQL de SQL Server 2019 con nivel de compatibilidad "
+    "100: sin STRING_AGG ni TRY_CAST.\n"
+    "- Responde breve (se lee en WhatsApp): kilos con separador de miles con punto. Si piden un PDF o Excel, ármalo "
+    "con generar_informe usando fuente='historico_plantas' en esas secciones."
+)
+REGLAS_PLANTAS_NO_DISPONIBLES = (
+    "(No se pudieron leer las reglas de vw_Planta_Proceso desde el conector Cierre SQL: antes de dar porcentajes de "
+    "exportación o kilos vaciados, advierte que las reglas de la vista no están disponibles.)"
+)
+
+
+def _bloque_markdown(texto, titulo):
+    """El bloque de un texto con secciones '## ...' que empieza con `titulo`, hasta la sección siguiente."""
+    if not texto:
+        return None
+    i = texto.find(titulo)
+    if i < 0:
+        return None
+    j = texto.find("\n## ", i + len(titulo))
+    return texto[i:j if j >= 0 else len(texto)].strip()
+
+
+class BaseHistoricoPlantas(BaseExterna):
+    """Temporadas anteriores de las plantas con todas las exportadoras (vw_Planta_Proceso). Vive en la base de
+    Cierre (mismo servidor y login claude_movil: variables CIERRE_SQL_*) y la vista filtra por el correo de la
+    sesión, pero es un permiso aparte: solo lee VISTAS_PLANTAS, así que darla no abre las finanzas de Cierre. El bot
+    la acota además por persona (`acotar`): las filas de Agua Santa a las plantas que consulta y las de otras
+    exportadoras a las plantas que tiene habilitadas (el doble ticket del panel). Las reglas de la vista se leen del
+    conector al arrancar (bloque '## Plantas' de REGLAS_MODELO)."""
+
+    requiere_email = True
+    vistas = VISTAS_PLANTAS
+    nota_informe = ("Histórico de plantas según vw_Planta_Proceso (base Presupuesto): temporada 2025-26 copiada una vez, "
+                    "con Agua Santa y otras exportadoras, solo de las plantas que el usuario tiene habilitadas.")
+    instruccion_prompt = (
+        "HISTÓRICO DE PLANTAS: la temporada anterior (2025-26) de las plantas El Carmelo (Buin), Almahue y Lisonjera, "
+        "de Agua Santa y de las otras exportadoras, se consulta con consultar_historico_plantas (vista "
+        "vw_Planta_Proceso, Temporada = 26; no con consultar_cierre). Úsala cuando pregunten por la temporada pasada "
+        "de otras exportadoras (`externas` solo trae desde junio de 2026) o por el total de esas plantas con todas "
+        "las exportadoras. Para lo de Agua Santa sola sigue usando `datos` y `packing`, que son la base oficial. Di "
+        "siempre de qué exportadora son los kilos, no sumes Agua Santa con las otras sin decirlo y di de qué base "
+        "sale cada cifra."
+    )
+
+    def __init__(self):
+        ruta = _env("CIERRE_REGLAS_ARCHIVO", r"C:\ClaudeCierre\server.py")
+        reglas = (_bloque_markdown(_texto_de_archivo(ruta, "REGLAS_MODELO"), "## Plantas")
+                  or REGLAS_PLANTAS_NO_DISPONIBLES)
+        super().__init__(
+            id="historico_plantas", nombre="Histórico de plantas", prefijo_env="CIERRE",
+            descripcion=DESCRIPCION_HISTORICO_PLANTAS, reglas=reglas, esquema="movil",
+            base_defecto="Presupuesto", usuario_defecto="claude_movil",
+        )
+
+    def desconectada(self):
+        """En mantención si lo está ella o la base de Cierre (es la misma base)."""
+        return super().desconectada() or (CARPETA / "BASE_DESCONECTADA_CIERRE").exists()
+
+    def _preparar_sesion(self, cur, email):
+        cur.execute("SET NOCOUNT ON; SET LANGUAGE Spanish; SET LOCK_TIMEOUT 30000;")
+        cur.execute("EXEC sys.sp_set_session_context @key = N'email', @value = ?, @read_only = 1;", email)
+        cur.execute(f"SELECT TOP 1 1 FROM {self.esquema}.{VISTAS_PLANTAS[0]};")
+        if cur.fetchone() is None:
+            logger.warning(f"{self.id}: el correo {email} no tiene acceso a {VISTAS_PLANTAS[0]}")
+            raise ErrorBase(f"El correo {email} no tiene acceso a las plantas en la base de Cierre (vista "
+                            f"{VISTAS_PLANTAS[0]}). Pide a Edson Lazo que te lo dé.")
+        return "las plantas autorizadas para su correo"
+
+    def _preparar(self, consulta, acotar=None):
+        sql = preparar_consulta(consulta, "dbo")  # valida; el esquema se resuelve abajo
+        partes = []
+        for es_codigo, texto in _segmentos(sql):
+            if es_codigo:
+                texto = _PREFIJO_PLANTAS.sub(lambda m: m.group(1), texto)
+                m = _FUERA_DE_PLANTAS.search(texto)
+                if m:
+                    raise ErrorBase(f"Con {self.herramienta_consulta} solo se lee {', '.join(VISTAS_PLANTAS)} (sin "
+                                    f"esquema): '{m.group(0)}' no está en esta base.")
+            partes.append(texto)
+        sql = "".join(partes)
+        condicion = self._condicion(acotar)
+        if not condicion:
+            return sql
+        ctes = ", ".join(f"{v} AS (SELECT * FROM {self.esquema}.{v} WHERE {condicion})" for v in VISTAS_PLANTAS)
+        m = re.match(r"\s*WITH\b", sql, re.IGNORECASE)
+        return f"WITH {ctes}, {sql[m.end():].lstrip()}" if m else f"WITH {ctes} {sql}"
+
+    @staticmethod
+    def _condicion(acotar):
+        """WHERE de lo que ve la persona: acotar = {"agua_santa": None (todas) | [plantas], "externas": [plantas]}
+        (nombres de Planta). None = sin límite."""
+        if not acotar:
+            return None
+        def en(plantas):
+            if plantas is None:
+                return "1 = 1"
+            if not plantas:
+                return "1 = 0"
+            nombres = ", ".join("N'" + str(p).strip().upper().replace("'", "''") + "'" for p in plantas)
+            return f"UPPER(LTRIM(RTRIM(Planta))) IN ({nombres})"
+        return (f"(EsAguaSanta = 1 AND {en(acotar.get('agua_santa'))}) OR "
+                f"(EsAguaSanta = 0 AND {en(acotar.get('externas'))})")
+
+    def _texto_acotado(self, acotar):
+        if not acotar:
+            return ""
+        nombres = lambda ps, todas: todas if ps is None else (", ".join(ps) if ps else "ninguna")
+        return (f"Agua Santa en {nombres(acotar.get('agua_santa'), 'todas las plantas')}; otras exportadoras en "
+                f"{nombres(acotar.get('externas'), 'todas las plantas')}")
+
+
+# ---------------------------------------------------------------------------
 # Registro de bases. Para sumar una base: agregarla aquí y poner sus variables en el .env.
 # ---------------------------------------------------------------------------
 BASES = {b.id: b for b in (
     BaseCierre(),
+    BaseHistoricoPlantas(),
 )}
 
 
