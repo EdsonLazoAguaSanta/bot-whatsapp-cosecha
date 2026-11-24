@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # de load_dotenv y del logging porque lee su configuración del .env al importarse.
 import bases_externas
 import calidad_inglobo
+import qc_recepcion
 
 # ============================================================================
 # CONFIGURACIÓN
@@ -5333,8 +5334,63 @@ TOOL_CALIDAD_BRIX = {
     },
 }
 
+# Calidad de RECEPCIÓN (QC Manager de Agrez, 24-11-2026): mismo permiso Calidad y mismo alcance; la fruta de otras
+# exportadoras solo a quien la ve en esa planta (decisiones de Edson del 24-11).
+_FILTROS_QC = {
+    "planta": {"type": "string", "description": "Planta (ej. Lisonjera, El Carmelo, El Parque, Greenvic)."},
+    "productor": {"type": "string", "description": "Productor o fundo (basta parte del nombre)."},
+    "variedad": {"type": "string"},
+    "especie": {"type": "string", "description": "cereza, arándano, carozo (damasco, durazno, nectarín, ciruela) o cítrico."},
+}
+TOOL_QC_RESUMEN = {
+    "name": "consultar_qc_recepcion",
+    "description": (
+        "Calidad de la fruta al llegar a la planta (inspección QC de RECEPCIÓN, sistema QC Manager de Agrez; no es "
+        "Inglobo, que es producto terminado). Por recepción (camión/lote): nota 1 a 4 (1 la mejor, 4 la peor) con su "
+        "causal, % exportable, defectos, Brix, firmeza, calibres y color. Úsala para 'cómo llegó la fruta de Villaseca', "
+        "'recepciones con nota 4 ayer en Lisonjera', 'Brix en recepción de Santina esta semana'. Cualquier día o rango "
+        "de la temporada; sin fecha es hoy. Plantas: El Carmelo, Lisonjera, El Parque y Greenvic (Almahue todavía no "
+        "está en QC Manager). Lo que trae ya viene limitado a lo que esta persona puede ver."
+    ),
+    "input_schema": {"type": "object", "properties": {
+        "fecha": {"type": "string", "description": "Día de recepción (AAAA-MM-DD) o el primero de un rango. Sin fecha: hoy."},
+        "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD)."},
+        **_FILTROS_QC,
+        "agrupar": {"type": "string", "enum": ["productor", "variedad", "planta", "dia", "especie", "exportadora"],
+                    "description": "Para ver las cifras por grupo."},
+        "todas": {"type": "boolean", "description": "true lista todas las recepciones; por defecto solo las de nota 4."},
+    }},
+}
+TOOL_QC_DETALLE = {
+    "name": "detalle_qc_recepcion",
+    "description": (
+        "Una recepción completa de QC Manager por su lote, guía o código (ej. CSR-1435): muestra y contramuestra con "
+        "nota y causal, % exportable, todos los defectos, Brix (fruto a fruto: promedio, mínimo y máximo), firmeza por "
+        "color, calibres, color, temperaturas y observaciones. Si calza más de una, las lista para preguntar cuál."
+    ),
+    "input_schema": {"type": "object", "properties": {
+        "lote": {"type": "string", "description": "Lote, guía o código de la recepción."},
+        "fecha": {"type": "string", "description": "Día de recepción (AAAA-MM-DD), si lo sabe. Sin fecha: últimos 60 días."},
+    }, "required": ["lote"]},
+}
+TOOL_QC_CRUCE = {
+    "name": "cruce_recepcion_embalado",
+    "description": (
+        "Compara la calidad en RECEPCIÓN (QC Manager) con la de PRODUCTO TERMINADO (Inglobo) por planta, fundo y "
+        "variedad en el mismo período: recepciones, % nota 4 y % exportable y Brix en recepción, contra cajas "
+        "evaluadas, % rojas y Brix embalado. Úsala para '¿la fruta que llegó mal salió mal embalada?' o 'Brix de "
+        "recepción contra Brix embalado de Santina'."
+    ),
+    "input_schema": {"type": "object", "properties": {
+        "fecha": {"type": "string", "description": "Día (AAAA-MM-DD) o el primero de un rango. Sin fecha: hoy."},
+        "fecha_hasta": {"type": "string", "description": "Último día del rango (AAAA-MM-DD)."},
+        **_FILTROS_QC,
+    }},
+}
+
+HERRAMIENTAS_QC = {TOOL_QC_RESUMEN["name"], TOOL_QC_DETALLE["name"], TOOL_QC_CRUCE["name"]}
 HERRAMIENTAS_CALIDAD = {TOOL_CALIDAD_RESUMEN["name"], TOOL_CALIDAD_CAJA["name"], TOOL_CALIDAD_INFORME["name"],
-                        TOOL_CALIDAD_BRIX["name"]}
+                        TOOL_CALIDAD_BRIX["name"], *HERRAMIENTAS_QC}
 
 INSTRUCCION_CALIDAD = (
     "CALIDAD DE PRODUCTO TERMINADO (Inglobo): con consultar_calidad das el semáforo de las cajas evaluadas por día, "
@@ -5349,7 +5405,13 @@ INSTRUCCION_CALIDAD = (
     "Para el Brix promedio usa promedio_brix_calidad y di siempre cuántas mediciones entraron y cuántas quedaron fuera "
     "por «sin medir». Brix o Peso neto en 0 en Inglobo es «sin medir / sin pesar», no un rechazo por ese defecto: si "
     "una caja quedó roja solo por eso, dilo así (sigue contada como roja porque así la marca Inglobo). Las consultas "
-    "aceptan cualquier rango desde junio de 2026."
+    "aceptan cualquier rango desde junio de 2026. "
+    "CALIDAD DE RECEPCIÓN (QC Manager, Agrez): la inspección de la fruta al LLEGAR a la planta, antes del proceso; "
+    "Inglobo es la caja ya EMBALADA. No las confundas: si preguntan «cómo llegó la fruta», «nota de recepción» o "
+    "«QC», es consultar_qc_recepcion (una recepción completa: detalle_qc_recepcion; las dos etapas juntas: "
+    "cruce_recepcion_embalado). En QC la nota es de la recepción: 1 la mejor, 4 la peor, con su causal (sólidos "
+    "solubles = Brix bajo). Almahue todavía no está en QC Manager. Si trae recepciones de otras exportadoras, dilo y "
+    "no las sumes a Agua Santa."
 )
 
 _PRODUCTORES_POR_CODIGO = {"cargado": 0.0, "mapa": {}}
@@ -5393,6 +5455,100 @@ def _permitido_calidad(alcance):
                    for f in alcance)
     return del_productor
 
+def _permitido_qc(numero, alcance):
+    """Qué muestras de QC Manager ve cada uno: las de Agua Santa con su alcance (como Inglobo: planta o fundos, por
+    nombre o CSG); las de otras exportadoras, solo en las plantas donde ve otras exportadoras (gerencia con el permiso;
+    el admin todas)."""
+    base = _permitido_calidad(alcance)
+    plantas_externas = [PLANTA_DE_EXTERNAS[k] for k in ve_externas(numero) if k in PLANTA_DE_EXTERNAS]
+
+    def permitido(m):
+        if m["agua_santa"]:
+            return base(m)
+        return any(_planta_coincide(p, m["planta"]) for p in plantas_externas)
+    return permitido
+
+def _ejecutar_qc(tool_name, entrada, numero_sender, alcance):
+    if not qc_recepcion.configurada():
+        return "La calidad de recepción (QC Manager) todavía no está configurada en el bot."
+    permitido = _permitido_qc(numero_sender, alcance)
+    filtros = {k: entrada.get(k) for k in ("planta", "productor", "variedad", "especie")}
+    try:
+        if tool_name == "detalle_qc_recepcion":
+            if entrada.get("fecha"):
+                dia = calidad_inglobo.leer_fecha(entrada.get("fecha"))
+                desde, hasta = dia - timedelta(days=1), dia + timedelta(days=1)
+            else:
+                desde, hasta = date.today() - timedelta(days=60), date.today()
+            return qc_recepcion.detalle(desde, hasta, permitido, str(entrada.get("lote") or "").strip())
+        desde = calidad_inglobo.leer_fecha(entrada.get("fecha"))
+        hasta = calidad_inglobo.leer_fecha(entrada.get("fecha_hasta"), desde)
+        desde, hasta = min(desde, hasta), max(desde, hasta)
+        if tool_name == "consultar_qc_recepcion":
+            return qc_recepcion.resumen(desde, hasta, permitido, agrupar=entrada.get("agrupar"),
+                                        solo_nota4=entrada.get("todas") is not True, **filtros)
+        filas = _cruce_qc_inglobo(desde, hasta, alcance, numero_sender, filtros)
+        if not filas:
+            return "No hay recepciones de QC Manager ni cajas de Inglobo en ese período con esos filtros."
+        periodo = desde.strftime("%d-%m-%Y") + ("" if hasta == desde else f" al {hasta:%d-%m-%Y}")
+        d = lambda x, n=1: "—" if x is None else _fmt_numero(x, n)
+        lineas = [f"Recepción (QC Manager) contra producto terminado (Inglobo) · {periodo}",
+                  "Planta | Fundo | Variedad | Recepciones | % nota 4 rec. | % exportable rec. | Brix rec. | Cajas "
+                  "evaluadas | % rojas | Brix embalado"]
+        lineas += [" | ".join([f[0], f[1], f[2], d(f[3], 0), d(f[4]), d(f[5]), d(f[6]), d(f[7], 0), d(f[8]), d(f[9])])
+                   for f in filas]
+        lineas.append("— = no hay dato de esa etapa (la fruta pudo recibirse un día y embalarse otro, o la planta no "
+                      "está en ese sistema: Almahue no está en QC Manager). Se cruza por planta, fundo (código CSG) y "
+                      "variedad.")
+        return "\n".join(lineas)
+    except (qc_recepcion.ErrorQC, calidad_inglobo.ErrorCalidad) as e:
+        return f"No pude consultar la calidad: {e}"
+
+def _cruce_qc_inglobo(desde, hasta, alcance, numero, filtros=None, cajas=None):
+    """Filas [Planta, Fundo, Variedad, recepciones, % nota 4, % exportable, Brix rec., cajas evaluadas, % rojas, Brix
+    embalado] por planta, fundo (nombre de Control_EAS por el código) y variedad. cajas: las de Inglobo ya leídas
+    (el informe las pasa); si no, se leen."""
+    filtros = filtros or {}
+    recs = qc_recepcion.filtrar(qc_recepcion.recepciones(desde, hasta, _permitido_qc(numero, alcance)),
+                                **{k: v for k, v in filtros.items() if k in ("planta", "productor", "variedad", "especie")})
+    if cajas is None:
+        permitido = _permitido_calidad(alcance)
+        cajas = []
+        for dia in calidad_inglobo.dias_entre(desde, hasta):
+            cajas += [c for c in calidad_inglobo.cajas(calidad_inglobo.reporte_dia(dia)) if permitido(c)]
+        mapa = {"planta": "packing", "productor": "productor", "variedad": "variedad", "especie": "especie"}
+        for k, v in filtros.items():
+            if str(v or "").strip() and k in mapa:
+                cajas = [c for c in cajas if calidad_inglobo._coincide(v, c[mapa[k]])]
+
+    def clave(planta, codigo, productor, variedad):
+        fundo = _productor_por_codigo(codigo) or productor
+        return (_planta_informe(planta), _clave_fundo(fundo), _variedad_informe(variedad)), fundo
+
+    grupos = {}
+    for lista in recs.values():
+        m = lista[0]
+        # Otras exportadoras: su propio nombre (su CSG puede caer en otro fundo de Control_EAS).
+        k, fundo = clave(m["planta"], m["codigo_productor"] if m["agua_santa"] else "", m["productor"], m["variedad"])
+        g = grupos.setdefault(k, {"nombre": (_planta_informe(m["planta"]), fundo, m["variedad"]), "rec": [], "cajas": []})
+        g["rec"].append(lista)
+    for c in cajas:
+        k, fundo = clave(c["packing"], c.get("codigo_productor"), c["productor"], c["variedad"])
+        g = grupos.setdefault(k, {"nombre": (_planta_informe(c["packing"]), fundo, c["variedad"]), "rec": [], "cajas": []})
+        g["cajas"].append(c)
+    filas = []
+    for g in grupos.values():
+        s = qc_recepcion.estadisticas(g["rec"]) if g["rec"] else None
+        brix_pt = [v for c in g["cajas"] for v in c.get("medidas", {}).get("BRIX", [])
+                   if isinstance(v, (int, float)) and v > calidad_inglobo.UMBRAL_SIN_MEDIR]
+        n = len(g["cajas"])
+        filas.append([*g["nombre"], s["recepciones"] if s else 0, s["pct_nota"].get(4) if s and s["con_nota"] else None,
+                      s["exportable"] if s else None, s["brix"] if s else None, n,
+                      100 * sum(c["nota"] == "ROJO" for c in g["cajas"]) / n if n else None,
+                      sum(brix_pt) / len(brix_pt) if brix_pt else None])
+    filas.sort(key=lambda f: (_orden_planta_proyeccion(f[0]), -(f[3] + f[7]), f[1], f[2]))
+    return filas
+
 def _ejecutar_calidad(tool_name, entrada, numero_sender):
     if not ve_calidad(numero_sender):
         return "La calidad de producto terminado (Inglobo) no está habilitada para este usuario."
@@ -5400,6 +5556,8 @@ def _ejecutar_calidad(tool_name, entrada, numero_sender):
     if alcance is not None and not alcance:
         return MENSAJE_SIN_PLANTA if isinstance(alcance, AlcancePlanta) else MENSAJE_SIN_FUNDOS
     permitido = _permitido_calidad(alcance)
+    if tool_name in HERRAMIENTAS_QC:
+        return _ejecutar_qc(tool_name, entrada, numero_sender, alcance)
     try:
         if tool_name == "consultar_calidad":
             desde = calidad_inglobo.leer_fecha(entrada.get("fecha"))
@@ -5508,6 +5666,7 @@ def herramientas_disponibles(numero_sender=None):
     # El zonal confirma lo que piden sus productores (y, en modo prueba, el admin que las recibe).
     resuelve = bool(numero_sender) and (rol_de(numero_sender) == "zonal" or bool(aprobaciones_para(numero_sender)))
     calidad = ([TOOL_CALIDAD_RESUMEN, TOOL_CALIDAD_CAJA, TOOL_CALIDAD_INFORME, TOOL_CALIDAD_BRIX]
+               + ([TOOL_QC_RESUMEN, TOOL_QC_DETALLE, TOOL_QC_CRUCE] if qc_recepcion.configurada() else [])
                if calidad_inglobo.configurada() and ve_calidad(numero_sender) else [])
     return (cosecha + sql + externas + calidad
             + ([TOOL_REGISTRAR_CUESTIONARIO] if numero_sender and reporta else [])
@@ -10988,6 +11147,76 @@ def _informe_calidad(dias, alcance, titulo, momento, filtros=None, fotos=True, n
             "nota": "°Brix promedio de las mediciones de muestra y contramuestra (no las filas Promedio de Inglobo). "
                     "Brix 0 o 0,01 es «sin medir» en Inglobo y queda fuera del promedio. Fundo con el nombre de "
                     "Control_EAS."})
+    # ---- Recepción (QC Manager) y su cruce con producto terminado (pedido de Edson, 24-11-2026).
+    if qc_recepcion.configurada() and not por_turno:
+        filtros_qc = {{"packing": "planta"}.get(k, k): v for k, v in (filtros or {}).items()
+                      if k in ("packing", "productor", "variedad", "especie")}
+        try:
+            recs = qc_recepcion.filtrar(qc_recepcion.recepciones(min(dias), max(dias), _permitido_qc(numero, alcance)),
+                                        **filtros_qc)
+        except qc_recepcion.ErrorQC as e:
+            logger.warning(f"Informe de calidad: sin QC Manager ({e})")
+            recs = None
+            resumen.append(f"- Recepción (QC Manager): no respondió ({e}).")
+        if recs:
+            # Totales solo de Agua Santa: lo de otras exportadoras se cuenta aparte (no se mezcla sin decirlo).
+            propias = [l for l in recs.values() if l[0]["agua_santa"]]
+            otras_qc = len(recs) - len(propias)
+            e_qc = qc_recepcion.estadisticas(propias) if propias else None
+            if e_qc:
+                resumen.append(f"- *Recepción de Agua Santa (QC Manager):* {_fmt_numero(e_qc['recepciones'])} recepciones "
+                               f"inspeccionadas ({_fmt_numero(e_qc['kilos'])} kg); nota 4 en "
+                               f"{_fmt_numero(e_qc['pct_nota'].get(4, 0), 1)} %, exportable "
+                               f"{_fmt_numero(e_qc['exportable'] or 0, 1)} %"
+                               + (f" (además, {otras_qc} de otras exportadoras, aparte)" if otras_qc else ""))
+            elif otras_qc:
+                resumen.append(f"- Recepción (QC Manager): solo {otras_qc} recepciones de otras exportadoras.")
+            por_qc = {}
+            for lista in recs.values():
+                m = lista[0]
+                # El CSG da el nombre de Control_EAS solo para Agua Santa (en otras exportadoras puede caer en otro fundo).
+                fundo = (_productor_por_codigo(m["codigo_productor"]) if m["agua_santa"] else "") or m["productor"]
+                if not m["agua_santa"]:
+                    fundo += f" ({m['exportadora'].replace('EXPORTADORA ', '').title()})"
+                por_qc.setdefault((m["variedad"], fundo, _planta_informe(m["planta"])), []).append(lista)
+            filas_qc = []
+            for (variedad, fundo, planta_qc), listas in sorted(por_qc.items(), key=lambda g: (-sum(l[0]["kilos"] for l in g[1]), g[0])):
+                s = qc_recepcion.estadisticas(listas)
+                firme = (s["firmezas"].get("MUY FIRME", 0) + s["firmezas"].get("FIRME", 0)) if s["firmezas"] else None
+                filas_qc.append([variedad, fundo, planta_qc, s["recepciones"], round(s["kilos"]),
+                                 round(s["pct_nota"].get(4, 0), 1) if s["con_nota"] else None,
+                                 round(s["exportable"], 1) if s["exportable"] is not None else None,
+                                 round(s["brix"], 1) if s["brix"] is not None else None,
+                                 round(firme, 1) if firme is not None else None,
+                                 "; ".join(f"{c.lower()} ({n})" for c, n in s["causales_nota4"][:3])])
+            secciones.append({
+                "titulo": "Recepción (QC Manager) por variedad, fundo y planta",
+                "encabezados": ["Variedad", "Fundo", "Planta", "Recepciones", "Kg recibidos", "% nota 4",
+                                "% exportable", "Brix", "% firme", "Causal nota 4"],
+                "filas": filas_qc,
+                "total": ["TOTAL Agua Santa", "", "", e_qc["recepciones"], round(e_qc["kilos"]),
+                          round(e_qc["pct_nota"].get(4, 0), 1) if e_qc["con_nota"] else None,
+                          round(e_qc["exportable"], 1) if e_qc["exportable"] is not None else None,
+                          round(e_qc["brix"], 1) if e_qc["brix"] is not None else None, None, ""]
+                         if e_qc and len(filas_qc) > 1 else None,
+                "grafico": None,
+                "nota": "Inspección QC de la fruta al llegar a la planta (QC Manager de Agrez; Almahue todavía no está). "
+                        "Nota de la recepción: 1 la mejor, 4 la peor. % exportable y Brix: promedio de muestra y "
+                        "contramuestra (Brix fruto a fruto). % firme = muy firme + firme. Entre paréntesis, otras "
+                        "exportadoras."})
+            filas_x = _cruce_qc_inglobo(min(dias), max(dias), alcance, numero, filtros_qc, cajas=cajas)
+            filas_x = [f for f in filas_x if f[3] and f[7]]  # solo lo que tiene las dos etapas
+            if filas_x:
+                secciones.append({
+                    "titulo": "Recepción contra producto terminado",
+                    "encabezados": ["Planta", "Fundo", "Variedad", "Recepciones", "% nota 4 recepción",
+                                    "% exportable recepción", "Brix recepción", "Cajas evaluadas", "% rojas embalado",
+                                    "Brix embalado"],
+                    "filas": [[*f[:3], f[3], *(round(x, 1) if x is not None else None for x in f[4:7]), f[7],
+                               *(round(x, 1) if x is not None else None for x in f[8:])] for f in filas_x],
+                    "total": None, "grafico": None,
+                    "nota": "Mismo período, por planta, fundo (código CSG) y variedad; solo lo que tiene recepción en QC "
+                            "Manager y cajas en Inglobo. La fruta recibida un día puede embalarse otro."})
     problemas = sorted(rojas + amarillas, key=lambda c: (c["nota"] != "ROJO", c["_dia"],
                                                           _orden_planta_proyeccion(planta(c)), c["hora"]))
     if problemas:
