@@ -4065,6 +4065,18 @@ _SQL_PACKING_REGLAS = (
         "SUM(KgsEmbalados)/NULLIF(SUM(KgsVaciados),0) sobre 'Packing Planta'. (c) Categoria viene escrita de "
         "varias formas ('CAT 1' y 'CAT1' son lo mismo): si agrupas por categoría, únelas con "
         "REPLACE(Categoria, ' ', ''). "
+        # Pedido de Edson del 25-11-2026: Jerónimo pidió las cajas eq de la Precosecha y el bot las calculó con la
+        # planilla (hasta +9 % en nectarín) y después dijo que la base no las tenía; están guardadas en `packing`.
+        "(d) CAJAS EQ: CajasEq viene GUARDADA en la base para cada fuente, y cada fuente la calcula distinto ('Packing "
+        "Planta' = cajas de lo embalado; 'Trisem Proceso', 'Estim Primavera' y 'Estim Invierno' = cajas estimadas, "
+        "con el rendimiento ya incluido): al sumar CajasEq filtra SIEMPRE por [Base Origen] y nunca mezcles fuentes. "
+        "(e) Las cajas eq de las ESTIMACIONES (Precosecha = 'Estim Primavera'; 'Estim Invierno') están aquí, en "
+        "`packing`: SUM(CajasEq) WHERE [Base Origen] = 'Estim Primavera' (son las mismas de la planilla de "
+        "estimación PKG-Cos-Estima). En `datos` no están (allí CajasEq solo viene en las filas Trisemanal). Si piden "
+        "cajas eq de una estimación, LÉELAS de `packing`; NO las calcules con `conversiones` (eso solo si piden "
+        "convertir kilos que no traen cajas, y diciendo que es un cálculo). (f) Los Bultos con Envase 'CAJA EQ' de "
+        "`datos` son bultos de ese envase, NO las cajas equivalentes de la estimación. (g) Antes de decir que la base "
+        "no tiene un dato de cajas eq, revisa `packing`. "
 )
 _SQL_PACKING_EDGE = (
     "El embalaje real ('Packing Planta') sale de los sistemas de cada planta (FX), salvo donde FX no tiene la "
@@ -4116,7 +4128,7 @@ _DESCRIPCION_SQL = {
         "categoría y calibre. Ya viene filtrada por lo que este usuario puede ver. Columnas: Temporada (int, la "
         "temporada oficial según la fecha: semana ISO 44 a 43; úsala para 'esta temporada', 'la pasada', comparar "
         "temporadas), TemporadaBase (la que trae la base; úsala solo si la piden), "
-        + _SQL_PACKING_COLUMNAS + _SQL_PACKING_REGLAS + "(d) " + _SQL_PACKING_EDGE
+        + _SQL_PACKING_COLUMNAS + _SQL_PACKING_REGLAS + "(h) " + _SQL_PACKING_EDGE
         + "Agrega en SQL (GROUP BY, SUM) en vez de traer filas sueltas, usa TOP para rankings, CAST(Fecha AS DATE) "
           "para fechas (compáralo con 'AAAA-MM-DD'; si comparas Fecha sin CAST usa 'AAAAMMDD', porque el servidor "
           "está en español y lee mal '2026-10-26' como datetime) y CAST(Semana AS INT) para semanas; NULLIF para "
