@@ -2743,7 +2743,7 @@ PLANTAS_EXTERNAS = {"buin": "Buin", "lisonjera": "Lisonjera", "almahue": "Almahu
 # Cada una con su nombre en `datos` y `packing` (para ordenar y marcar la lista de plantas del panel). Del 12 al
 # 18-11-2026 las de otras exportadoras salían de las plantas que consulta; desde el 18-11 son una lista aparte.
 PLANTA_DE_EXTERNAS = {"buin": "PLANTA EL CARMELO", "lisonjera": "PLANTA LISONJERA", "almahue": "PLANTA ALMAHUE"}
-NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", *TABLAS_EMBARQUES, *TABLAS_EXTERNAS}
+NOMBRES_RESERVADOS_SQL = {"datos", "packing", "conversiones", "despachos", *TABLAS_EMBARQUES, *TABLAS_EXTERNAS}
 
 NIVELES_EMBARQUES = {"no": 0, "sin_fob": 1, "fob": 2}
 NOMBRE_NIVEL_EMBARQUES = {nivel: nombre for nombre, nivel in NIVELES_EMBARQUES.items()}
@@ -3003,7 +3003,7 @@ def validar_consulta_sql(sql, tablas_extra=(), bases=BASES_LECTURA["ambas"]):
     if reservados:
         return None, f"No definas un WITH llamado '{sorted(reservados)[0]}': ese nombre ya es una tabla."
     externas = TABLAS_EXTERNAS if getattr(bases, "externas", False) else ()
-    permitidas = {*bases, *tablas_extra, *externas, "conversiones"}
+    permitidas = {*bases, *tablas_extra, *externas, "conversiones", *(("despachos",) if "packing" in bases else ())}
     if {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EXTERNAS) - permitidas):
         return None, "Las tablas de otras exportadoras (externas) no están habilitadas para este usuario."
     vedadas = {t.strip("[]\"").lower() for t in tokens} & (set(TABLAS_EMBARQUES) - permitidas)
@@ -3185,6 +3185,20 @@ def _ctes_externas(plantas=True):
         f"CAST(x.Kilos AS FLOAT) AS Kilos FROM [PKG-Externas] x{_filtro_plantas_externas(plantas, 'x')})",
     ]
 
+def _cte_despachos(alcance):
+    """Tabla `despachos` (pedido de Edson, 26-11-2026): cajas despachadas desde las plantas (exportación y venta
+    nacional) por fecha de despacho, de la vista bot.Embarques, para calcular existencias = cajas eq procesadas
+    (packing) - despachadas. Va a todo el que tiene packing (decisión de Edson), con su alcance de plantas o fundos, y
+    sin FOB, naves ni destinos."""
+    condiciones = ["e.Fecha_Despacho IS NOT NULL"]
+    if isinstance(alcance, AlcancePlanta):
+        condiciones.append(_sql_plantas(alcance, columna="e.Planta", literales=True)[0])
+    elif alcance is not None:
+        condiciones.append(_sql_fundos(alcance, columna="e.Productor", literales=True)[0] if alcance else "1 = 0")
+    return ("despachos AS (SELECT CAST(e.Temporada AS INT) AS Temporada, e.Fecha_Despacho AS Fecha, "
+            "e.Tipo_Despacho AS Tipo, LTRIM(RTRIM(e.Planta)) AS Planta, e.Productor, e.Especie, e.Variedad, "
+            f"e.Cajas, e.Cajas_Eq AS CajasEq FROM bot.Embarques e WHERE {' AND '.join(condiciones)})")
+
 def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA["ambas"]):
     """Antepone el WITH "datos": la tabla real + Zonal, con la temporada oficial por fecha,
     sin las filas duplicadas sin kilos (las mismas que excluyen todas las consultas del bot)
@@ -3206,6 +3220,7 @@ def _consulta_con_datos(consulta, alcance, embarques=False, bases=BASES_LECTURA[
                     f"FROM {RECEPCION_SQL} rc WHERE {' AND '.join(condiciones)})")
     if "packing" in bases:
         ctes.append(_cte_packing(alcance))
+        ctes.append(_cte_despachos(alcance))
     ctes.append(_cte_conversiones())
     if embarques:
         nivel_emb = 2 if embarques is True else int(embarques)
@@ -4077,6 +4092,17 @@ _SQL_PACKING_REGLAS = (
         "convertir kilos que no traen cajas, y diciendo que es un cálculo). (f) Los Bultos con Envase 'CAJA EQ' de "
         "`datos` son bultos de ese envase, NO las cajas equivalentes de la estimación. (g) Antes de decir que la base "
         "no tiene un dato de cajas eq, revisa `packing`. "
+        # Pedido de Edson del 26-11-2026: existencias en planta.
+        "(i) EXISTENCIAS: también tienes la tabla `despachos` (lo despachado desde las plantas, de los embarques): "
+        "Temporada, Fecha (= fecha de despacho), Tipo ('Export' = exportación, 'VN' = venta nacional), Planta, "
+        "Productor, Especie (en inglés, como packing), Variedad, Cajas (cajas físicas) y CajasEq. EXISTENCIAS (cajas eq "
+        "en planta) = cajas eq procesadas - cajas eq despachadas, a una fecha: SUM(CajasEq) de `packing` con [Base "
+        "Origen] = 'Packing Planta' y CAST(Fecha AS DATE) <= la fecha, MENOS SUM(CajasEq) de `despachos` con "
+        "CAST(Fecha AS DATE) <= la fecha (exportación y venta nacional), misma Temporada, por especie (y por planta si "
+        "la piden: compara REPLACE(UPPER(Packing),'PLANTA ','') con REPLACE(UPPER(Planta),'PLANTA ',''), porque se "
+        "escriben distinto). Arma cada suma en su propio SELECT agrupado y únelos (UNION ALL o FULL JOIN), nunca con un "
+        "JOIN fila a fila. Sin fecha, al día de hoy y esta temporada. Dilo como un cálculo (procesadas - despachadas) y "
+        "muestra las tres cifras. "
 )
 _SQL_PACKING_EDGE = (
     "El embalaje real ('Packing Planta') sale de los sistemas de cada planta (FX), salvo donde FX no tiene la "
@@ -9897,8 +9923,9 @@ def generar_informe_personalizado(numero_destino, formato, titulo, secciones, su
 
 def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None, consulta_kpis=None,
                                 alcance=None, embarques=False, confirmaciones=False, fuente_kpis=None,
-                                bases=BASES_LECTURA["ambas"], omitir_vacias=False, externas=None):
+                                bases=BASES_LECTURA["ambas"], omitir_vacias=False, externas=None, max_secciones=8):
     """Ejecuta las consultas y arma el informe (sin enviarlo): (informe, None) o (None, error).
+    max_secciones: tope para los informes que arma Claude; los diarios pasan todas las suyas.
     omitir_vacias=True deja fuera las secciones sin filas (informes automáticos). externas = bases
     externas que puede leer quien lo pide (ver _consulta_informe)."""
     if not secciones:
@@ -9928,7 +9955,7 @@ def armar_informe_personalizado(titulo, secciones, subtitulo=None, resumen=None,
                 informe["kpis"].append(kpi)
     alguno_pide_grafico = any((s.get("grafico") or {}).get("tipo") not in (None, "ninguno")
                               for s in secciones)
-    for numero_seccion, seccion in enumerate(secciones[:8]):
+    for numero_seccion, seccion in enumerate(secciones[:max_secciones]):
         nombre = seccion.get("titulo") or f"Sección {numero_seccion + 1}"
         resultado, error = _consulta_informe(seccion.get("consulta_sql"), seccion.get("fuente"), alcance,
                                              MAX_FILAS_INFORME, embarques, confirmaciones, bases, externas)
@@ -10108,12 +10135,14 @@ TIPOS_INFORME_DIARIO = ("cosecha", "procesos", "proyeccion", "calidad")
 AVISO_INFORME_DIARIO = {"cosecha": "informes", "procesos": "informes", "proyeccion": "proyeccion", "calidad": "calidad"}
 NOMBRE_INFORME_DIARIO = {"cosecha": "cosecha", "procesos": "procesos", "proyeccion": "proyección de cosecha",
                          "calidad": "calidad"}
-_INF_PLANTA = "REPLACE(Packing,'PLANTA ','')"
+_INF_PLANTA = "UPPER(REPLACE(Packing,'PLANTA ',''))"  # la base trae «Planta Almahue» y «PLANTA ALMAHUE»
 _INF_PRODUCTOR = ("CASE WHEN Productor='SANTA ANA' THEN 'SANTA ANA DE HUIQUE' "
                   "WHEN Productor='AGRICOLA EL CARMELO LTDA' THEN 'AGRÍCOLA EL CARMELO LTDA' ELSE Productor END")
 _INF_VARIEDAD = "CASE WHEN Variedad IN ('RAINIER','ROYAL RAINIER') THEN 'RAINIER' ELSE Variedad END"
 _INF_ESPECIE = ("CASE Especie WHEN 'CHERRY' THEN 'Cereza' WHEN 'PEACH' THEN 'Durazno' WHEN 'NECTARINE' THEN "
-                "'Nectarín' WHEN 'APRICOT' THEN 'Damasco' WHEN 'BLUEBERRY' THEN 'Arándano' ELSE Especie END")
+                "'Nectarín' WHEN 'APRICOT' THEN 'Damasco' WHEN 'BLUEBERRY' THEN 'Arándano' WHEN 'PLUM' THEN 'Ciruela' "
+                "WHEN 'GRAPE' THEN 'Uva' WHEN 'MANDARIN' THEN 'Mandarina' WHEN 'ORANGE' THEN 'Naranja' WHEN 'PEAR' THEN "
+                "'Pera' WHEN 'KIWI' THEN 'Kiwi' WHEN 'FLAT PEACH' THEN 'Durazno plano' ELSE Especie END")
 _INF_ORDEN_PLANTA = "CASE Planta WHEN 'LISONJERA' THEN 1 ELSE 2 END"
 _INF_ORDEN_CALIBRE = ("CASE Calibre WHEN '4J' THEN 1 WHEN '4JD' THEN 2 WHEN '3J' THEN 3 WHEN '3JD' THEN 4 "
                       "WHEN '2J' THEN 5 WHEN '2JD' THEN 6 WHEN 'J' THEN 7 WHEN 'JD' THEN 8 WHEN 'XL' THEN 9 "
@@ -10397,138 +10426,181 @@ def spec_informe_cosecha(fecha, turno="pm"):
             "consulta_kpis": kpis, "secciones": secciones}
 
 def spec_informe_procesos(fecha, turno="pm"):
+    """Informe diario de procesos. Cambios pedidos por Edson el 26-11-2026: sin las cifras de programa y procesado del
+    día; la sección 1 abre con el avance por especie (Precosecha, procesadas, despachadas y existencias) y la tabla por
+    planta suma «Bins por procesar»; la 2 va por productor y especie; la 3 por especie y solo en cajas eq; sin la de
+    fruta pendiente; embalado por calibre de cada especie; % exportación en otras exportadoras."""
     c = _corte_informe(fecha, turno)
     am, t, D, d = c["am"], c["t"], c["D"], c["d"]
-    pk, tp, real = "Packing Planta", "Trisem Proceso", BASE_ORIGEN_REAL
+    pk, tp, real, pre = "Packing Planta", "Trisem Proceso", BASE_ORIGEN_REAL, BASE_ORIGEN_ESTIM_PRIMAVERA
     corte = f"Temporada={t} AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{D}'"
     vt, ct, et = (_suma_si(corte, "KgsVaciados"), _suma_si(corte, "CajasEq"), _suma_si(corte, "KgsEmbalados"))
     del_dia = lambda base, col: _suma_si(f"[Base Origen]='{base}' AND CAST(Fecha AS DATE)='{D}'", col)
-    # Cifras pedidas por Edson el 11-11-2026: 4 = cajas eq producidas y 5 = cajas eq programadas del día.
+    # Cifras pedidas por Edson el 11-11-2026: 4 = cajas eq producidas y 5 = cajas eq programadas del día. El 26-11
+    # salieron el programa y el procesado del día en kg.
     sufijo = f"del {d}" if am else "hoy"
     kpis = (f"SELECT ROUND({vt},0) AS [Procesado temporada {c['al']} (kg)], ROUND({ct},0) AS [Cajas eq temporada], "
             f"ROUND(100.0*{et}/NULLIF({vt},0),1) AS [% embalaje temporada], "
             f"ROUND({del_dia(pk, 'CajasEq')},0) AS [Cajas eq producidas {sufijo}{'' if am else ' (parcial)'}], "
-            f"ROUND({del_dia(tp, 'CajasEq')},0) AS [Cajas eq programadas {sufijo}], "
-            f"ROUND({del_dia(tp, 'KgsVaciados')},0) AS [Programa {sufijo} (kg)], "
-            f"ROUND({del_dia(pk, 'KgsVaciados')},0) AS [Procesado {sufijo}{'' if am else ' parcial'} (kg)] FROM packing")
-    grupo = f"{_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}"
-    campos_dia = (f"{_suma_si(f'[Base Origen]={chr(39)}{tp}{chr(39)}', 'KgsVaciados')} AS T, "
-                  f"{_suma_si(f'[Base Origen]={chr(39)}{tp}{chr(39)}', 'CajasEq')} AS TC, "
-                  f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsVaciados')} AS V, "
-                  f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsEmbalados')} AS E, "
-                  f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'CajasEq')} AS C")
+            f"ROUND({del_dia(tp, 'CajasEq')},0) AS [Cajas eq programadas {sufijo}] FROM packing")
+
+    # 1a. Avance de la temporada por especie (26-11-2026): Precosecha de toda la temporada, procesadas (embalaje real)
+    # y despachadas (embarques de exportación y venta nacional) al corte; existencias = procesadas - despachadas.
+    avance = (
+        f"WITH e AS (SELECT {_INF_ESPECIE} AS Especie, SUM(CajasEq) AS Est, 0.0 AS Pro, 0.0 AS Des FROM packing "
+        f"WHERE Temporada={t} AND [Base Origen]='{pre}' GROUP BY Especie "
+        f"UNION ALL SELECT {_INF_ESPECIE}, 0.0, SUM(CajasEq), 0.0 FROM packing WHERE {corte} GROUP BY Especie "
+        f"UNION ALL SELECT {_INF_ESPECIE}, 0.0, 0.0, SUM(CajasEq) FROM despachos WHERE Temporada={t} "
+        f"AND CAST(Fecha AS DATE)<='{D}' GROUP BY Especie), "
+        "b AS (SELECT Especie, SUM(Est) AS Est, SUM(Pro) AS Pro, SUM(Des) AS Des FROM e GROUP BY Especie) "
+        "SELECT Especie, [Total cajas eq estimadas], [Cajas eq procesadas], [% avance], [Cajas eq despachadas], "
+        "[Existencias cajas eq] FROM (SELECT Especie, ROUND(Est,0) AS [Total cajas eq estimadas], "
+        "ROUND(Pro,0) AS [Cajas eq procesadas], ROUND(100.0*Pro/NULLIF(Est,0),1) AS [% avance], "
+        "ROUND(Des,0) AS [Cajas eq despachadas], ROUND(Pro-Des,0) AS [Existencias cajas eq], 0 AS S FROM b "
+        "WHERE Est<>0 OR Pro<>0 OR Des<>0 UNION ALL SELECT 'TOTAL', ROUND(SUM(Est),0), ROUND(SUM(Pro),0), "
+        "ROUND(100.0*SUM(Pro)/NULLIF(SUM(Est),0),1), ROUND(SUM(Des),0), ROUND(SUM(Pro-Des),0), 1 FROM b) x "
+        "ORDER BY S, [Total cajas eq estimadas] DESC")
     planta_especie = f"{_INF_PLANTA}, Especie"
 
     def por_planta(con_recepcion):
-        # P1 (11-11-2026): por planta y especie, con lo recibido y lo que falta procesar (recibido - procesado).
-        # Quien no tiene la base de cosecha la recibe sin esas dos columnas.
-        recibido = (f" UNION ALL SELECT {_INF_PLANTA}, {_INF_ESPECIE}, 0.0, 0.0, 0.0, SUM(KgsRecepcionados) FROM datos "
-                    f"WHERE Temporada={t} AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{D}' GROUP BY {planta_especie}"
-                    if con_recepcion else "")
-        extra = ", [Kg recibidos], [Kg por procesar]" if con_recepcion else ""
-        extra_b = ", ROUND(R,0) AS [Kg recibidos], ROUND(R-V,0) AS [Kg por procesar]" if con_recepcion else ""
-        extra_t = ", ROUND(SUM(R),0), ROUND(SUM(R-V),0)" if con_recepcion else ""
-        return (f"WITH r AS (SELECT {_INF_PLANTA} AS Planta, {_INF_ESPECIE} AS Especie, SUM(KgsVaciados) AS V, "
-                f"SUM(KgsEmbalados) AS E, SUM(CajasEq) AS C, 0.0 AS R FROM packing WHERE {corte} GROUP BY {planta_especie}"
-                f"{recibido}), b AS (SELECT Planta, Especie, SUM(V) AS V, SUM(E) AS E, SUM(C) AS C, SUM(R) AS R FROM r "
-                "GROUP BY Planta, Especie) SELECT Planta, Especie, [Procesado kg], [Embalado kg], [Cajas eq], [% embalaje]"
+        # P1 (11-11-2026): por planta y especie, con lo recibido y lo que falta procesar (recibido - procesado); desde
+        # el 26-11 también en bins (kg por procesar / kg por bin de la planilla de conversiones de la especie). Quien
+        # no tiene la base de cosecha la recibe sin esas columnas.
+        recibido = (f" UNION ALL SELECT {_INF_PLANTA}, {_INF_ESPECIE}, Especie, 0.0, 0.0, 0.0, SUM(KgsRecepcionados) "
+                    f"FROM datos WHERE Temporada={t} AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{D}' "
+                    f"GROUP BY {planta_especie}" if con_recepcion else "")
+        extra = ", [Kg recibidos], [Kg por procesar], [Bins por procesar]" if con_recepcion else ""
+        extra_b = (", ROUND(R,0) AS [Kg recibidos], ROUND(R-V,0) AS [Kg por procesar], "
+                   "ROUND((R-V)/NULLIF(PB,0),0) AS [Bins por procesar]" if con_recepcion else "")
+        extra_t = ", ROUND(SUM(R),0), ROUND(SUM(R-V),0), ROUND(SUM((R-V)/NULLIF(PB,0)),0)" if con_recepcion else ""
+        return (f"WITH r AS (SELECT {_INF_PLANTA} AS Planta, {_INF_ESPECIE} AS Especie, Especie AS EN, "
+                f"SUM(KgsVaciados) AS V, SUM(KgsEmbalados) AS E, SUM(CajasEq) AS C, 0.0 AS R FROM packing WHERE {corte} "
+                f"GROUP BY {planta_especie}{recibido}), "
+                "k AS (SELECT Especie, MAX(PesoBinKg) AS PB FROM conversiones GROUP BY Especie), "
+                "b AS (SELECT r.Planta, r.Especie, SUM(r.V) AS V, SUM(r.E) AS E, SUM(r.C) AS C, SUM(r.R) AS R, "
+                "MAX(k.PB) AS PB FROM r LEFT JOIN k ON k.Especie = r.EN GROUP BY r.Planta, r.Especie) "
+                "SELECT Planta, Especie, [Procesado kg], [Embalado kg], [Cajas eq], [% embalaje]"
                 f"{extra} FROM (SELECT Planta, Especie, ROUND(V,0) AS [Procesado kg], ROUND(E,0) AS [Embalado kg], "
                 f"ROUND(C,0) AS [Cajas eq], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje]{extra_b}, 0 AS S, "
                 f"{_INF_ORDEN_PLANTA} AS O FROM b WHERE V<>0 OR R<>0 UNION ALL SELECT 'TOTAL', '', ROUND(SUM(V),0), "
                 f"ROUND(SUM(E),0), ROUND(SUM(C),0), ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1){extra_t}, 1, 9 FROM b) x "
                 "ORDER BY S, O, [Procesado kg] DESC")
 
-    # Gráfico de P1 (Edson, 11-11-2026): cajas eq producidas vs la Precosecha (Estim Primavera) en cajas eq.
-    grafico_p1 = {"tipo": "barras", "categoria": "Planta", "valores": ["Cajas eq producidas", "Precosecha cajas eq"],
-                  "titulo": "Cajas eq producidas vs Precosecha por planta (cajas eq)",
-                  "consulta_sql": (
-                      f"SELECT {_INF_PLANTA} AS Planta, "
-                      f"ROUND(SUM(CASE WHEN [Base Origen]='{pk}' THEN CajasEq ELSE 0 END),0) AS [Cajas eq producidas], "
-                      f"ROUND(SUM(CASE WHEN [Base Origen]='{BASE_ORIGEN_ESTIM_PRIMAVERA}' THEN CajasEq ELSE 0 END),0) "
-                      f"AS [Precosecha cajas eq] FROM packing WHERE Temporada={t} AND CAST(Fecha AS DATE)<='{D}' "
-                      f"AND [Base Origen] IN ('{pk}','{BASE_ORIGEN_ESTIM_PRIMAVERA}') GROUP BY {_INF_PLANTA}")}
+    # 5. Embalado por calibre de cada especie (26-11-2026). Cereza como antes (cada D en su calibre en el gráfico) y
+    # arándano sin agrupar; el resto, por decena (052, 52 y 54 van en 50; 108 en 100). Lo sin calibre va aparte.
+    def por_calibre(especie, nombre):
+        if especie == "CHERRY":
+            return {
+                "titulo": f"Embalado por calibre (cereza, {c['corte']})", "bases": ("packing",),
+                "consulta_sql": (
+                    f"SELECT Calibre, [Embalado {c['del_dia']} kg], [Embalado temporada kg], [Cajas eq temporada], "
+                    "[% temporada] FROM (SELECT ISNULL(Calibre,'TOTAL') AS Calibre, "
+                    f"ROUND({_suma_si(f'CAST(Fecha AS DATE)={chr(39)}{D}{chr(39)}', 'KgsEmbalados')},0) AS "
+                    f"[Embalado {c['del_dia']} kg], ROUND(SUM(KgsEmbalados),0) AS [Embalado temporada kg], "
+                    "ROUND(SUM(CajasEq),0) AS [Cajas eq temporada], ROUND(100.0*SUM(KgsEmbalados)/NULLIF((SELECT "
+                    f"SUM(KgsEmbalados) FROM packing WHERE {corte} AND Especie='CHERRY'),0),1) AS [% temporada], "
+                    f"GROUPING(Calibre) AS G, {_INF_ORDEN_CALIBRE} AS O FROM packing WHERE {corte} AND "
+                    "Especie='CHERRY' GROUP BY Calibre WITH ROLLUP) x WHERE [Embalado temporada kg]<>0 ORDER BY G, O"),
+                "grafico": {"tipo": "barras", "categoria": "Calibre", "valores": ["Embalado temporada kg"],
+                            "titulo": "Embalado de la temporada por calibre – cereza (kg)",
+                            # Edson, 11-11-2026: cada calibre D suma en su calibre (4JD = 4J ... LD = L).
+                            "grupos": {"4JD": "4J", "3JD": "3J", "2JD": "2J", "JD": "J", "XLD": "XL", "LD": "L"},
+                            "orden": ["4J", "3J", "2J", "J", "XL", "L"]}}
+        # Sin TRY_CAST (la base tiene un nivel de compatibilidad antiguo): solo se convierte lo que es puro dígito.
+        digitos, numero = "Calibre NOT LIKE '%[^0-9]%'", "CAST(Calibre AS INT)"
+        if especie == "BLUEBERRY":
+            grupo_cal, orden = "ISNULL(Calibre, 'Sin calibre')", "CASE WHEN Calibre IS NULL THEN 1 ELSE 0 END"
+        else:
+            grupo_cal = (f"CASE WHEN Calibre IS NULL THEN 'Sin calibre' WHEN {digitos} THEN "
+                         f"CAST({numero}/10*10 AS varchar(10)) ELSE Calibre END")
+            orden = f"CASE WHEN Calibre IS NULL THEN 999999 WHEN {digitos} THEN {numero}/10*10 ELSE 999998 END"
+        return {
+            "titulo": f"Embalado por calibre ({nombre}, {c['corte']})", "bases": ("packing",),
+            "consulta_sql": (
+                f"WITH g AS (SELECT {grupo_cal} AS Calibre, {orden} AS O, KgsEmbalados AS K, CajasEq AS C, "
+                f"CASE WHEN CAST(Fecha AS DATE)='{D}' THEN KgsEmbalados ELSE 0 END AS KD FROM packing WHERE {corte} "
+                f"AND Especie='{especie}'), b AS (SELECT Calibre, MIN(O) AS O, SUM(KD) AS KD, SUM(K) AS K, SUM(C) AS C "
+                f"FROM g GROUP BY Calibre) SELECT Calibre, [Embalado {c['del_dia']} kg], [Embalado temporada kg], "
+                "[Cajas eq temporada], [% temporada] FROM (SELECT Calibre, ROUND(KD,0) AS "
+                f"[Embalado {c['del_dia']} kg], ROUND(K,0) AS [Embalado temporada kg], ROUND(C,0) AS "
+                "[Cajas eq temporada], ROUND(100.0*K/NULLIF((SELECT SUM(K) FROM b),0),1) AS [% temporada], 0 AS S, O "
+                "FROM b WHERE K<>0 UNION ALL SELECT 'TOTAL', ROUND(SUM(KD),0), ROUND(SUM(K),0), ROUND(SUM(C),0), "
+                "100.0, 1, 0 FROM b HAVING SUM(K)<>0) x ORDER BY S, O, Calibre"),
+            "grafico": {"tipo": "barras", "categoria": "Calibre", "valores": ["Embalado temporada kg"],
+                        "titulo": f"Embalado de la temporada por calibre – {nombre} (kg)",
+                        # En el orden de la tabla (decenas de menor a mayor, lo sin calibre al final), no por kilos.
+                        "orden": (None if especie == "BLUEBERRY"
+                                  else [str(n) for n in range(0, 1000, 10)] + ["Sin calibre"])},
+            "nota": (None if especie == "BLUEBERRY" else
+                     "Calibres agrupados por decena (052, 52 y 54 van en 50; 108 en 100). «Sin calibre»: embalado que "
+                     "no trae calibre en la base.")}
+
     secciones = [
+        {"titulo": f"Avance de la temporada por especie ({c['corte']})", "bases": ("packing",),
+         "consulta_sql": avance, "grafico": {"tipo": "ninguno"},
+         "nota": "Total estimadas = Precosecha (Estim Primavera) de toda la temporada. Procesadas = cajas eq embaladas "
+                 "(Packing Planta). Despachadas = embarques de exportación y venta nacional, por fecha de despacho. "
+                 "Existencias = procesadas - despachadas."},
         {"titulo": f"Proceso de la temporada por planta y especie ({c['corte']})", "bases": ("datos", "packing"),
-         "consulta_sql": por_planta(True), "grafico": grafico_p1,
+         "consulta_sql": por_planta(True), "grafico": {"tipo": "ninguno"},
          "nota": "Kg por procesar = kg recibidos (recepción en planta) - kg procesados (vaciados), acumulado de la "
-                 "temporada."},
+                 "temporada. Bins por procesar = kg por procesar / kg por bin de la planilla de conversiones de la "
+                 "especie (en cereza, bins equivalentes: llega en totes)."},
         {"titulo": f"Proceso de la temporada por planta y especie ({c['corte']})", "bases": ("packing",),
-         "sin": "datos", "consulta_sql": por_planta(False), "grafico": grafico_p1},
-        # Desde / Hasta (11-11-2026): primer y último día en que se procesó (vació) esa variedad.
-        {"titulo": f"Proceso de la temporada por productor y variedad ({c['corte']})", "bases": ("packing",),
+         "sin": "datos", "consulta_sql": por_planta(False), "grafico": {"tipo": "ninguno"}},
+        # Desde / Hasta (11-11-2026): primer y último día en que se procesó (vació). Por productor y especie (26-11).
+        {"titulo": f"Proceso de la temporada por productor y especie ({c['corte']})", "bases": ("packing",),
          "consulta_sql": (
-             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
+             f"WITH b AS (SELECT {_INF_PRODUCTOR} AS Productor, {_INF_ESPECIE} AS Especie, "
              "MIN(CASE WHEN KgsVaciados<>0 THEN CAST(Fecha AS DATE) END) AS Di, "
              "MAX(CASE WHEN KgsVaciados<>0 THEN CAST(Fecha AS DATE) END) AS Hi, "
              f"SUM(KgsVaciados) AS V, SUM(KgsEmbalados) AS E, SUM(CajasEq) AS C FROM packing WHERE {corte} "
-             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, Desde, Hasta, [Procesado kg], [Cajas eq], "
-             "[% embalaje] FROM (SELECT Planta, Productor, Variedad, Di AS Desde, Hi AS Hasta, ROUND(V,0) AS "
-             "[Procesado kg], ROUND(C,0) AS [Cajas eq], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, "
-             f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL','','',MIN(Di),MAX(Hi),ROUND(SUM(V),0),"
-             "ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x ORDER BY S, O, [Procesado kg] DESC"),
+             f"GROUP BY {_INF_PRODUCTOR}, {_INF_ESPECIE}) SELECT Productor, Especie, Desde, Hasta, [Procesado kg], "
+             "[Cajas eq], [% embalaje] FROM (SELECT Productor, Especie, Di AS Desde, Hi AS Hasta, ROUND(V,0) AS "
+             "[Procesado kg], ROUND(C,0) AS [Cajas eq], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S "
+             "FROM b UNION ALL SELECT 'TOTAL','',MIN(Di),MAX(Hi),ROUND(SUM(V),0),ROUND(SUM(C),0),"
+             "ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1 FROM b) x ORDER BY S, [Procesado kg] DESC"),
          "grafico": {"tipo": "ninguno"},
-         "nota": "Rainier incluye Royal Rainier. Desde / Hasta = primer y último día en que se procesó esa variedad. "
+         "nota": "Desde / Hasta = primer y último día en que se procesó fruta de ese productor y especie. "
                  "% embalaje = kg embalados / kg vaciados."},
         {"titulo": f"Proceso {'del ' + d if am else 'de hoy ' + d + ' (parcial)'}: programa vs real", "bases": ("packing",),
          "consulta_sql": (
-             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
-             f"{campos_dia} FROM packing WHERE CAST(Fecha AS DATE)='{D}' AND [Base Origen] IN ('{tp}','{pk}') "
-             f"GROUP BY {grupo}) SELECT Planta, Productor, Variedad, [Programa kg], [Programa cajas eq], "
-             "[Procesado kg], [Cajas eq embaladas], [% embalaje] FROM (SELECT Planta, Productor, Variedad, "
-             "ROUND(T,0) AS [Programa kg], ROUND(TC,0) AS [Programa cajas eq], ROUND(V,0) AS [Procesado kg], "
-             "ROUND(C,0) AS [Cajas eq embaladas], ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, "
-             f"{_INF_ORDEN_PLANTA} AS O FROM b UNION ALL SELECT 'TOTAL','','',ROUND(SUM(T),0),ROUND(SUM(TC),0),"
-             "ROUND(SUM(V),0),ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),1,9 FROM b) x "
-             "ORDER BY S, O, [Programa kg] DESC"),
+             f"WITH b AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_ESPECIE} AS Especie, "
+             f"{_suma_si(f'[Base Origen]={chr(39)}{tp}{chr(39)}', 'CajasEq')} AS TC, "
+             f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsVaciados')} AS V, "
+             f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'KgsEmbalados')} AS E, "
+             f"{_suma_si(f'[Base Origen]={chr(39)}{pk}{chr(39)}', 'CajasEq')} AS C "
+             f"FROM packing WHERE CAST(Fecha AS DATE)='{D}' AND [Base Origen] IN ('{tp}','{pk}') "
+             f"GROUP BY {_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_ESPECIE}) SELECT Planta, Productor, Especie, "
+             "[Programa cajas eq], [Cajas eq embaladas], [% embalaje] FROM (SELECT Planta, Productor, Especie, "
+             "ROUND(TC,0) AS [Programa cajas eq], ROUND(C,0) AS [Cajas eq embaladas], "
+             f"ROUND(100.0*E/NULLIF(V,0),1) AS [% embalaje], 0 AS S, {_INF_ORDEN_PLANTA} AS O FROM b "
+             "UNION ALL SELECT 'TOTAL','','',ROUND(SUM(TC),0),ROUND(SUM(C),0),ROUND(100.0*SUM(E)/NULLIF(SUM(V),0),1),"
+             "1,9 FROM b) x ORDER BY S, O, [Programa cajas eq] DESC"),
          "grafico": {"tipo": "ninguno"},
-         "nota": (None if am else "Procesado = registrado hasta la hora del informe (parcial). El embalado del día "
+         "nota": (None if am else "Embalado = registrado hasta la hora del informe (parcial). El embalado del día "
                                   "se registra con desfase, por eso su % puede salir bajo.")},
-        {"titulo": f"Fruta recibida pendiente de proceso ({c['corte']})", "bases": ("datos", "packing"),
-         "consulta_sql": (
-             f"WITH r AS (SELECT {_INF_PLANTA} AS Planta, {_INF_PRODUCTOR} AS Productor, {_INF_VARIEDAD} AS Variedad, "
-             f"SUM(KgsRecepcionados) AS Rec, 0.0 AS Vac FROM datos WHERE Temporada={t} "
-             f"AND [Base Origen]='{real}' AND CAST(Fecha AS DATE)<='{D}' GROUP BY {grupo} UNION ALL "
-             f"SELECT {_INF_PLANTA}, {_INF_PRODUCTOR}, {_INF_VARIEDAD}, 0.0, SUM(KgsVaciados) FROM packing "
-             f"WHERE Temporada={t} AND [Base Origen]='{pk}' AND CAST(Fecha AS DATE)<='{D}' "
-             f"GROUP BY {grupo}), g AS (SELECT Planta, Productor, Variedad, SUM(Rec) AS Rec, SUM(Vac) AS Vac FROM r "
-             "GROUP BY Planta, Productor, Variedad) SELECT Planta, Productor, Variedad, [Recibido kg], [Procesado kg], "
-             "[Pendiente kg] FROM (SELECT Planta, Productor, Variedad, ROUND(Rec,0) AS [Recibido kg], "
-             f"ROUND(Vac,0) AS [Procesado kg], ROUND(Rec-Vac,0) AS [Pendiente kg], 0 AS S, {_INF_ORDEN_PLANTA} AS O "
-             "FROM g WHERE ABS(Rec-Vac)>=1 UNION ALL SELECT 'TOTAL','','',ROUND(SUM(Rec),0),ROUND(SUM(Vac),0),"
-             "ROUND(SUM(Rec-Vac),0),1,9 FROM g WHERE ABS(Rec-Vac)>=1) x ORDER BY S, O, [Pendiente kg] DESC"),
-         "grafico": {"tipo": "ninguno"},
-         "nota": "Recibido (recepción en planta) menos procesado (kg vaciados), acumulado de la temporada; "
-                 "solo líneas con saldo."},
-        {"titulo": f"Embalado por calibre (cereza, {c['corte']})", "bases": ("packing",),
-         "consulta_sql": (
-             f"SELECT Calibre, [Embalado {c['del_dia']} kg], [Embalado temporada kg], [Cajas eq temporada], [% temporada] "
-             "FROM (SELECT ISNULL(Calibre,'TOTAL') AS Calibre, "
-             f"ROUND({_suma_si(f'CAST(Fecha AS DATE)={chr(39)}{D}{chr(39)}', 'KgsEmbalados')},0) AS [Embalado {c['del_dia']} kg], "
-             "ROUND(SUM(KgsEmbalados),0) AS [Embalado temporada kg], ROUND(SUM(CajasEq),0) AS [Cajas eq temporada], "
-             "ROUND(100.0*SUM(KgsEmbalados)/NULLIF((SELECT SUM(KgsEmbalados) FROM packing WHERE "
-             f"{corte} AND Especie='CHERRY'),0),1) AS [% temporada], GROUPING(Calibre) AS G, {_INF_ORDEN_CALIBRE} AS O "
-             f"FROM packing WHERE {corte} AND Especie='CHERRY' GROUP BY Calibre WITH ROLLUP) x "
-             "WHERE [Embalado temporada kg]<>0 ORDER BY G, O"),
-         "grafico": {"tipo": "barras", "categoria": "Calibre", "valores": ["Embalado temporada kg"],
-                     "titulo": "Embalado de la temporada por calibre (kg)",
-                     # Edson, 11-11-2026: cada calibre D suma en su calibre (4JD = 4J ... LD = L).
-                     "grupos": {"4JD": "4J", "3JD": "3J", "2JD": "2J", "JD": "J", "XLD": "XL", "LD": "L"},
-                     "orden": ["4J", "3J", "2J", "J", "XL", "L"]}},
+        *[por_calibre(e, n) for e, n in (("CHERRY", "cereza"), ("BLUEBERRY", "arándano"), ("NECTARINE", "nectarín"),
+                                         ("PEACH", "durazno"), ("APRICOT", "damasco"), ("PLUM", "ciruela"),
+                                         ("FLAT PEACH", "durazno plano"), ("SUGAR PLUM", "sugar plum"),
+                                         ("GRAPE", "uva"), ("MANDARIN", "mandarina"), ("ORANGE", "naranja"),
+                                         ("PEAR", "pera"), ("KIWI", "kiwi"))],
         {"titulo": f"Otras exportadoras: proceso de la temporada ({c['corte']})", "externas": True,
          "consulta_sql": (
              f"WITH b AS (SELECT Planta, Exportadora, {_EXT_ESPECIE} AS Especie, SUM(KgRecibidos) AS R, "
              "SUM(KgVaciados) AS V, SUM(KgPackingExportacion) AS X, SUM(KgPackingMercadoInterno) AS M, "
              f"SUM(KgPackingDesecho) AS DS FROM externas WHERE Temporada={t} AND Fecha<='{D}' "
              "GROUP BY Planta, Exportadora, Especie) SELECT Planta, Exportadora, Especie, [Recibido kg], [Procesado kg], "
-             "[Por procesar kg], [Exportación kg], [Mercado interno kg], [Desecho kg] FROM (SELECT Planta, Exportadora, "
-             "Especie, ROUND(R,0) AS [Recibido kg], ROUND(V,0) AS [Procesado kg], ROUND(R-V,0) AS [Por procesar kg], "
-             "ROUND(X,0) AS [Exportación kg], ROUND(M,0) AS [Mercado interno kg], ROUND(DS,0) AS [Desecho kg], 0 AS S "
+             "[Por procesar kg], [Exportación kg], [% exportación], [Mercado interno kg], [Desecho kg] FROM (SELECT "
+             "Planta, Exportadora, Especie, ROUND(R,0) AS [Recibido kg], ROUND(V,0) AS [Procesado kg], ROUND(R-V,0) AS "
+             "[Por procesar kg], ROUND(X,0) AS [Exportación kg], ROUND(100.0*X/NULLIF(V,0),1) AS [% exportación], "
+             "ROUND(M,0) AS [Mercado interno kg], ROUND(DS,0) AS [Desecho kg], 0 AS S "
              "FROM b WHERE R<>0 OR V<>0 UNION ALL SELECT 'TOTAL','','',ROUND(SUM(R),0),ROUND(SUM(V),0),"
-             "ROUND(SUM(R-V),0),ROUND(SUM(X),0),ROUND(SUM(M),0),ROUND(SUM(DS),0),1 FROM b) x "
-             "ORDER BY S, [Procesado kg] DESC"),
+             "ROUND(SUM(R-V),0),ROUND(SUM(X),0),ROUND(100.0*SUM(X)/NULLIF(SUM(V),0),1),ROUND(SUM(M),0),"
+             "ROUND(SUM(DS),0),1 FROM b) x ORDER BY S, [Procesado kg] DESC"),
          "grafico": {"tipo": "ninguno"},
          "nota": _NOTA_EXTERNAS + " Procesado = kg vaciados en proceso normal; exportación, mercado interno y "
-                                  "desecho = kg embalados."},
+                                  "desecho = kg embalados. % exportación = exportación kg / procesado kg."},
     ]
     return {"titulo": f"Informe diario de procesos – {DIAS_SEMANA[fecha.weekday()]} {fecha:%d-%m-%Y}",
             "subtitulo": (f"Temporada {t} · kilos vaciados y cajas eq de Agua Santa · {c['subtitulo']} · "
@@ -11353,7 +11425,8 @@ def armar_informe_diario(tipo, fecha, numero, permisos=None, turno=None):
                  and (s.get("fuente") != "confirmaciones" or confirmaciones)]
     informe, error = armar_informe_personalizado(
         spec["titulo"], secciones, subtitulo=spec["subtitulo"], consulta_kpis=spec["consulta_kpis"],
-        alcance=alcance, embarques=0, confirmaciones=confirmaciones, bases=bases, omitir_vacias=True)
+        alcance=alcance, embarques=0, confirmaciones=confirmaciones, bases=bases, omitir_vacias=True,
+        max_secciones=len(secciones))
     if error:
         logger.error(f"Informe diario de {tipo} para {numero}: {error}")
         return None, error
